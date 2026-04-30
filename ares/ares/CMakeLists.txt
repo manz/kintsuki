@@ -15,13 +15,15 @@ increases performance.
   OFF
 )
 
-add_sourcery_command(ares ares/resource)
+# sourcery (resource compiler) was stripped along with tools/. The
+# pre-generated resource.cpp/resource.hpp checked in to ares/resource/
+# are used as-is — they only embed icons for the desktop UI we don't ship.
 
 if(ARES_PRECOMPILE_HEADERS)
   target_precompile_headers(ares PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:ares/ares.hpp>")
 endif()
 
-target_link_libraries(ares PRIVATE libco ares::nall::headers $<$<BOOL:${ARES_ENABLE_CHD}>:chdr-static> PUBLIC sljit)
+target_link_libraries(ares PRIVATE libco ares::nall::headers PUBLIC sljit)
 
 if(ARES_PROFILE_ACCURACY)
   target_compile_definitions(ares PUBLIC PROFILE_ACCURACY)
