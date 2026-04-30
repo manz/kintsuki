@@ -66,6 +66,13 @@ targets:
         basedOnDependencyAnalysis: false
         script: |
           set -e
+          # Xcode launches scripts with a sanitized PATH (no /opt/homebrew).
+          export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$PATH"
+          if ! command -v cmake >/dev/null 2>&1; then
+            echo "error: cmake not found on PATH ($PATH)" >&2
+            echo "install with: brew install cmake ninja" >&2
+            exit 1
+          fi
           REPO="$SRCROOT/.."
           if [ ! -d "$REPO/build" ]; then
             cmake -S "$REPO/ares" -B "$REPO/build" -G Ninja \
