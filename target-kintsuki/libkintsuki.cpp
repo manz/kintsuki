@@ -63,6 +63,25 @@ void    kintsuki_cgram_write(kintsuki_t* h, uint32_t addr, uint8_t v){ if(h) h->
 uint8_t kintsuki_oam_read(kintsuki_t* h, uint32_t addr)              { return h ? h->program->oamRead(addr)   : 0; }
 void    kintsuki_oam_write(kintsuki_t* h, uint32_t addr, uint8_t v)  { if(h) h->program->oamWrite(addr, v); }
 
+uint32_t kintsuki_vram_dump(kintsuki_t* h, uint8_t* out, uint32_t len) {
+  if(!h || !out) return 0;
+  uint32_t n = len < 0x10000 ? len : 0x10000;
+  for(uint32_t i = 0; i < n; i++) out[i] = h->program->vramRead(i);
+  return n;
+}
+uint32_t kintsuki_cgram_dump(kintsuki_t* h, uint8_t* out, uint32_t len) {
+  if(!h || !out) return 0;
+  uint32_t n = len < 0x200 ? len : 0x200;
+  for(uint32_t i = 0; i < n; i++) out[i] = h->program->cgramRead(i);
+  return n;
+}
+uint32_t kintsuki_oam_dump(kintsuki_t* h, uint8_t* out, uint32_t len) {
+  if(!h || !out) return 0;
+  uint32_t n = len < 0x220 ? len : 0x220;
+  for(uint32_t i = 0; i < n; i++) out[i] = h->program->oamRead(i);
+  return n;
+}
+
 struct kintsuki_cpu_state_t {
   uint16_t a, x, y, s, d;
   uint8_t  b, p;
