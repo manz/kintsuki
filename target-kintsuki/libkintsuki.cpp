@@ -12,6 +12,13 @@
 #include <memory>
 #include <vector>
 
+// kintsuki test-harness bail flag: defined in ares/sfc/system/system.cpp,
+// read+cleared from cpu.cpp before each instruction. Declared here at
+// file scope (outside extern "C") so the C++ name mangling matches.
+namespace ares::SuperFamicom {
+  extern volatile bool kintsukiBailRequested;
+}
+
 extern "C" {
 
 struct kintsuki_t {
@@ -265,6 +272,38 @@ void kintsuki_step(kintsuki_t* h) {
   g_stepHit = false;
   ares::SuperFamicom::system.run();
   ares::SuperFamicom::execHook = g_prevExecHook;
+}
+
+
+namespace {
+volatile uint32_t g_runUntilTarget = 0;
+volatile bool g_runUntilHit = false;
+ares::SuperFamicom::ExecHook g_savedHook = nullptr;
+
+void runUntilHook(uint32_t pc) {
+  if(g_savedHook) g_savedHook(pc);
+  if(pc == g_runUntilTarget) {
+    g_runUntilHit = true;
+    ares::SuperFamicom::kintsukiBailRequested = true;
+  }
+}
+}  // namespace
+
+int kintsuki_run_until(kintsuki_t* h, uint32_t target_pc, uint32_t max_frames) {
+  if(!h) return 0;
+  g_runUntilTarget = target_pc & 0xffffff;
+  g_runUntilHit = false;
+  g_savedHook = ares::SuperFamicom::execHook;
+  ares::SuperFamicom::execHook = &runUntilHook;
+  uint64_t startFrames = h->program->framesRendered;
+  while(!g_runUntilHit
+        && h->program->framesRendered < startFrames + max_frames) {
+    ares::SuperFamicom::system.run();
+  }
+  ares::SuperFamicom::execHook = g_savedHook;
+  g_savedHook = nullptr;
+  ares::SuperFamicom::kintsukiBailRequested = false;
+  return g_runUntilHit ? 1 : 0;
 }
 
 }  // extern "C"

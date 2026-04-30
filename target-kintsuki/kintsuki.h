@@ -40,6 +40,11 @@ void        kintsuki_run_frames(kintsuki_t*, uint32_t n);
 void        kintsuki_step(kintsuki_t*);
 uint64_t    kintsuki_frame_count(kintsuki_t*);
 
+// Mid-frame run-until. Yields the scheduler the moment the CPU is about
+// to execute target_pc — does NOT wait for vblank. Returns 1 on hit,
+// 0 if max_frames of emulated time elapsed without reaching the target.
+int         kintsuki_run_until(kintsuki_t*, uint32_t target_pc, uint32_t max_frames);
+
 // Memory (CPU bus, 24-bit address)
 uint8_t     kintsuki_read_u8 (kintsuki_t*, uint32_t addr);
 void        kintsuki_write_u8(kintsuki_t*, uint32_t addr, uint8_t val);
