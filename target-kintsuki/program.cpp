@@ -185,18 +185,22 @@ auto Program::bootRom() -> bool {
   string profile = "[Nintendo] Super Famicom (NTSC)";
   if(!SuperFamicom::load(root, profile)) return false;
 
-  // Walk the node tree to find the Cartridge Slot port and allocate +
-  // connect it. ares' desktop UI does this after the user picks a ROM;
-  // headless we do it programmatically. Without this loadCartridge()
-  // never runs, no memory map is built, the CPU executes 0xFF garbage,
-  // and the PPU outputs an all-black framebuffer.
+  // Walk the node tree to wire up:
+  //   1. Cartridge Slot — allocate + connect → loadCartridge runs and
+  //      builds the memory map. Without this, ROM is never mapped.
+  //   2. Controller Port 1/2 — allocate "Gamepad" so the buttons exist
+  //      as Input nodes; otherwise platform->input() is never called
+  //      and our setButton bitmask never reaches the SNES.
   for(auto& node : *root) {
     auto port = std::dynamic_pointer_cast<Core::Port>(node);
     if(!port) continue;
-    if(port->name().match("*Cartridge*")) {
-      port->allocate(port->name());
+    auto pname = port->name();
+    if(pname.match("*Cartridge*")) {
+      port->allocate(pname);
       port->connect();
-      break;
+    } else if(pname.match("*Controller Port*")) {
+      port->allocate("Gamepad");
+      port->connect();
     }
   }
 
