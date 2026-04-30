@@ -13,9 +13,13 @@
 #include "stb_image_write.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <iterator>
+
+using namespace nall;
+using namespace ares;
 
 Program* kintsukiProgram = nullptr;
 
@@ -28,31 +32,33 @@ auto readFile(const char* path) -> std::vector<uint8_t> {
   return {std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>()};
 }
 
-// Build the system pak. ares loads boards.bml + ipl.rom from here. We bundle
-// the files shipped with ares' source tree under ares/System/Super Famicom/.
+// Per-process keep-alive so vfs::memory::open's non-owning span stays valid
+// for the lifetime of the emulator.
+std::vector<std::vector<uint8_t>>& keepalive() {
+  static std::vector<std::vector<uint8_t>> store;
+  return store;
+}
+
+auto attachFile(std::shared_ptr<vfs::directory>& dir,
+                const char* name, std::vector<uint8_t> bytes) -> void {
+  if(bytes.empty()) return;
+  keepalive().push_back(std::move(bytes));
+  auto& kept = keepalive().back();
+  auto file = vfs::memory::open(std::span<const uint8_t>(kept.data(), kept.size()));
+  file->setName(name);
+  dir->append(file);
+}
+
+// Build the system pak from ares' bundled System/ tree.
 auto makeSystemPak() -> std::shared_ptr<vfs::directory> {
   auto dir = std::make_shared<vfs::directory>();
-  // KINTSUKI_SYSTEM_PAK env var lets the user point at an alternate location;
-  // fall back to compile-time path baked at build via -DKINTSUKI_SYSTEM_PAK=...
   const char* base = std::getenv("KINTSUKI_SYSTEM_PAK");
   if(!base) base = KINTSUKI_SYSTEM_PAK_DEFAULT;
 
-  auto loadInto = [&](const char* name) {
+  for(const char* name : {"boards.bml", "ipl.rom"}) {
     string path{base, "/", name};
-    auto data = readFile(path);
-    if(data.empty()) return;
-    // memory::open takes a non-owning span, so we keep the bytes alive on
-    // the heap via a static cache. (Files are small and load-once.)
-    static std::vector<std::vector<uint8_t>> keepalive;
-    keepalive.push_back(std::move(data));
-    auto& kept = keepalive.back();
-    auto file = vfs::memory::open(std::span<const uint8_t>(kept.data(), kept.size()));
-    file->setName(name);
-    dir->append(file);
-  };
-
-  loadInto("boards.bml");
-  loadInto("ipl.rom");
+    attachFile(dir, name, readFile((const char*)path));
+  }
   return dir;
 }
 
@@ -69,12 +75,9 @@ Program::~Program() {
   // C ABI shim is responsible for calling that before destroying us.
 }
 
-auto Program::attach(ares::Node::Object) -> void {
-  // No tree mirroring needed for headless. ares still walks input nodes
-  // each poll; we handle them in input() below.
-}
+auto Program::attach(Node::Object) -> void {}
 
-auto Program::pak(ares::Node::Object node) -> std::shared_ptr<vfs::directory> {
+auto Program::pak(Node::Object node) -> std::shared_ptr<vfs::directory> {
   if(!node) return {};
   string name = node->name();
   if(name == "Super Famicom") return systemPak;
@@ -84,17 +87,16 @@ auto Program::pak(ares::Node::Object node) -> std::shared_ptr<vfs::directory> {
 
 auto Program::event(ares::Event) -> void {}
 
-auto Program::log(ares::Node::Debugger::Tracer::Tracer, string_view msg) -> void {
+auto Program::log(Node::Debugger::Tracer::Tracer, string_view msg) -> void {
   std::fwrite(msg.data(), 1, msg.size(), stderr);
   std::fputc('\n', stderr);
 }
 
-auto Program::video(ares::Node::Video::Screen, const u32* data, u32 pitch, u32 width, u32 height) -> void {
+auto Program::video(Node::Video::Screen, const u32* data, u32 pitch, u32 width, u32 height) -> void {
   fbWidth = width;
   fbHeight = height;
   size_t pixels = size_t(width) * height;
   if(fb.size() < pixels) fb.resize(pixels);
-  // pitch is bytes; data is u32 per pixel.
   u32 stride = pitch / sizeof(u32);
   for(u32 y = 0; y < height; y++) {
     const u32* src = data + y * stride;
@@ -104,25 +106,23 @@ auto Program::video(ares::Node::Video::Screen, const u32* data, u32 pitch, u32 w
   framesRendered++;
 }
 
-auto Program::audio(ares::Node::Audio::Stream) -> void {}
+auto Program::audio(Node::Audio::Stream) -> void {}
 
-auto Program::input(ares::Node::Input::Input node) -> void {
-  // ares calls us once per button per poll. Walk to the parent peripheral
-  // (Gamepad) and its parent port to identify which port we're on.
-  auto button = std::dynamic_pointer_cast<ares::Node::Input::Button>(node);
+auto Program::input(Node::Input::Input node) -> void {
+  // node is shared_ptr<Core::Input::Input>; downcast to Button.
+  auto button = std::dynamic_pointer_cast<Core::Input::Button>(node);
   if(!button) return;
 
-  // Lookup port index by climbing the node tree. Each gamepad sits under
-  // "Controller Port 1" or "Controller Port 2".
-  auto self = std::static_pointer_cast<ares::Node::Object>(node);
+  // Walk up the node tree to find the controller port.
   uint port = 0;
-  for(auto p = self->parent().lock(); p; p = p->parent().lock()) {
-    auto pname = p->name();
-    if(pname.match("*Port*1*"))      { port = 0; break; }
-    if(pname.match("*Port*2*"))      { port = 1; break; }
+  bool found = false;
+  for(auto p = node->parent().lock(); p; p = p->parent().lock()) {
+    string pname = p->name();
+    if(pname.match("*Port*1*"))      { port = 0; found = true; break; }
+    if(pname.match("*Port*2*"))      { port = 1; found = true; break; }
   }
+  if(!found) return;
 
-  // Map button name to bit index (matches Gamepad enum order).
   static const std::pair<const char*, int> map[] = {
     {"Up", 0}, {"Down", 1}, {"Left", 2}, {"Right", 3},
     {"B", 4},  {"A", 5},    {"Y", 6},    {"X", 7},
@@ -131,7 +131,7 @@ auto Program::input(ares::Node::Input::Input node) -> void {
   string name = button->name();
   for(auto& [k, bit] : map) {
     if(name == k) {
-      button->setValue((inputState[port] >> bit) & 1);
+      button->setValue(((inputState[port] >> bit) & 1) != 0);
       return;
     }
   }
@@ -149,24 +149,16 @@ auto Program::loadRom(const char* path) -> bool {
   kintsuki::RomInfo info;
   if(!kintsuki::detectRom(romData, info)) return false;
 
-  cartManifest = kintsuki::buildManifest(info).c_str();
+  std::string m = kintsuki::buildManifest(info);
+  cartManifest = string{m.c_str()};
 
-  // Build cart pak: manifest.bml + program.rom (full ROM).
   cartPak = std::make_shared<vfs::directory>();
+  attachFile(cartPak, "manifest.bml", std::vector<uint8_t>(m.begin(), m.end()));
 
-  // manifest.bml — keep alive on the heap (vfs::memory::open is non-owning).
-  static std::vector<std::vector<uint8_t>> keepalive;
-  std::vector<uint8_t> manifestBytes(cartManifest.begin(), cartManifest.end());
-  keepalive.push_back(std::move(manifestBytes));
-  auto manifestFile = vfs::memory::open(
-    std::span<const uint8_t>(keepalive.back().data(), keepalive.back().size()));
-  manifestFile->setName("manifest.bml");
-  cartPak->append(manifestFile);
-
-  // program.rom — pad to programSize so ares' map calculations don't fault.
   if(romData.size() < info.programSize) {
     romData.resize(info.programSize, 0);
   }
+  // ROM data lives in this->romData for the program lifetime — no keepalive.
   auto romFile = vfs::memory::open(
     std::span<const uint8_t>(romData.data(), romData.size()));
   romFile->setName("program.rom");
@@ -176,71 +168,104 @@ auto Program::loadRom(const char* path) -> bool {
 }
 
 auto Program::bootRom() -> bool {
-  ares::Node::System root;
+  // Default to the performance PPU (faster, sufficient for headless testing).
+  // Without this call ares' PPUBase::implementation stays nullptr and
+  // System::power() crashes.
+  SuperFamicom::ppu.setAccurate(false);
+
+  Node::System root;
   string profile = "[Nintendo] Super Famicom (NTSC)";
-  if(!ares::SuperFamicom::load(root, profile)) return false;
-  ares::SuperFamicom::system.power(false);
+  if(!SuperFamicom::load(root, profile)) return false;
+  SuperFamicom::system.power(false);
   loaded = true;
   return true;
 }
 
 auto Program::runFrames(u32 n) -> void {
   if(!loaded) return;
-  // ares::SuperFamicom::system.run() advances by one PPU frame because the
-  // PPU calls platform->video() at vblank; the scheduler returns once it
-  // sees the Frame event. We loop n times.
   u64 target = framesRendered + n;
-  u64 spinCap = u64(n) * 10'000'000ull;
   u64 spin = 0;
+  u64 spinCap = u64(n) * 10'000'000ull;
   while(framesRendered < target && spin++ < spinCap) {
-    ares::SuperFamicom::system.run();
+    SuperFamicom::system.run();
   }
 }
 
 auto Program::memRead(u32 addr) -> u8 {
-  return ares::SuperFamicom::bus.read(addr & 0xffffff, 0);
+  return SuperFamicom::bus.read(addr & 0xffffff, 0);
 }
 
 auto Program::memWrite(u32 addr, u8 val) -> void {
-  ares::SuperFamicom::bus.write(addr & 0xffffff, val);
+  SuperFamicom::bus.write(addr & 0xffffff, val);
 }
 
-// PPU memory: ares' performance PPU isn't installed in this build (we only
-// included sfc/ppu, the cycle-accurate one). vram is uint16[].
+// VRAM lives in the performance PPU's vram member (n16[64K]).
 auto Program::vramRead(u32 addr) -> u8 {
-  uint16_t word = ares::SuperFamicom::ppu.vram[(addr >> 1) & 0x7fff];
+  uint16_t word = SuperFamicom::ppuPerformanceImpl.vram.data[(addr >> 1) & 0x7fff];
   return (addr & 1) ? (word >> 8) : (word & 0xff);
 }
 
 auto Program::vramWrite(u32 addr, u8 val) -> void {
   u32 idx = (addr >> 1) & 0x7fff;
-  uint16_t& word = ares::SuperFamicom::ppu.vram[idx];
-  if(addr & 1) word = (word & 0x00ff) | (uint16_t(val) << 8);
-  else         word = (word & 0xff00) | val;
+  auto& word = SuperFamicom::ppuPerformanceImpl.vram.data[idx];
+  uint16_t w = word;
+  if(addr & 1) w = (w & 0x00ff) | (uint16_t(val) << 8);
+  else         w = (w & 0xff00) | val;
+  word = w;
 }
 
+// CGRAM is 256 entries of 15-bit color in DAC.
 auto Program::cgramRead(u32 addr) -> u8 {
-  // ares cgram is a member of the obj/bg modules — accessed through public
-  // io.cgramAddress / io.cgramData rather than a flat array. For now route
-  // via the bus at $2122 — read-only side effect free path TODO. Stub.
-  (void)addr;
-  return 0;
+  uint16_t word = (uint16_t)(uint16_t)SuperFamicom::ppuPerformanceImpl.dac.cgram[(addr >> 1) & 0xff];
+  return (addr & 1) ? (word >> 8) : (word & 0xff);
 }
 
-auto Program::cgramWrite(u32 addr, u8 val) -> void { (void)addr; (void)val; }
-auto Program::oamRead(u32 addr) -> u8 { (void)addr; return 0; }
-auto Program::oamWrite(u32 addr, u8 val) -> void { (void)addr; (void)val; }
+auto Program::cgramWrite(u32 addr, u8 val) -> void {
+  u32 idx = (addr >> 1) & 0xff;
+  uint16_t w = (uint16_t)(uint16_t)SuperFamicom::ppuPerformanceImpl.dac.cgram[idx];
+  if(addr & 1) w = (w & 0x00ff) | (uint16_t(val) << 8);
+  else         w = (w & 0xff00) | val;
+  SuperFamicom::ppuPerformanceImpl.dac.cgram[idx] = w & 0x7fff;
+}
+
+auto Program::oamRead(u32 addr) -> u8 {
+  return SuperFamicom::ppuPerformanceImpl.obj.oam.read(addr & 0x3ff);
+}
+
+auto Program::oamWrite(u32 addr, u8 val) -> void {
+  SuperFamicom::ppuPerformanceImpl.obj.oam.write(addr & 0x3ff, val);
+}
 
 auto Program::getCpuState() const -> CpuState {
-  CpuState s{};
-  // ares cpu register layout — TODO once we wire hooks. Leave zeroed.
+  auto& r = SuperFamicom::cpu.r;
+  CpuState s;
+  s.a  = (uint16_t)(uint16_t)r.a.w;
+  s.x  = (uint16_t)(uint16_t)r.x.w;
+  s.y  = (uint16_t)(uint16_t)r.y.w;
+  s.s  = (uint16_t)(uint16_t)r.s.w;
+  s.d  = (uint16_t)(uint16_t)r.d.w;
+  s.b  = (uint8_t) r.b;
+  s.p  = (uint8_t) (n8)r.p;
+  s.pc = (uint32_t)(uint32_t)r.pc.d;
+  s.e  = r.e;
   return s;
 }
 
-auto Program::setCpuState(const CpuState& s) -> void { (void)s; }
+auto Program::setCpuState(const CpuState& s) -> void {
+  auto& r = SuperFamicom::cpu.r;
+  r.a.w  = s.a;
+  r.x.w  = s.x;
+  r.y.w  = s.y;
+  r.s.w  = s.s;
+  r.d.w  = s.d;
+  r.b    = s.b;
+  r.p    = s.p;
+  r.pc.d = s.pc;
+  r.e    = s.e;
+}
 
 auto Program::saveStateBlob() -> std::vector<uint8_t> {
-  serializer s = ares::SuperFamicom::system.serialize(true);
+  serializer s = SuperFamicom::system.serialize(true);
   std::vector<uint8_t> out(s.size());
   std::memcpy(out.data(), s.data(), s.size());
   return out;
@@ -248,7 +273,7 @@ auto Program::saveStateBlob() -> std::vector<uint8_t> {
 
 auto Program::loadStateBlob(const uint8_t* data, u32 size) -> bool {
   serializer s(data, size);
-  return ares::SuperFamicom::system.unserialize(s);
+  return SuperFamicom::system.unserialize(s);
 }
 
 auto Program::saveStateFile(const char* path) -> bool {
