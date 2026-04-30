@@ -13,6 +13,24 @@ final class Emulator: ObservableObject {
     @Published private(set) var fps: Double = 0
     @Published private(set) var cpuState = CpuState()
     @Published private(set) var saveStateSlots: [Int: SaveSlot] = [:]
+    @Published private(set) var breakpoints: [Breakpoint] = []
+
+    enum BreakKind: Int, CaseIterable, Identifiable {
+        case exec = 0, read = 1, write = 2
+        var id: Int { rawValue }
+        var label: String { ["Exec", "Read", "Write"][rawValue] }
+    }
+
+    struct Breakpoint: Identifiable, Equatable {
+        let id = UUID()
+        var kind: BreakKind
+        var lo: UInt32
+        var hi: UInt32
+        var hitCount: Int = 0
+        var lastHit: UInt32 = 0
+        // Native callback id from kintsuki_add_callback.
+        var nativeId: Int32 = 0
+    }
 
     struct CpuState: Equatable {
         var a: UInt16 = 0, x: UInt16 = 0, y: UInt16 = 0
@@ -165,14 +183,103 @@ final class Emulator: ObservableObject {
         if s != cpuState { cpuState = s }
     }
 
-    // ----- Memory snapshot for hex viewer (called from view body) ---------
-    func readWRAM(start: UInt32, length: Int) -> Data {
+    // ----- Memory snapshot for hex/palette/tile views ---------------------
+    enum MemRegion: String, CaseIterable, Identifiable {
+        case wram = "WRAM", rom = "ROM", sram = "SRAM"
+        case vram = "VRAM", cgram = "CGRAM", oam = "OAM"
+        var id: String { rawValue }
+        // Length of the addressable window for the stepper.
+        var size: UInt32 {
+            switch self {
+            case .wram:  return 0x20000   // 128 KB
+            case .rom:   return 0x800000  // generous; reads return open bus past end
+            case .sram:  return 0x10000   // up to 64 KB SRAM (mapped via bus)
+            case .vram:  return 0x10000
+            case .cgram: return 0x200
+            case .oam:   return 0x220
+            }
+        }
+    }
+
+    func readRegion(_ region: MemRegion, offset: UInt32, length: Int) -> Data {
         guard let h = handle else { return Data() }
         var buf = [UInt8](repeating: 0, count: length)
         buf.withUnsafeMutableBufferPointer { ptr in
-            _ = kintsuki_read_range(h, 0x7E0000 + start, UInt32(length), ptr.baseAddress)
+            switch region {
+            case .wram:
+                _ = kintsuki_read_range(h, 0x7E0000 + offset, UInt32(length), ptr.baseAddress)
+            case .rom:
+                // LoROM: bank 00-7D, $8000-$FFFF. Walk the bus to surface
+                // whatever the cart mapping sees.
+                for i in 0..<length {
+                    let abs = offset + UInt32(i)
+                    let bank = abs / 0x8000
+                    let addr = (bank << 16) | 0x8000 | (abs & 0x7FFF)
+                    ptr[i] = kintsuki_read_u8(h, addr)
+                }
+            case .sram:
+                // LoROM SRAM: $70:0000-$7D:FFFF. Mirror per-bank.
+                for i in 0..<length {
+                    let abs = offset + UInt32(i)
+                    let addr = (UInt32(0x70) << 16) | (abs & 0xFFFF)
+                    ptr[i] = kintsuki_read_u8(h, addr)
+                }
+            case .vram:
+                for i in 0..<length { ptr[i] = kintsuki_vram_read(h, offset + UInt32(i)) }
+            case .cgram:
+                for i in 0..<length { ptr[i] = kintsuki_cgram_read(h, offset + UInt32(i)) }
+            case .oam:
+                for i in 0..<length { ptr[i] = kintsuki_oam_read(h, offset + UInt32(i)) }
+            }
         }
         return Data(buf)
+    }
+
+    /// 256 CGRAM entries decoded to RGB (8-bit per channel).
+    func paletteRGB() -> [(UInt8, UInt8, UInt8)] {
+        guard let h = handle else { return [] }
+        var out: [(UInt8, UInt8, UInt8)] = []
+        out.reserveCapacity(256)
+        for i in 0..<256 {
+            let lo = kintsuki_cgram_read(h, UInt32(i*2))
+            let hi = kintsuki_cgram_read(h, UInt32(i*2 + 1))
+            let bgr = UInt16(lo) | (UInt16(hi) << 8)
+            // 0bbbbb gggggrrrrr
+            let r5 = UInt8((bgr >>  0) & 0x1F)
+            let g5 = UInt8((bgr >>  5) & 0x1F)
+            let b5 = UInt8((bgr >> 10) & 0x1F)
+            // 5-bit → 8-bit (replicate top bits to low bits).
+            out.append(((r5 << 3) | (r5 >> 2),
+                        (g5 << 3) | (g5 >> 2),
+                        (b5 << 3) | (b5 >> 2)))
+        }
+        return out
+    }
+
+    /// Decode a 4bpp 8x8 tile from VRAM at byte offset `addr`. Returns 64
+    /// palette indices (0-15). Caller pairs them with a 16-color sub-palette.
+    func decodeTile4bpp(addr: UInt32) -> [UInt8] {
+        guard let h = handle else { return [] }
+        var pixels = [UInt8](repeating: 0, count: 64)
+        // 4bpp tile = 32 bytes. Planes interleaved 16 bytes / 16 bytes.
+        var raw = [UInt8](repeating: 0, count: 32)
+        for i in 0..<32 { raw[i] = kintsuki_vram_read(h, addr + UInt32(i)) }
+        for y in 0..<8 {
+            let p01_lo = raw[y*2]
+            let p01_hi = raw[y*2 + 1]
+            let p23_lo = raw[16 + y*2]
+            let p23_hi = raw[16 + y*2 + 1]
+            for x in 0..<8 {
+                let bit = UInt8(7 - x)
+                let mask: UInt8 = 1 << bit
+                let p0: UInt8 = (p01_lo & mask) != 0 ? 1 : 0
+                let p1: UInt8 = (p01_hi & mask) != 0 ? 2 : 0
+                let p2: UInt8 = (p23_lo & mask) != 0 ? 4 : 0
+                let p3: UInt8 = (p23_hi & mask) != 0 ? 8 : 0
+                pixels[y*8 + x] = p0 | p1 | p2 | p3
+            }
+        }
+        return pixels
     }
 
     // ----- Save-state slots -----------------------------------------------
@@ -184,6 +291,49 @@ final class Emulator: ObservableObject {
         blob.withUnsafeMutableBytes { _ = kintsuki_save_state(h, $0.baseAddress, size) }
         saveStateSlots[slot] = SaveSlot(data: blob, savedAt: .now)
         NSLog("kintsuki: quick-saved slot \(slot) (\(size) bytes)")
+    }
+
+    // ----- Breakpoints ----------------------------------------------------
+    // Single C callback that bumps the breakpoint's hit counter via the
+    // userdata pointer. We store the index into self.breakpoints there.
+    private static let breakCallback: kintsuki_cb_t = { addr, _value, ud in
+        guard let ud else { return }
+        let ctx = Unmanaged<BreakCallbackContext>.fromOpaque(ud).takeUnretainedValue()
+        ctx.fire(addr: addr)
+    }
+    private final class BreakCallbackContext {
+        weak var owner: Emulator?
+        let bpId: UUID
+        init(owner: Emulator, bpId: UUID) { self.owner = owner; self.bpId = bpId }
+        func fire(addr: UInt32) {
+            // Hop to main since callback runs on the emulator (main) thread.
+            DispatchQueue.main.async { [weak owner, bpId] in
+                guard let owner else { return }
+                if let i = owner.breakpoints.firstIndex(where: { $0.id == bpId }) {
+                    owner.breakpoints[i].hitCount &+= 1
+                    owner.breakpoints[i].lastHit = addr
+                }
+            }
+        }
+    }
+    private var breakContexts: [UUID: BreakCallbackContext] = [:]
+
+    func addBreakpoint(kind: BreakKind, lo: UInt32, hi: UInt32) {
+        guard let h = handle else { return }
+        var bp = Breakpoint(kind: kind, lo: lo, hi: hi)
+        let ctx = BreakCallbackContext(owner: self, bpId: bp.id)
+        breakContexts[bp.id] = ctx
+        let opaque = Unmanaged.passUnretained(ctx).toOpaque()
+        bp.nativeId = Int32(kintsuki_add_callback(h, Int32(kind.rawValue), lo, hi,
+                                                  Self.breakCallback, opaque))
+        breakpoints.append(bp)
+    }
+
+    func removeBreakpoint(_ bp: Breakpoint) {
+        guard let h = handle else { return }
+        kintsuki_remove_callback(h, Int32(bp.kind.rawValue), bp.nativeId)
+        breakContexts.removeValue(forKey: bp.id)
+        breakpoints.removeAll { $0.id == bp.id }
     }
 
     func quickLoad(slot: Int) {
