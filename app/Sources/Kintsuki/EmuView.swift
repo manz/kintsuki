@@ -63,6 +63,7 @@ final class HostView: NSView {
     override func keyDown(with event: NSEvent) {
         guard let emu = emulator else { return }
         if let btn = InputMapper.button(forKeyCode: event.keyCode) {
+            NSLog("kintsuki: keyDown code=\(event.keyCode) btn=\(btn)")
             emu.press(port: 0, button: btn.rawValue, pressed: true)
             return
         }
@@ -76,5 +77,12 @@ final class HostView: NSView {
             return
         }
         super.keyUp(with: event)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        // Reclaim first responder when the user clicks the game area.
+        // SwiftUI sometimes steals focus during commands / menu actions.
+        window?.makeFirstResponder(self)
+        super.mouseDown(with: event)
     }
 }

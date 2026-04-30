@@ -26,6 +26,25 @@ struct KintsukiApp: App {
                 .keyboardShortcut("p", modifiers: .command)
                 Button("Step Frame") { emulator.stepOneFrame() }
                     .keyboardShortcut(".", modifiers: .command)
+                Divider()
+                Button(emulator.inspectorOpen ? "Hide Inspector" : "Show Inspector") {
+                    emulator.inspectorOpen.toggle()
+                }
+                .keyboardShortcut("i", modifiers: .command)
+            }
+            // Save / load state slots — ⌘1-9 / ⇧⌘1-9.
+            CommandMenu("State") {
+                ForEach(1...9, id: \.self) { slot in
+                    Button("Save Slot \(slot)") { emulator.quickSave(slot: slot) }
+                        .keyboardShortcut(KeyEquivalent(Character("\(slot)")),
+                                          modifiers: .command)
+                }
+                Divider()
+                ForEach(1...9, id: \.self) { slot in
+                    Button("Load Slot \(slot)") { emulator.quickLoad(slot: slot) }
+                        .keyboardShortcut(KeyEquivalent(Character("\(slot)")),
+                                          modifiers: [.command, .shift])
+                }
             }
         }
     }
