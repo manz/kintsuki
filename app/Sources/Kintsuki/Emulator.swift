@@ -235,51 +235,103 @@ final class Emulator: ObservableObject {
         return Data(buf)
     }
 
-    /// 256 CGRAM entries decoded to RGB (8-bit per channel).
-    func paletteRGB() -> [(UInt8, UInt8, UInt8)] {
-        guard let h = handle else { return [] }
-        var out: [(UInt8, UInt8, UInt8)] = []
-        out.reserveCapacity(256)
+    // ----- Cached PPU dumps (rebuilt at most ~6 Hz) -----------------------
+    private var vramCache = Data(count: 0x10000)
+    private var cgramCache = Data(count: 0x200)
+    private var paletteCache = [(UInt8, UInt8, UInt8)](repeating: (0,0,0), count: 256)
+    private var tileImageCache: [Int: NSImage] = [:]      // keyed by base+sub-palette
+    private var lastInspectorRefresh: UInt64 = 0
+
+    /// Returns true if we just refreshed (caller can rebuild images).
+    @discardableResult
+    func refreshInspectorCachesIfDue() -> Bool {
+        // Refresh every 10 emulated frames (~6 Hz). Cheap enough.
+        if lastFrameID < lastInspectorRefresh + 10 { return false }
+        lastInspectorRefresh = lastFrameID
+        guard let h = handle else { return false }
+        vramCache.withUnsafeMutableBytes {
+            _ = kintsuki_vram_dump(h, $0.bindMemory(to: UInt8.self).baseAddress, 0x10000)
+        }
+        cgramCache.withUnsafeMutableBytes {
+            _ = kintsuki_cgram_dump(h, $0.bindMemory(to: UInt8.self).baseAddress, 0x200)
+        }
         for i in 0..<256 {
-            let lo = kintsuki_cgram_read(h, UInt32(i*2))
-            let hi = kintsuki_cgram_read(h, UInt32(i*2 + 1))
+            let lo = cgramCache[i*2]
+            let hi = cgramCache[i*2 + 1]
             let bgr = UInt16(lo) | (UInt16(hi) << 8)
-            // 0bbbbb gggggrrrrr
             let r5 = UInt8((bgr >>  0) & 0x1F)
             let g5 = UInt8((bgr >>  5) & 0x1F)
             let b5 = UInt8((bgr >> 10) & 0x1F)
-            // 5-bit → 8-bit (replicate top bits to low bits).
-            out.append(((r5 << 3) | (r5 >> 2),
-                        (g5 << 3) | (g5 >> 2),
-                        (b5 << 3) | (b5 >> 2)))
+            paletteCache[i] = ((r5 << 3) | (r5 >> 2),
+                               (g5 << 3) | (g5 >> 2),
+                               (b5 << 3) | (b5 >> 2))
         }
-        return out
+        tileImageCache.removeAll(keepingCapacity: true)
+        return true
     }
 
-    /// Decode a 4bpp 8x8 tile from VRAM at byte offset `addr`. Returns 64
-    /// palette indices (0-15). Caller pairs them with a 16-color sub-palette.
-    func decodeTile4bpp(addr: UInt32) -> [UInt8] {
-        guard let h = handle else { return [] }
-        var pixels = [UInt8](repeating: 0, count: 64)
-        // 4bpp tile = 32 bytes. Planes interleaved 16 bytes / 16 bytes.
-        var raw = [UInt8](repeating: 0, count: 32)
-        for i in 0..<32 { raw[i] = kintsuki_vram_read(h, addr + UInt32(i)) }
-        for y in 0..<8 {
-            let p01_lo = raw[y*2]
-            let p01_hi = raw[y*2 + 1]
-            let p23_lo = raw[16 + y*2]
-            let p23_hi = raw[16 + y*2 + 1]
-            for x in 0..<8 {
-                let bit = UInt8(7 - x)
-                let mask: UInt8 = 1 << bit
-                let p0: UInt8 = (p01_lo & mask) != 0 ? 1 : 0
-                let p1: UInt8 = (p01_hi & mask) != 0 ? 2 : 0
-                let p2: UInt8 = (p23_lo & mask) != 0 ? 4 : 0
-                let p3: UInt8 = (p23_hi & mask) != 0 ? 8 : 0
-                pixels[y*8 + x] = p0 | p1 | p2 | p3
+    func paletteRGB() -> [(UInt8, UInt8, UInt8)] {
+        refreshInspectorCachesIfDue()
+        return paletteCache
+    }
+
+    /// Render a 16x8 grid of 4bpp tiles starting at VRAM offset `base`,
+    /// using the given 16-colour sub-palette index. Returns a cached
+    /// NSImage (128x64 px, nearest-neighbor).
+    func tileGridImage(base: UInt32, paletteIndex: Int) -> NSImage? {
+        refreshInspectorCachesIfDue()
+        let key = (Int(base) << 8) | (paletteIndex & 0xFF)
+        if let img = tileImageCache[key] { return img }
+
+        let cols = 16, rows = 8, tileSize = 8
+        let w = cols * tileSize
+        let h = rows * tileSize
+        var rgba = [UInt8](repeating: 0, count: w * h * 4)
+
+        let palOff = paletteIndex * 16
+        for tileRow in 0..<rows {
+            for tileCol in 0..<cols {
+                let tileIndex = tileRow * cols + tileCol
+                let tileBase = Int(base) + tileIndex * 32
+                if tileBase + 32 > vramCache.count { continue }
+                for y in 0..<8 {
+                    let p01_lo = vramCache[tileBase + y*2]
+                    let p01_hi = vramCache[tileBase + y*2 + 1]
+                    let p23_lo = vramCache[tileBase + 16 + y*2]
+                    let p23_hi = vramCache[tileBase + 16 + y*2 + 1]
+                    for x in 0..<8 {
+                        let bit = UInt8(7 - x)
+                        let mask: UInt8 = 1 << bit
+                        var idx: UInt8 = 0
+                        if (p01_lo & mask) != 0 { idx |= 1 }
+                        if (p01_hi & mask) != 0 { idx |= 2 }
+                        if (p23_lo & mask) != 0 { idx |= 4 }
+                        if (p23_hi & mask) != 0 { idx |= 8 }
+                        let pal = palOff + Int(idx)
+                        let c = paletteCache[pal & 0xFF]
+                        let dx = tileCol * 8 + x
+                        let dy = tileRow * 8 + y
+                        let off = (dy * w + dx) * 4
+                        rgba[off + 0] = c.0
+                        rgba[off + 1] = c.1
+                        rgba[off + 2] = c.2
+                        rgba[off + 3] = 0xFF
+                    }
+                }
             }
         }
-        return pixels
+
+        guard let provider = CGDataProvider(data: Data(rgba) as CFData) else { return nil }
+        let cs = CGColorSpaceCreateDeviceRGB()
+        guard let cg = CGImage(width: w, height: h, bitsPerComponent: 8,
+                               bitsPerPixel: 32, bytesPerRow: w * 4,
+                               space: cs,
+                               bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
+                               provider: provider, decode: nil, shouldInterpolate: false,
+                               intent: .defaultIntent) else { return nil }
+        let img = NSImage(cgImage: cg, size: NSSize(width: w, height: h))
+        tileImageCache[key] = img
+        return img
     }
 
     // ----- Save-state slots -----------------------------------------------

@@ -53,6 +53,16 @@ void        kintsuki_cgram_write(kintsuki_t*, uint32_t addr, uint8_t v);
 uint8_t     kintsuki_oam_read (kintsuki_t*, uint32_t addr);
 void        kintsuki_oam_write(kintsuki_t*, uint32_t addr, uint8_t v);
 
+// Bulk dumps. One FFI hop for the whole region — way faster than looping
+// per-byte read for inspector views.
+//   VRAM  = 64 KB (n16[32K] copied as little-endian bytes)
+//   CGRAM = 512 B (n15[256])
+//   OAM   = 544 B (512 B sprite table + 32 B high table)
+// Returns bytes actually copied (min of region size and `len`).
+uint32_t    kintsuki_vram_dump (kintsuki_t*, uint8_t* out, uint32_t len);
+uint32_t    kintsuki_cgram_dump(kintsuki_t*, uint8_t* out, uint32_t len);
+uint32_t    kintsuki_oam_dump  (kintsuki_t*, uint8_t* out, uint32_t len);
+
 // CPU state
 void        kintsuki_get_state(kintsuki_t*, kintsuki_cpu_state_t* out);
 void        kintsuki_set_state(kintsuki_t*, const kintsuki_cpu_state_t* in);

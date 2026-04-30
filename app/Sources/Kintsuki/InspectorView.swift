@@ -126,7 +126,7 @@ struct InspectorView: View {
                     .font(.system(.caption2, design: .monospaced))
                 }
             }
-            .id(emulator.lastFrameID / 6)  // refresh ~10 Hz
+            .id(emulator.lastFrameID / 10)  // refresh ~6 Hz
         }
     }
 
@@ -153,7 +153,7 @@ struct InspectorView: View {
                     }
                 }
             }
-            .id(emulator.lastFrameID / 12)  // refresh ~5 Hz
+            .id(emulator.lastFrameID / 30)  // refresh ~2 Hz
         }
     }
 
@@ -184,21 +184,14 @@ struct InspectorView: View {
 
     @ViewBuilder
     private var tileGrid: some View {
-        let colors = emulator.paletteRGB()
-        let paletteOffset = tilePalette * 16
-        VStack(spacing: 1) {
-            ForEach(0..<8, id: \.self) { tileRow in
-                HStack(spacing: 1) {
-                    ForEach(0..<16, id: \.self) { tileCol in
-                        let tileIndex = tileRow * 16 + tileCol
-                        let pixels = emulator.decodeTile4bpp(addr: tileBase + UInt32(tileIndex * 32))
-                        TileView(pixels: pixels,
-                                 paletteOffset: paletteOffset,
-                                 colors: colors)
-                            .frame(width: 16, height: 16)
-                    }
-                }
-            }
+        if let img = emulator.tileGridImage(base: tileBase, paletteIndex: tilePalette) {
+            Image(nsImage: img)
+                .interpolation(.none)
+                .resizable()
+                .aspectRatio(2, contentMode: .fit)  // 16 cols × 8 rows
+                .frame(maxWidth: 256)
+        } else {
+            Rectangle().fill(.secondary.opacity(0.2)).frame(height: 64)
         }
     }
 
@@ -295,30 +288,3 @@ struct InspectorView: View {
     }
 }
 
-/// Renders a decoded 8x8 tile (64 palette indices) as a small image.
-private struct TileView: View {
-    let pixels: [UInt8]
-    let paletteOffset: Int
-    let colors: [(UInt8, UInt8, UInt8)]
-
-    var body: some View {
-        Canvas { ctx, size in
-            let cell = min(size.width / 8.0, size.height / 8.0)
-            for y in 0..<8 {
-                for x in 0..<8 {
-                    let idx = pixels[y*8 + x]
-                    let palIdx = paletteOffset + Int(idx)
-                    let c = palIdx < colors.count ? colors[palIdx] : (0, 0, 0)
-                    let color = Color(.sRGB,
-                                      red: Double(c.0)/255.0,
-                                      green: Double(c.1)/255.0,
-                                      blue: Double(c.2)/255.0)
-                    let rect = CGRect(x: Double(x) * cell,
-                                      y: Double(y) * cell,
-                                      width: cell, height: cell)
-                    ctx.fill(Path(rect), with: .color(color))
-                }
-            }
-        }
-    }
-}
