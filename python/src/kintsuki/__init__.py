@@ -280,28 +280,14 @@ class Emu:
         target_pc: int,
         max_frames: int = 60,
     ) -> bool:
-        """Run the emulator until PC matches `target_pc` (typically a
-        sentinel return address). Returns True if hit, False if we burned
-        through `max_frames` of emulated time without a hit.
+        """Run the emulator until PC matches `target_pc`. Returns True on
+        hit, False if max_frames of emulated time elapsed first.
 
-        Uses an exec callback to bail — way faster than per-instruction
-        Python crossings. `step()` advances a full frame slice, not one
-        instruction, so we drive frames not steps.
-        """
-        hit = [False]
-
-        def cb(addr, _val):
-            hit[0] = True
-
-        cid = self.add_exec_callback(target_pc, target_pc, cb)
-        try:
-            for _ in range(max_frames):
-                self.run_frames(1)
-                if hit[0]:
-                    return True
-        finally:
-            self.remove_callback(CallbackKind.EXEC, cid)
-        return False
+        Backed by kintsuki_run_until in the C ABI: the scheduler bails the
+        moment the CPU is about to execute target_pc, so the captured CPU
+        state is exactly at the sentinel (no over-run by mid-frame slack)."""
+        rc = _native.lib.kintsuki_run_until(self._handle, target_pc, max_frames)
+        return rc != 0
 
     # Sentinel "exit" address. Test stubs jmp here to signal completion;
     # run_asm installs an exec callback at this PC and bails when it fires.
@@ -339,18 +325,8 @@ class Emu:
 
         # Snapshot CPU state in the exec callback, before run_frames(1)
         # finishes its slice and the CPU runs past the sentinel.
-        captured: list[CpuState] = []
-        def cb(_addr, _val):
-            captured.append(self.get_state())
-        cid = self.add_exec_callback(self.EXIT_PC, self.EXIT_PC, cb)
-        try:
-            for _ in range(max_frames):
-                self.run_frames(1)
-                if captured:
-                    break
-        finally:
-            self.remove_callback(CallbackKind.EXEC, cid)
-        return captured[0] if captured else self.get_state()
+        self.run_until(self.EXIT_PC, max_frames=max_frames)
+        return self.get_state()
 
     def call(
         self,
@@ -393,22 +369,12 @@ class Emu:
         self.push_byte((rtl_exit >> 16) & 0xFF)
         self.push_word(sentinel_lo)
 
-        captured: list[CpuState] = []
-        def cb(_addr, _val):
-            captured.append(self.get_state())
-        c1 = self.add_exec_callback(rtl_exit, rtl_exit, cb)
-        c2 = (self.add_exec_callback(rts_exit, rts_exit, cb)
-              if rts_exit != rtl_exit else None)
-        try:
-            for _ in range(max_frames):
-                self.run_frames(1)
-                if captured:
-                    break
-        finally:
-            self.remove_callback(CallbackKind.EXEC, c1)
-            if c2 is not None:
-                self.remove_callback(CallbackKind.EXEC, c2)
-        return captured[0] if captured else self.get_state()
+        # Try RTL exit first (long-form return); if that doesn't fire,
+        # fall through to RTS exit in the function's bank.
+        if not self.run_until(rtl_exit, max_frames=max_frames):
+            if rts_exit != rtl_exit:
+                self.run_until(rts_exit, max_frames=max_frames)
+        return self.get_state()
 
     # --------------------------------------------------------------- Cleanup
     def close(self) -> None:

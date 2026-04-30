@@ -105,6 +105,7 @@ _bind("kintsuki_load_rom", c_int, [HANDLE, c_char_p])
 _bind("kintsuki_run_frames", None, [HANDLE, c_uint32])
 _bind("kintsuki_step", None, [HANDLE])
 _bind("kintsuki_frame_count", c_uint64, [HANDLE])
+_bind("kintsuki_run_until", c_int, [HANDLE, c_uint32, c_uint32])
 
 # Memory
 _bind("kintsuki_read_u8", c_uint8, [HANDLE, c_uint32])
