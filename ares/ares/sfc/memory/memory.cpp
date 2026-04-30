@@ -4,6 +4,10 @@ namespace ares::SuperFamicom {
 
 Bus bus;
 
+BusHook memReadHook = nullptr;
+BusHook memWriteHook = nullptr;
+ExecHook execHook = nullptr;
+
 Bus::~Bus() {
   if(lookup) delete[] lookup;
   if(target) delete[] target;

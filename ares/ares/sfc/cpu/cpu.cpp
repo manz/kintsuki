@@ -32,6 +32,7 @@ auto CPU::main() -> void {
 
   if(!status.interruptPending) {
     debugger.instruction();
+    if(execHook) execHook(r.pc.d);
     return instruction();
   }
 

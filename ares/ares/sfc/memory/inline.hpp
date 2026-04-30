@@ -27,9 +27,12 @@ alwaysinline auto Bus::read(n24 address, n8 data) -> n8 {
   if(!(address & 0x40e000)) address = 0x7e0000 | (address & 0x1fff);  //de-mirror WRAM
   if(auto result = platform->cheat(address)) return *result;
 
-  return reader[lookup[address]](target[address], data);
+  n8 value = reader[lookup[address]](target[address], data);
+  if(memReadHook) memReadHook(address, value);
+  return value;
 }
 
 alwaysinline auto Bus::write(n24 address, n8 data) -> void {
+  if(memWriteHook) memWriteHook(address, data);
   return writer[lookup[address]](target[address], data);
 }

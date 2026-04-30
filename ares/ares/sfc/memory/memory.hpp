@@ -52,3 +52,14 @@ private:
 };
 
 extern Bus bus;
+
+// kintsuki test-harness hooks. Set non-null to receive a callback after
+// each CPU bus read or write. Branch is folded by the predictor when null.
+using BusHook = void (*)(u32 addr, u8 value);
+extern BusHook memReadHook;
+extern BusHook memWriteHook;
+
+// CPU exec hook fires before each WDC65816 instruction with the current
+// 24-bit PC (cpu.r.pc.d).
+using ExecHook = void (*)(u32 pc);
+extern ExecHook execHook;
