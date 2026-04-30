@@ -50,7 +50,11 @@ set_target_properties(kintsuki PROPERTIES
 # visible on the shared library boundary.
 target_compile_options(kintsuki PRIVATE -fvisibility=default)
 
-target_link_libraries(kintsuki PRIVATE kintsuki-program)
+target_link_libraries(kintsuki PRIVATE
+  kintsuki-program
+  ares::ares
+  ares::nall
+)
 
 # ---------------------------------------------------------------------------
 # Executable: Lua test runner CLI (LuaJIT 2.1, homebrew)

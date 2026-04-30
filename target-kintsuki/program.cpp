@@ -153,6 +153,15 @@ auto Program::loadRom(const char* path) -> bool {
   cartManifest = string{m.c_str()};
 
   cartPak = std::make_shared<vfs::directory>();
+  // ares' Cartridge::connect() reads title/region/board as pak ATTRIBUTES,
+  // not from the manifest text. Without these set, loadBoard("") fails,
+  // no memory map gets built, and the CPU executes 0xFF from a null bus.
+  // ares' Cartridge::connect() reads title/region/board as pak ATTRIBUTES,
+  // not from the manifest text. Without these, loadBoard("") fails, no
+  // memory map gets built, and the CPU executes 0xFF from a null bus.
+  cartPak->setAttribute("title",  string{info.title.c_str()});
+  cartPak->setAttribute("region", string{info.region.c_str()});
+  cartPak->setAttribute("board",  string{info.board.c_str()});
   attachFile(cartPak, "manifest.bml", std::vector<uint8_t>(m.begin(), m.end()));
 
   if(romData.size() < info.programSize) {
@@ -168,14 +177,29 @@ auto Program::loadRom(const char* path) -> bool {
 }
 
 auto Program::bootRom() -> bool {
-  // Default to the performance PPU (faster, sufficient for headless testing).
-  // Without this call ares' PPUBase::implementation stays nullptr and
-  // System::power() crashes.
+  // Performance PPU works fine — the earlier "no pixels" symptom was the
+  // missing port.allocate/connect call (see below), not a PPU choice.
   SuperFamicom::ppu.setAccurate(false);
 
   Node::System root;
   string profile = "[Nintendo] Super Famicom (NTSC)";
   if(!SuperFamicom::load(root, profile)) return false;
+
+  // Walk the node tree to find the Cartridge Slot port and allocate +
+  // connect it. ares' desktop UI does this after the user picks a ROM;
+  // headless we do it programmatically. Without this loadCartridge()
+  // never runs, no memory map is built, the CPU executes 0xFF garbage,
+  // and the PPU outputs an all-black framebuffer.
+  for(auto& node : *root) {
+    auto port = std::dynamic_pointer_cast<Core::Port>(node);
+    if(!port) continue;
+    if(port->name().match("*Cartridge*")) {
+      port->allocate(port->name());
+      port->connect();
+      break;
+    }
+  }
+
   SuperFamicom::system.power(false);
   loaded = true;
   return true;
