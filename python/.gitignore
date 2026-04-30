@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+src/kintsuki/_lib/*.dylib
+src/kintsuki/_lib/*.so
+src/kintsuki/_lib/*.dll
