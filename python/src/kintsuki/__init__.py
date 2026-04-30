@@ -23,7 +23,51 @@ __all__ = [
     "Button",
     "CpuState",
     "CallbackKind",
+    "SymbolTable",
 ]
+
+
+import re
+from pathlib import Path
+
+
+class SymbolTable:
+    """Parse a ca65 / Mesen .sym file ('BB:OOOO name' lines).
+
+    Looks up by symbol name → 24-bit address. Convenience for unit tests
+    that drive the CPU at named entry points.
+
+    >>> syms = SymbolTable("ff4.sym")
+    >>> syms["GetKerningAdjustmentLinearSearch"]
+    0x208297
+    """
+
+    _LINE = re.compile(r"\s*([0-9a-fA-F]+):([0-9a-fA-F]+)\s+(\S+)")
+
+    def __init__(self, path: str | Path):
+        self._addrs: dict[str, int] = {}
+        text = Path(path).read_text()
+        for line in text.splitlines():
+            m = self._LINE.match(line)
+            if not m:
+                continue
+            bank, off, name = m.groups()
+            self._addrs[name] = (int(bank, 16) << 16) | int(off, 16)
+
+    def __getitem__(self, name: str) -> int:
+        return self._addrs[name]
+
+    def get(self, name: str, default: int | None = None) -> int | None:
+        return self._addrs.get(name, default)
+
+    def __contains__(self, name: str) -> bool:
+        return name in self._addrs
+
+    def __len__(self) -> int:
+        return len(self._addrs)
+
+    def names(self) -> list[str]:
+        return list(self._addrs.keys())
 
 
 class Button:
@@ -100,6 +144,12 @@ class Emu:
         buf = (ctypes.c_uint8 * length)()
         n = _native.lib.kintsuki_read_range(self._handle, addr, length, buf)
         return bytes(buf[:n])
+
+    def write_range(self, addr: int, data: bytes | bytearray) -> None:
+        """Bulk write `data` starting at `addr` (CPU bus, 24-bit). Useful
+        for dropping assembled stubs into WRAM as test harnesses."""
+        for i, b in enumerate(data):
+            _native.lib.kintsuki_write_u8(self._handle, addr + i, b & 0xFF)
 
     # PPU memory
     def vram_read(self, addr: int) -> int:
@@ -209,6 +259,156 @@ class Emu:
         self._registered = [
             r for r in self._registered if not (r.kind == kind and r.cb_id == cb_id)
         ]
+
+    # ----- High-level test helpers ---------------------------------------
+
+    def push_byte(self, value: int) -> None:
+        """Push a byte onto the 65816 stack ($00:0100-$01FF)."""
+        s = self.get_state()
+        self.write(0x100 | (s.s & 0xFF), value & 0xFF)
+        s.s = (s.s - 1) & 0xFFFF
+        self.set_state(s)
+
+    def push_word(self, value: int) -> None:
+        """Push a 16-bit word onto the stack (little-endian: high byte first
+        so RTS pulls low then high). 65816 stack convention."""
+        self.push_byte((value >> 8) & 0xFF)
+        self.push_byte((value >> 0) & 0xFF)
+
+    def run_until(
+        self,
+        target_pc: int,
+        max_frames: int = 60,
+    ) -> bool:
+        """Run the emulator until PC matches `target_pc` (typically a
+        sentinel return address). Returns True if hit, False if we burned
+        through `max_frames` of emulated time without a hit.
+
+        Uses an exec callback to bail — way faster than per-instruction
+        Python crossings. `step()` advances a full frame slice, not one
+        instruction, so we drive frames not steps.
+        """
+        hit = [False]
+
+        def cb(addr, _val):
+            hit[0] = True
+
+        cid = self.add_exec_callback(target_pc, target_pc, cb)
+        try:
+            for _ in range(max_frames):
+                self.run_frames(1)
+                if hit[0]:
+                    return True
+        finally:
+            self.remove_callback(CallbackKind.EXEC, cid)
+        return False
+
+    # Sentinel "exit" address. Test stubs jmp here to signal completion;
+    # run_asm installs an exec callback at this PC and bails when it fires.
+    # Lives in the very top of bank-0 mirror (unmapped → reads as 0xFF →
+    # never executed by real code).
+    EXIT_PC: int = 0x00FFFC
+
+    def run_asm(
+        self,
+        code: bytes | bytearray,
+        *,
+        load_addr: int = 0x7E0000,
+        a: int = 0,
+        x: int = 0,
+        y: int = 0,
+        max_frames: int = 60,
+    ) -> CpuState:
+        """Drop `code` into WRAM at `load_addr`, set CPU regs, run until the
+        stub jumps to EXIT_PC. Returns the CPU state captured the moment
+        the sentinel was hit (snapshotted from inside the exec callback).
+        """
+        EXIT_OPCODE = bytes([0x5C, 0xFC, 0xFF, 0x00])
+        payload = bytes(code)
+        if not payload.endswith(EXIT_OPCODE):
+            payload += EXIT_OPCODE
+        self.write_range(load_addr, payload)
+
+        s = self.get_state()
+        s.pc = load_addr & 0xFFFFFF
+        s.a = a & 0xFFFF
+        s.x = x & 0xFFFF
+        s.y = y & 0xFFFF
+        s.s = 0x1FFF
+        self.set_state(s)
+
+        # Snapshot CPU state in the exec callback, before run_frames(1)
+        # finishes its slice and the CPU runs past the sentinel.
+        captured: list[CpuState] = []
+        def cb(_addr, _val):
+            captured.append(self.get_state())
+        cid = self.add_exec_callback(self.EXIT_PC, self.EXIT_PC, cb)
+        try:
+            for _ in range(max_frames):
+                self.run_frames(1)
+                if captured:
+                    break
+        finally:
+            self.remove_callback(CallbackKind.EXEC, cid)
+        return captured[0] if captured else self.get_state()
+
+    def call(
+        self,
+        func_addr: int,
+        a: int = 0,
+        x: int = 0,
+        y: int = 0,
+        max_frames: int = 60,
+    ) -> CpuState:
+        """Direct-call a 65816 routine.
+
+        Sets PC = func_addr, A/X/Y to the requested values, pushes a sentinel
+        return address (long-form, so this works for both RTS and RTL),
+        then runs until the sentinel is hit. Returns the CPU state at that
+        point so you can read result registers.
+
+        Caller is responsible for routine being a leaf-ish pure function:
+        no NMI/IRQ-dependent logic, no SMP handshake, no DMA setup. Best
+        for ROM-table lookups and arithmetic helpers.
+        """
+        # Two possible exit addresses depending on whether the routine uses
+        # RTS (16-bit pop, stays in current PB) or RTL (24-bit pop, jumps
+        # to bank we pushed). Cover both:
+        #   - rts_exit: same bank as the function, low 16 bits = $FFFC
+        #   - rtl_exit: bank $00, low 16 bits = $FFFC
+        sentinel_lo = 0xFFFC
+        rtl_exit = 0x000000 | sentinel_lo
+        rts_exit = (func_addr & 0xFF0000) | sentinel_lo
+
+        s = self.get_state()
+        s.pc = func_addr & 0xFFFFFF
+        s.a = a & 0xFFFF
+        s.x = x & 0xFFFF
+        s.y = y & 0xFFFF
+        s.s = 0x1FFF
+        self.set_state(s)
+        # Push long-form return so RTL works. RTS only pops the lower two
+        # bytes; the bank byte we push above is then unused but doesn't
+        # hurt anything.
+        self.push_byte((rtl_exit >> 16) & 0xFF)
+        self.push_word(sentinel_lo)
+
+        captured: list[CpuState] = []
+        def cb(_addr, _val):
+            captured.append(self.get_state())
+        c1 = self.add_exec_callback(rtl_exit, rtl_exit, cb)
+        c2 = (self.add_exec_callback(rts_exit, rts_exit, cb)
+              if rts_exit != rtl_exit else None)
+        try:
+            for _ in range(max_frames):
+                self.run_frames(1)
+                if captured:
+                    break
+        finally:
+            self.remove_callback(CallbackKind.EXEC, c1)
+            if c2 is not None:
+                self.remove_callback(CallbackKind.EXEC, c2)
+        return captured[0] if captured else self.get_state()
 
     # --------------------------------------------------------------- Cleanup
     def close(self) -> None:
