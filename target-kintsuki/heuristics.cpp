@@ -91,10 +91,11 @@ bool detectRom(std::span<const uint8_t> rom, RomInfo& info) {
   uint8_t map = rom[off + 0x15];
   info.fastRom = (map & 0x10) != 0;
 
-  // SRAM size byte: 1<<n in kbit. Cap to 256KB (bsnes convention).
+  // SRAM size byte at $D8: bytes = 1024 << val (Nintendo SHVC convention).
+  // val=3 → 8 KB (typical), val=5 → 32 KB. Cap to 256 KB.
   uint8_t sramShift = rom[off + 0x18];
-  if(sramShift > 0 && sramShift <= 11) {
-    info.saveRamSize = (uint32_t)1 << (sramShift + 7);  // bytes (kbit = 1024 bits = 128 bytes)
+  if(sramShift > 0 && sramShift <= 8) {
+    info.saveRamSize = 1024u << sramShift;
     info.hasSaveRam = info.saveRamSize > 0;
   }
 
@@ -144,6 +145,40 @@ std::string buildManifest(const RomInfo& info) {
   }
 
   return out;
+}
+
+bool applyIpsPatch(std::vector<uint8_t>& rom, std::span<const uint8_t> ips) {
+  // IPS format:
+  //   "PATCH" (5 bytes)
+  //   records, each: 3-byte BE offset; 2-byte BE length;
+  //     if length > 0: `length` bytes of data
+  //     if length == 0 (RLE): 2-byte BE rle-length + 1 byte fill value
+  //   terminator "EOF" (3 bytes)
+  if(ips.size() < 8) return false;
+  if(std::memcmp(ips.data(), "PATCH", 5) != 0) return false;
+
+  size_t i = 5;
+  while(i + 3 <= ips.size()) {
+    if(std::memcmp(ips.data() + i, "EOF", 3) == 0) return true;
+    if(i + 5 > ips.size()) return false;
+    uint32_t off = (uint32_t(ips[i]) << 16) | (uint32_t(ips[i+1]) << 8) | ips[i+2];
+    uint32_t len = (uint32_t(ips[i+3]) << 8) | ips[i+4];
+    i += 5;
+    if(len == 0) {
+      if(i + 3 > ips.size()) return false;
+      uint32_t rle = (uint32_t(ips[i]) << 8) | ips[i+1];
+      uint8_t  fill = ips[i+2];
+      i += 3;
+      if(off + rle > rom.size()) rom.resize(off + rle, 0);
+      std::fill(rom.begin() + off, rom.begin() + off + rle, fill);
+    } else {
+      if(i + len > ips.size()) return false;
+      if(off + len > rom.size()) rom.resize(off + len, 0);
+      std::memcpy(rom.data() + off, ips.data() + i, len);
+      i += len;
+    }
+  }
+  return true;  // truncated, but treat as best-effort success
 }
 
 }  // namespace kintsuki

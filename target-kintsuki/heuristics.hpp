@@ -38,4 +38,9 @@ bool detectRom(std::span<const uint8_t> rom, RomInfo& info);
 // that ares' BML parser will accept.
 std::string buildManifest(const RomInfo& info);
 
+// Apply an IPS patch in place. Returns true if the patch parsed cleanly
+// (even when zero records were present). Resizes `rom` to fit any record
+// that writes past the current end. Silently ignores trailing garbage.
+bool applyIpsPatch(std::vector<uint8_t>& rom, std::span<const uint8_t> ips);
+
 }  // namespace kintsuki

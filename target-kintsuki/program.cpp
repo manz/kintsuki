@@ -146,6 +146,25 @@ auto Program::loadRom(const char* path) -> bool {
     romData.erase(romData.begin(), romData.begin() + 512);
   }
 
+  // Auto-apply an IPS patch sitting next to the ROM. ares' upstream loader
+  // doesn't do this in headless — we duplicate mia's behaviour here.
+  // Two locations: <rom>.ips (preferred) and <rom-without-ext>.ips.
+  auto tryPatch = [&](const std::string& patchPath) {
+    auto ips = readFile(patchPath.c_str());
+    if(ips.empty()) return false;
+    bool ok = kintsuki::applyIpsPatch(romData, std::span<const uint8_t>(ips.data(), ips.size()));
+    if(ok) std::fprintf(stderr, "kintsuki: applied IPS %s (%zu bytes)\n",
+                        patchPath.c_str(), ips.size());
+    return ok;
+  };
+  std::string p = path;
+  // <rom>.ips
+  if(!tryPatch(p + ".ips")) {
+    // <rom-without-extension>.ips
+    auto dot = p.find_last_of('.');
+    if(dot != std::string::npos) tryPatch(p.substr(0, dot) + ".ips");
+  }
+
   kintsuki::RomInfo info;
   if(!kintsuki::detectRom(romData, info)) return false;
 
@@ -163,6 +182,16 @@ auto Program::loadRom(const char* path) -> bool {
   cartPak->setAttribute("region", string{info.region.c_str()});
   cartPak->setAttribute("board",  string{info.board.c_str()});
   attachFile(cartPak, "manifest.bml", std::vector<uint8_t>(m.begin(), m.end()));
+
+  // Zero-filled save.ram if the board declares SRAM. ares' loadMap binds
+  // a reader function pointing into cart.ram.data(); if ram was never
+  // allocated (no save.ram in pak), the first SRAM access dereferences
+  // null and crashes — happens fast for games that touch cart RAM during
+  // boot (e.g. FF4 reads $38:07FE during its startup vector).
+  if(info.hasSaveRam && info.saveRamSize > 0) {
+    attachFile(cartPak, "save.ram",
+               std::vector<uint8_t>(info.saveRamSize, 0));
+  }
 
   if(romData.size() < info.programSize) {
     romData.resize(info.programSize, 0);
