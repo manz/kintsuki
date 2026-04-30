@@ -33,6 +33,13 @@ auto CPU::main() -> void {
   if(!status.interruptPending) {
     debugger.instruction();
     if(execHook) execHook(r.pc.d);
+    // kintsuki: a hook may flag a bail to stop emulation at a sentinel PC.
+    // Yield from the scheduler so System::run() returns to the host loop.
+    extern volatile bool kintsukiBailRequested;
+    if(kintsukiBailRequested) {
+      kintsukiBailRequested = false;
+      scheduler.exit(Event::Frame);
+    }
     return instruction();
   }
 

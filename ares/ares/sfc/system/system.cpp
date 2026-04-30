@@ -64,6 +64,13 @@ auto System::run() -> void {
   if(!reset && controls.reset->value()) power(true);
 }
 
+// kintsuki test-harness primitive: yield from the scheduler the moment
+// any installed exec/read/write hook signals via this flag. Used by
+// kintsuki_run_until so call() can land on a sentinel mid-frame instead
+// of running a full frame past it.
+__attribute__((visibility("default")))
+volatile bool kintsukiBailRequested = false;
+
 auto System::load(Node::System& root, string name) -> bool {
   if(node) unload();
 
