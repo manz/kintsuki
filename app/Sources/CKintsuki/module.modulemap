@@ -1,0 +1,5 @@
+module CKintsuki {
+  header "kintsuki.h"
+  link "kintsuki"
+  export *
+}

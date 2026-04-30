@@ -1,0 +1,5 @@
+Kintsuki.xcodeproj/
+Vendor/libkintsuki.dylib
+Vendor/System/
+build/
+.DS_Store

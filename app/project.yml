@@ -1,0 +1,99 @@
+name: Kintsuki
+options:
+  bundleIdPrefix: net.ringum
+  deploymentTarget:
+    macOS: "26.0"
+  generateEmptyDirectories: true
+  createIntermediateGroups: true
+
+settings:
+  base:
+    MARKETING_VERSION: "0.1"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.10"
+    MACOSX_DEPLOYMENT_TARGET: "26.0"
+    ONLY_ACTIVE_ARCH: YES
+    ARCHS: arm64
+    ENABLE_HARDENED_RUNTIME: YES
+    CODE_SIGN_STYLE: Automatic
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+
+targets:
+  Kintsuki:
+    type: application
+    platform: macOS
+    sources:
+      - path: Sources/Kintsuki
+      - path: Sources/CKintsuki
+    info:
+      path: Resources/Info.plist
+      properties:
+        CFBundleIdentifier: net.ringum.kintsuki
+        CFBundleName: Kintsuki
+        CFBundleDisplayName: Kintsuki
+        CFBundleShortVersionString: $(MARKETING_VERSION)
+        CFBundleVersion: $(CURRENT_PROJECT_VERSION)
+        LSMinimumSystemVersion: $(MACOSX_DEPLOYMENT_TARGET)
+        NSHumanReadableCopyright: "© 2026 ringum"
+        CFBundleDocumentTypes:
+          - CFBundleTypeName: SNES ROM
+            CFBundleTypeRole: Viewer
+            LSItemContentTypes:
+              - public.data
+            CFBundleTypeExtensions:
+              - sfc
+              - smc
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: net.ringum.kintsuki
+        PRODUCT_NAME: Kintsuki
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.developer-tools
+        # CKintsuki module map + libkintsuki.dylib live in Vendor/.
+        SWIFT_INCLUDE_PATHS: $(SRCROOT)/Sources/CKintsuki
+        LIBRARY_SEARCH_PATHS:
+          - $(SRCROOT)/Vendor
+        OTHER_LDFLAGS: -lkintsuki
+        # @rpath for the embedded dylib; install_name_tool fixes the load
+        # path during the embed-copy build phase below.
+        LD_RUNPATH_SEARCH_PATHS: "@executable_path/../Frameworks"
+    dependencies:
+      - sdk: MetalKit.framework
+      - sdk: Metal.framework
+      - sdk: CoreGraphics.framework
+      - sdk: AppKit.framework
+    preBuildScripts:
+      - name: Build libkintsuki + sync System pak
+        basedOnDependencyAnalysis: false
+        script: |
+          set -e
+          REPO="$SRCROOT/.."
+          if [ ! -d "$REPO/build" ]; then
+            cmake -S "$REPO/ares" -B "$REPO/build" -G Ninja \
+              -DCMAKE_C_COMPILER=/usr/bin/clang \
+              -DCMAKE_CXX_COMPILER=/usr/bin/clang++
+          fi
+          cmake --build "$REPO/build" --target kintsuki
+          mkdir -p "$SRCROOT/Vendor"
+          cp "$REPO/build/target-kintsuki/libkintsuki.dylib" "$SRCROOT/Vendor/"
+          # ares System/ pak (boards.bml + ipl.rom) lives next to the dylib
+          # so the bundle copy phase ships it as a Resource.
+          rsync -a --delete "$REPO/ares/ares/System/" "$SRCROOT/Vendor/System/"
+          # Fix install_name to @rpath for embedded loading.
+          install_name_tool -id @rpath/libkintsuki.dylib "$SRCROOT/Vendor/libkintsuki.dylib" || true
+    postBuildScripts:
+      - name: Embed libkintsuki + System pak into bundle
+        basedOnDependencyAnalysis: false
+        script: |
+          set -e
+          mkdir -p "$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH"
+          cp "$SRCROOT/Vendor/libkintsuki.dylib" \
+             "$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH/"
+          # ares System pak (boards.bml + ipl.rom) — Emulator.swift sets
+          # KINTSUKI_SYSTEM_PAK from Bundle.main.resourcePath at startup.
+          mkdir -p "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
+          rsync -a --delete "$SRCROOT/Vendor/System/" \
+             "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/System/"
+          # Re-sign now that Frameworks/ is populated.
+          /usr/bin/codesign --force --sign - \
+             --entitlements "$BUILT_PRODUCTS_DIR/$TARGET_NAME.app.xcent" \
+             "$TARGET_BUILD_DIR/$WRAPPER_NAME" || true
