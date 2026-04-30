@@ -18,7 +18,7 @@ final class Emulator: ObservableObject {
     private(set) var fbHeight: UInt32 = 0
 
     private var handle: OpaquePointer?
-    private var displayLink: CADisplayLink?
+    private var runTimer: Timer?
 
     init() {
         // Set KINTSUKI_SYSTEM_PAK env var so the dylib finds boards.bml/ipl.rom
@@ -39,23 +39,34 @@ final class Emulator: ObservableObject {
     // ----- ROM lifecycle ---------------------------------------------------
     func openRomViaPanel() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = []
+        // Don't filter: macOS 14+ rejects an empty allowedContentTypes array
+        // outright, and an explicit UTType list excludes ROMs Finder didn't
+        // tag with a recognised type. Just let the user pick any file.
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
+        panel.canChooseFiles = true
         panel.message = "Select a SNES ROM (.sfc / .smc)"
-        if panel.runModal() == .OK, let url = panel.url {
+        panel.prompt = "Open"
+        let response = panel.runModal()
+        NSLog("kintsuki: open panel response=\(response.rawValue) url=\(panel.url?.path ?? "nil")")
+        if response == .OK, let url = panel.url {
             loadROM(url)
         }
     }
 
     func loadROM(_ url: URL) {
-        guard let h = handle else { return }
+        guard let h = handle else {
+            NSLog("kintsuki: loadROM called with nil handle")
+            return
+        }
         let path = url.path
+        NSLog("kintsuki: loadROM path=\(path)")
         let ok = path.withCString { kintsuki_load_rom(h, $0) }
         guard ok != 0 else {
             NSLog("kintsuki: failed to load ROM at \(path)")
             return
         }
+        NSLog("kintsuki: ROM loaded successfully")
         loadedROM = url
         running = true
         startRunLoop()
@@ -80,18 +91,29 @@ final class Emulator: ObservableObject {
     }
 
     private func startRunLoop() {
-        guard displayLink == nil else { return }
-        let link = NSScreen.main?.displayLink(target: self, selector: #selector(tick))
-        link?.add(to: .main, forMode: .common)
-        displayLink = link
+        guard runTimer == nil else { return }
+        // 60 Hz Timer is simpler than CADisplayLink for emulation pacing.
+        // The MTKView runs its own display sync, so we just need to advance
+        // the emulator at roughly the source frame rate.
+        let timer = Timer.scheduledTimer(withTimeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            // Hop to main actor since Timer fires on the run loop's thread
+            // (which is main here, but explicit hop satisfies the actor).
+            Task { @MainActor in self.tick() }
+        }
+        timer.tolerance = 1.0 / 240.0
+        RunLoop.main.add(timer, forMode: .common)
+        runTimer = timer
+        NSLog("kintsuki: run loop started")
     }
 
     private func stopRunLoop() {
-        displayLink?.invalidate()
-        displayLink = nil
+        runTimer?.invalidate()
+        runTimer = nil
+        NSLog("kintsuki: run loop stopped")
     }
 
-    @objc private func tick() {
+    private func tick() {
         guard running, let h = handle else { return }
         kintsuki_run_frames(h, 1)
         snapshotFramebuffer()
