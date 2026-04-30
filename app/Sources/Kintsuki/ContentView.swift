@@ -6,6 +6,7 @@ struct ContentView: View {
     var body: some View {
         ZStack {
             EmuView(emulator: emulator)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color.black)
             if emulator.loadedROM == nil {
                 VStack(spacing: 12) {

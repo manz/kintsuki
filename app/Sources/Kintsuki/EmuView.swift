@@ -14,11 +14,14 @@ struct EmuView: NSViewRepresentable {
     func makeNSView(context: Context) -> NSView {
         let host = HostView()
         host.emulator = emulator
+        host.wantsLayer = true
+        host.layer?.backgroundColor = NSColor.black.cgColor
 
         let mtk = MTKView(frame: .zero)
         mtk.preferredFramesPerSecond = 60
         mtk.clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
         mtk.translatesAutoresizingMaskIntoConstraints = false
+        mtk.wantsLayer = true
 
         if let renderer = MetalRenderer(view: mtk) {
             renderer.emulator = emulator
@@ -33,6 +36,7 @@ struct EmuView: NSViewRepresentable {
             mtk.leadingAnchor.constraint(equalTo: host.leadingAnchor),
             mtk.trailingAnchor.constraint(equalTo: host.trailingAnchor),
         ])
+        NSLog("kintsuki: EmuView makeNSView host=\(host) mtk=\(mtk)")
         return host
     }
 

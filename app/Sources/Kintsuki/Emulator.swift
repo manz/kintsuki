@@ -26,6 +26,14 @@ final class Emulator: ObservableObject {
         if let res = Bundle.main.resourcePath {
             let pak = res + "/System/Super Famicom"
             setenv("KINTSUKI_SYSTEM_PAK", pak, 1)
+            let fm = FileManager.default
+            let boards = pak + "/boards.bml"
+            let ipl = pak + "/ipl.rom"
+            NSLog("kintsuki: system pak = \(pak)")
+            NSLog("kintsuki: boards.bml exists=\(fm.fileExists(atPath: boards))")
+            NSLog("kintsuki: ipl.rom    exists=\(fm.fileExists(atPath: ipl))")
+        } else {
+            NSLog("kintsuki: WARN no Bundle.main.resourcePath")
         }
         handle = kintsuki_create()
     }
@@ -130,6 +138,13 @@ final class Emulator: ObservableObject {
         fbWidth = w
         fbHeight = h2
         lastFrameID &+= 1
+        if lastFrameID % 60 == 0 {
+            let sample = framebuffer.prefix(32).map { String(format: "%02X", $0) }.joined(separator: " ")
+            let nonzero = framebuffer.contains { $0 != 0 }
+            var s = kintsuki_cpu_state_t()
+            kintsuki_get_state(h, &s)
+            NSLog("kintsuki: fb#\(lastFrameID) sample=\(sample) nz=\(nonzero) PC=$\(String(format: "%06X", s.pc)) A=\(String(format: "%04X", s.a))")
+        }
     }
 
     // ----- Input ------------------------------------------------------------
