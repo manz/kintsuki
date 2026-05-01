@@ -64,6 +64,8 @@ class CpuState(Structure):
         ("p", c_uint8),
         ("pc", c_uint32),
         ("e", c_uint8),
+        ("stp", c_uint8),
+        ("wai", c_uint8),
     ]
 
     def __repr__(self) -> str:
@@ -106,6 +108,7 @@ _bind("kintsuki_run_frames", None, [HANDLE, c_uint32])
 _bind("kintsuki_step", None, [HANDLE])
 _bind("kintsuki_frame_count", c_uint64, [HANDLE])
 _bind("kintsuki_run_until", c_int, [HANDLE, c_uint32, c_uint32])
+_bind("kintsuki_rearm_cpu", None, [HANDLE])
 
 # Memory
 _bind("kintsuki_read_u8", c_uint8, [HANDLE, c_uint32])

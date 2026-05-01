@@ -305,6 +305,8 @@ auto Program::getCpuState() const -> CpuState {
   s.p  = (uint8_t) (n8)r.p;
   s.pc = (uint32_t)(uint32_t)r.pc.d;
   s.e  = r.e;
+  s.stp = r.stp;
+  s.wai = r.wai;
   return s;
 }
 
@@ -319,6 +321,11 @@ auto Program::setCpuState(const CpuState& s) -> void {
   r.p    = s.p;
   r.pc.d = s.pc;
   r.e    = s.e;
+  r.wai  = s.wai;
+  r.stp  = s.stp;
+  // Clear pending interrupts so the next scheduler entry doesn't divert
+  // through the reset/NMI/IRQ vector and clobber the PC we just set.
+  SuperFamicom::cpu.clearPendingInterrupts();
 }
 
 auto Program::saveStateBlob() -> std::vector<uint8_t> {

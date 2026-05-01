@@ -22,6 +22,16 @@ struct CPU : WDC65816, Thread, PPUcounter {
 
   auto interruptPending() const -> bool override { return status.interruptPending; }
   auto pio() const -> n8 { return io.pio; }
+
+  // kintsuki: clear all pending interrupts so an external set_state PC
+  // override survives the next scheduler entry. Without this the reset/
+  // NMI/IRQ vector dispatch reloads PC and clobbers the override.
+  auto clearPendingInterrupts() -> void {
+    status.resetPending = 0;
+    status.nmiPending = 0;
+    status.irqPending = 0;
+    status.interruptPending = 0;
+  }
   auto refresh() const -> bool { return status.dramRefresh == 1; }
   auto synchronizing() const -> bool override { return scheduler.synchronizing(); }
 

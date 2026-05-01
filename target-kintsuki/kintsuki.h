@@ -17,6 +17,8 @@ typedef struct {
   uint8_t  b, p;
   uint32_t pc;   // 24-bit
   uint8_t  e;    // emulation flag (1 = 6502 mode)
+  uint8_t  stp;  // 1 if CPU is halted by STP
+  uint8_t  wai;  // 1 if CPU is waiting for IRQ via WAI
 } kintsuki_cpu_state_t;
 
 // 0=exec, 1=read, 2=write
@@ -44,6 +46,13 @@ uint64_t    kintsuki_frame_count(kintsuki_t*);
 // to execute target_pc — does NOT wait for vblank. Returns 1 on hit,
 // 0 if max_frames of emulated time elapsed without reaching the target.
 int         kintsuki_run_until(kintsuki_t*, uint32_t target_pc, uint32_t max_frames);
+
+// Rearm the CPU coroutine. Use this between back-to-back test stubs that
+// end with STP — the CPU coroutine is suspended inside instructionStop's
+// idle loop, and just clearing r.stp doesn't unwind it cleanly. Rearm
+// destroys + recreates the libco coroutine, clears pending interrupts,
+// preserves WRAM and all other emulator state. Cheap (microseconds).
+void        kintsuki_rearm_cpu(kintsuki_t*);
 
 // Memory (CPU bus, 24-bit address)
 uint8_t     kintsuki_read_u8 (kintsuki_t*, uint32_t addr);

@@ -263,9 +263,14 @@ class Emu:
     # ----- High-level test helpers ---------------------------------------
 
     def push_byte(self, value: int) -> None:
-        """Push a byte onto the 65816 stack ($00:0100-$01FF)."""
+        """Push a byte onto the 65816 stack. Native mode stack is the full
+        bank-0 16-bit S range; emulation mode is $00:0100-$01FF (the high
+        byte of S is forced to $01 by the CPU)."""
         s = self.get_state()
-        self.write(0x100 | (s.s & 0xFF), value & 0xFF)
+        addr = (s.s & 0xFFFF)            # bank 0
+        if s.e:                           # emulation: stack page is $0100
+            addr = 0x0100 | (s.s & 0xFF)
+        self.write(addr, value & 0xFF)
         s.s = (s.s - 1) & 0xFFFF
         self.set_state(s)
 
@@ -280,14 +285,26 @@ class Emu:
         target_pc: int,
         max_frames: int = 60,
     ) -> bool:
-        """Run the emulator until PC matches `target_pc`. Returns True on
-        hit, False if max_frames of emulated time elapsed first.
-
-        Backed by kintsuki_run_until in the C ABI: the scheduler bails the
-        moment the CPU is about to execute target_pc, so the captured CPU
-        state is exactly at the sentinel (no over-run by mid-frame slack)."""
+        """Run until PC == target_pc. Mid-frame bail. Returns True on hit."""
         rc = _native.lib.kintsuki_run_until(self._handle, target_pc, max_frames)
         return rc != 0
+
+    def rearm_cpu(self) -> None:
+        """Rebuild the CPU coroutine. Use between consecutive STP-terminated
+        stubs so the next stub starts from a clean dispatch state without
+        wiping WRAM or losing ROM mapping."""
+        _native.lib.kintsuki_rearm_cpu(self._handle)
+
+    def run_until_stp(self, max_frames: int = 60) -> bool:
+        """Run until the CPU executes STP (opcode 0xDB). After STP the CPU
+        halts (r.stp=1) so this is the cleanest way to mark "test done"
+        from injected asm: end your stub with `stp` and call this. Returns
+        True if STP was reached."""
+        for _ in range(max_frames):
+            self.run_frames(1)
+            if self.get_state().stp:
+                return True
+        return False
 
     # Sentinel "exit" address. Test stubs jmp here to signal completion;
     # run_asm installs an exec callback at this PC and bails when it fires.
@@ -362,6 +379,8 @@ class Emu:
         s.x = x & 0xFFFF
         s.y = y & 0xFFFF
         s.s = 0x1FFF
+        s.e = False                       # native mode
+        s.p = 0x00                        # 16-bit A + 16-bit X/Y, no flags
         self.set_state(s)
         # Push long-form return so RTL works. RTS only pops the lower two
         # bytes; the bank byte we push above is then unused but doesn't

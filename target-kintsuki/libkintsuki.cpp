@@ -25,6 +25,9 @@ struct kintsuki_t {
   std::unique_ptr<Program> program;
 };
 
+// Defined further down (in the anonymous-namespace callback section).
+static void resetAllCallbacks();
+
 static kintsuki_t* g_handle = nullptr;
 
 kintsuki_t* kintsuki_create(void) {
@@ -39,6 +42,12 @@ kintsuki_t* kintsuki_create(void) {
 void kintsuki_destroy(kintsuki_t* h) {
   if(!h || h != g_handle) return;
   ares::SuperFamicom::system.unload();
+  // Reset all callback state so the next kintsuki_create() doesn't
+  // inherit stale callback closures from the previous handle.
+  resetAllCallbacks();
+  ares::SuperFamicom::execHook = nullptr;
+  ares::SuperFamicom::memReadHook = nullptr;
+  ares::SuperFamicom::memWriteHook = nullptr;
   delete h;
   g_handle = nullptr;
   kintsukiProgram = nullptr;
@@ -94,6 +103,8 @@ struct kintsuki_cpu_state_t {
   uint8_t  b, p;
   uint32_t pc;
   uint8_t  e;
+  uint8_t  stp;
+  uint8_t  wai;
 };
 
 void kintsuki_get_state(kintsuki_t* h, kintsuki_cpu_state_t* out) {
@@ -102,6 +113,8 @@ void kintsuki_get_state(kintsuki_t* h, kintsuki_cpu_state_t* out) {
   out->a = s.a; out->x = s.x; out->y = s.y;
   out->s = s.s; out->d = s.d; out->b = s.b;
   out->p = s.p; out->pc = s.pc; out->e = s.e ? 1 : 0;
+  out->stp = s.stp ? 1 : 0;
+  out->wai = s.wai ? 1 : 0;
 }
 
 void kintsuki_set_state(kintsuki_t* h, const kintsuki_cpu_state_t* in) {
@@ -166,6 +179,19 @@ std::vector<CCallback> g_cExec, g_cRead, g_cWrite;
 uint8_t g_cExecPages[65536]  = {};
 uint8_t g_cReadPages[65536]  = {};
 uint8_t g_cWritePages[65536] = {};
+
+}  // anonymous namespace
+
+static void resetAllCallbacks() {
+  g_cExec.clear();
+  g_cRead.clear();
+  g_cWrite.clear();
+  std::memset(g_cExecPages,  0, sizeof(g_cExecPages));
+  std::memset(g_cReadPages,  0, sizeof(g_cReadPages));
+  std::memset(g_cWritePages, 0, sizeof(g_cWritePages));
+}
+
+namespace {
 
 auto markCPages(uint8_t* pages, uint32_t lo, uint32_t hi, int delta) -> void {
   uint32_t lpage = (lo & 0xffffff) >> 8;
@@ -288,6 +314,23 @@ void runUntilHook(uint32_t pc) {
   }
 }
 }  // namespace
+
+void kintsuki_rearm_cpu(kintsuki_t* h) {
+  if(!h) return;
+  // Rebuild the CPU's libco coroutine without doing a full system reset
+  // (which would re-randomize WRAM and re-run the boot vector). The
+  // coroutine's host-side stack is replaced by a fresh one; the next
+  // scheduler entry calls CPU::main from the top with a clean stack.
+  ares::SuperFamicom::cpu.create(
+    ares::SuperFamicom::system.cpuFrequency(),
+    std::bind_front(&ares::SuperFamicom::CPU::main,
+                    &ares::SuperFamicom::cpu));
+  // Clear the halt flags + pending interrupts on the WDC65816 register
+  // file so the next instruction dispatch runs at the PC the test sets.
+  ares::SuperFamicom::cpu.r.stp = false;
+  ares::SuperFamicom::cpu.r.wai = false;
+  ares::SuperFamicom::cpu.clearPendingInterrupts();
+}
 
 int kintsuki_run_until(kintsuki_t* h, uint32_t target_pc, uint32_t max_frames) {
   if(!h) return 0;

@@ -17,6 +17,8 @@ struct CpuState {
   uint8_t  b, p;
   uint32_t pc;  // 24-bit
   bool     e;
+  bool     stp;  // STP halted
+  bool     wai;  // WAI waiting for IRQ
 };
 
 struct Program : ares::Platform {
