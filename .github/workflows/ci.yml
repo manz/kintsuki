@@ -5,6 +5,11 @@ on:
     branches: [master]
   pull_request:
 
+# Hatch reads $VERSION at wheel-build time (see [tool.hatch.version]).
+# CI is non-tag, so use a dev marker.
+env:
+  VERSION: 0.0.0.dev0
+
 jobs:
   build-and-test:
     name: ${{ matrix.os }} / py${{ matrix.python }}

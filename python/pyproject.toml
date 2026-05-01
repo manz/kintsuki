@@ -1,6 +1,6 @@
 [project]
 name = "kintsuki"
-version = "0.1.0"
+dynamic = ["version"]
 description = "SNES emulator wheel for scripted testing and tracing, built on a stripped-down ares Super Famicom core."
 authors = [{ name = "Emmanuel Peralta", email = "manz@ringum.net" }]
 license = "ISC"
@@ -23,6 +23,12 @@ classifiers = [
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
+
+# Version comes from the VERSION env var at build time. CI sets it to the
+# pushed tag name (`${{ github.ref_name }}`) — same convention as a816.
+[tool.hatch.version]
+source = "env"
+variable = "VERSION"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kintsuki"]

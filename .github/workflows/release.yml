@@ -5,6 +5,13 @@ on:
     tags: ['v*']
   workflow_dispatch:
 
+# Hatch reads the package version from $VERSION at build time
+# (see [tool.hatch.version] in python/pyproject.toml). github.ref_name is
+# the tag name, e.g. 'v0.1.0'; packaging normalizes the leading 'v' away
+# so it lands on PyPI as '0.1.0'.
+env:
+  VERSION: ${{ github.ref_name }}
+
 jobs:
   build-wheel:
     name: wheel ${{ matrix.os }}

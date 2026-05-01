@@ -3,6 +3,12 @@
 BUILD ?= build
 PYTHON ?= python3
 
+# Hatch reads VERSION from the env at wheel-build time (see
+# [tool.hatch.version] in python/pyproject.toml). Default to a dev marker
+# for local builds; CI overrides with the pushed tag.
+VERSION ?= 0.0.0.dev0
+export VERSION
+
 # Native library build (cmake/ninja)
 all: build
 
