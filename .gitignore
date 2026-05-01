@@ -1,0 +1,32 @@
+# Build output
+build/
+DerivedData/
+dist/
+*.o
+*.obj
+*.a
+
+# Built shared libraries (CMake artifacts copied around)
+app/Vendor/libkintsuki.dylib
+python/src/kintsuki/_lib/libkintsuki.dylib
+python/src/kintsuki/_lib/libkintsuki.so
+python/src/kintsuki/_lib/kintsuki.dll
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Xcode per-user state
+xcuserdata/
+*.xcuserdatad/
+
+# IDE / OS junk
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
