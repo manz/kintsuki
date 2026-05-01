@@ -1,28 +1,31 @@
-.PHONY: all build clean test test-rom python-stage wheels
+VERSION ?= 0.0.0.dev0
+V = 0
+Q = $(if $(filter 1,$V),,@)
+
+M = $(shell if [ "$$(tput colors 2> /dev/null || echo 0)" -ge 8 ]; then printf "\033[34;1m▶\033[0m"; else printf "▶"; fi)
 
 BUILD ?= build
 PYTHON ?= python3
 
-# Hatch reads VERSION from the env at wheel-build time (see
-# [tool.hatch.version] in python/pyproject.toml). Default to a dev marker
-# for local builds; CI overrides with the pushed tag.
-VERSION ?= 0.0.0.dev0
 export VERSION
 
-# Native library build (cmake/ninja)
-all: build
+.SUFFIXES:
+.PHONY: all
+all: | build wheels  ## Build the native library and the python wheel
+
+# Standard targets
+
+.PHONY: build
+build: $(BUILD)/build.ninja  ## Build libkintsuki.dylib / .so via cmake + ninja
+	$(Q) ninja -C $(BUILD) kintsuki
 
 $(BUILD)/build.ninja:
-	cmake -S . -B $(BUILD) -G Ninja -DCMAKE_BUILD_TYPE=Release
+	$(Q) cmake -S . -B $(BUILD) -G Ninja -DCMAKE_BUILD_TYPE=Release
 
-build: $(BUILD)/build.ninja
-	ninja -C $(BUILD) kintsuki
-
-# Python wheel staging — copies the freshly built native library into the
-# place the wheel imports it from.
-python-stage: build
-	mkdir -p python/src/kintsuki/_lib
-	@LIB_DIR=$(BUILD)/ares/target-kintsuki; \
+.PHONY: python-stage
+python-stage: build  ## Copy the freshly built libkintsuki into the wheel
+	$(Q) mkdir -p python/src/kintsuki/_lib
+	$(Q) LIB_DIR=$(BUILD)/ares/target-kintsuki; \
 	if [ -f $$LIB_DIR/libkintsuki.dylib ]; then \
 	  cp $$LIB_DIR/libkintsuki.dylib python/src/kintsuki/_lib/; \
 	elif [ -f $$LIB_DIR/libkintsuki.so ]; then \
@@ -31,25 +34,31 @@ python-stage: build
 	  echo "no libkintsuki found in $$LIB_DIR" >&2; exit 1; \
 	fi
 
-# Assemble the CI test ROM (a816 must be on PATH).
-test-rom: python/tests/asm/test_rom.sfc
+.PHONY: test-rom
+test-rom: python/tests/asm/test_rom.sfc  ## Assemble the CI test ROM via a816
 
 python/tests/asm/test_rom.sfc: python/tests/asm/test_rom.s
-	a816 -f sfc -o $@ $<
+	$(Q) a816 -f sfc -o $@ $<
 
-# Full test cycle: build native lib, stage into wheel, build test ROM, pytest.
-test: python-stage test-rom
-	cd python && KINTSUKI_TEST_ROM=$(CURDIR)/python/tests/asm/test_rom.sfc \
+.PHONY: tests
+tests: python-stage test-rom; $(info $(M) Running tests...) @  ## Run pytest against the staged wheel + test ROM
+	$(Q) cd python && KINTSUKI_TEST_ROM=$(CURDIR)/python/tests/asm/test_rom.sfc \
 	  $(PYTHON) -m pytest tests/ -v
 
-# Build a Python wheel with the staged libkintsuki bundled in. Default
-# platform tag is what hatch infers (py3-none-any); CI retags the wheel
-# per platform with `python -m wheel tags --platform-tag ...`.
-wheels: python-stage
-	rm -rf python/dist
-	cd python && hatch build -t wheel
+.PHONY: wheels
+wheels: python-stage  ## Build a python wheel (py3-none-any; CI retags per platform)
+	$(Q) rm -rf python/dist
+	$(Q) cd python && hatch build -t wheel
 
-clean:
-	rm -rf $(BUILD)
-	rm -f python/tests/asm/test_rom.sfc
-	rm -f python/src/kintsuki/_lib/libkintsuki.*
+.PHONY: clean
+clean: ## Cleanup build artifacts
+	$(info $(M) cleaning ...)
+	$(Q) rm -rf $(BUILD)
+	$(Q) rm -f python/tests/asm/test_rom.sfc
+	$(Q) rm -f python/src/kintsuki/_lib/libkintsuki.*
+	$(Q) rm -rf python/dist
+
+.PHONY: help
+help: ## Display help
+	@grep -hE '^[ a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | \
+		awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-17s\033[0m %s\n", $$1, $$2}'
