@@ -22,6 +22,16 @@ struct KintsukiApp: App {
                     emulator.openRomViaPanel()
                 }
                 .keyboardShortcut("o", modifiers: .command)
+                Menu("Open Recent") {
+                    ForEach(emulator.recentROMs, id: \.self) { url in
+                        Button(url.lastPathComponent) { emulator.loadROM(url) }
+                    }
+                    if !emulator.recentROMs.isEmpty {
+                        Divider()
+                        Button("Clear Menu") { emulator.clearRecents() }
+                    }
+                }
+                .disabled(emulator.recentROMs.isEmpty)
             }
             CommandGroup(after: .toolbar) {
                 Button("Reset") { emulator.reset() }

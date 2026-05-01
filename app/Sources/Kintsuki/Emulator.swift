@@ -9,6 +9,9 @@ import CKintsuki
 final class Emulator: ObservableObject {
     @Published private(set) var running: Bool = false
     @Published private(set) var loadedROM: URL?
+    @Published private(set) var recentROMs: [URL] = []
+    private let recentsKey = "kintsuki.recentROMs"
+    private let recentsLimit = 10
     @Published private(set) var lastFrameID: UInt64 = 0
     @Published var inspectorOpen: Bool = false
     @Published private(set) var fps: Double = 0
@@ -71,6 +74,7 @@ final class Emulator: ObservableObject {
             NSLog("kintsuki: WARN no Bundle.main.resourcePath")
         }
         handle = kintsuki_create()
+        loadRecents()
     }
 
     deinit {
@@ -112,7 +116,30 @@ final class Emulator: ObservableObject {
         NSLog("kintsuki: ROM loaded successfully")
         loadedROM = url
         running = true
+        rememberRecent(url)
         startRunLoop()
+    }
+
+    func clearRecents() {
+        recentROMs = []
+        UserDefaults.standard.removeObject(forKey: recentsKey)
+        NSDocumentController.shared.clearRecentDocuments(nil)
+    }
+
+    private func loadRecents() {
+        let paths = UserDefaults.standard.stringArray(forKey: recentsKey) ?? []
+        recentROMs = paths.compactMap { p in
+            FileManager.default.fileExists(atPath: p) ? URL(fileURLWithPath: p) : nil
+        }
+    }
+
+    private func rememberRecent(_ url: URL) {
+        var list = recentROMs.filter { $0.path != url.path }
+        list.insert(url, at: 0)
+        if list.count > recentsLimit { list = Array(list.prefix(recentsLimit)) }
+        recentROMs = list
+        UserDefaults.standard.set(list.map(\.path), forKey: recentsKey)
+        NSDocumentController.shared.noteNewRecentDocumentURL(url)
     }
 
     func reset() {
