@@ -1,7 +1,8 @@
 # kintsuki
 
-SNES emulator core for Lua-driven testing and DAP debug adapters,
-built on bsnes via a thin C ABI.
+SNES emulator wheel built on a stripped-down [ares](https://ares-emu.net)
+Super Famicom core via a thin C ABI. Aimed at scripted testing and
+instruction tracing.
 
 ```python
 import kintsuki
@@ -19,11 +20,13 @@ This package ships `libkintsuki.dylib` (macOS) / `.so` (Linux) /
 `.dll` (Windows) in `src/kintsuki/_lib/`. Rebuild from source:
 
 ```sh
-make -C ../bsnes/bsnes target=kintsuki binary=library
-cp ../bsnes/bsnes/out/libkintsuki.dylib src/kintsuki/_lib/
+cmake -S ../ares -B ../build -G Ninja
+ninja -C ../build kintsuki
+cp ../build/target-kintsuki/libkintsuki.dylib src/kintsuki/_lib/
 pip install -e .
 ```
 
 ## License
 
-GPL-3.0-or-later (matches bsnes).
+ISC. Vendors ares under its own ISC license — see `ares/LICENSE` in the
+parent repo.
