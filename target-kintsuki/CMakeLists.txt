@@ -15,14 +15,16 @@ set_target_properties(kintsuki-program PROPERTIES
 
 target_include_directories(kintsuki-program PUBLIC
   ${CMAKE_CURRENT_SOURCE_DIR}
-  ${CMAKE_SOURCE_DIR}
-  ${CMAKE_SOURCE_DIR}/ares
-  ${CMAKE_SOURCE_DIR}/nall
+  ${ares_SOURCE_DIR}
+  ${ares_SOURCE_DIR}/ares
+  ${ares_SOURCE_DIR}/nall
 )
 
 # Default location of ares' System/ tree (boards.bml + ipl.rom).
+# ares_SOURCE_DIR resolves to the directory holding ares' CMakeLists, so
+# this works whether kintsuki is configured at the repo root or at ares/.
 target_compile_definitions(kintsuki-program PUBLIC
-  KINTSUKI_SYSTEM_PAK_DEFAULT="${CMAKE_SOURCE_DIR}/ares/System/Super Famicom"
+  KINTSUKI_SYSTEM_PAK_DEFAULT="${ares_SOURCE_DIR}/ares/System/Super Famicom"
 )
 
 target_link_libraries(kintsuki-program PUBLIC

@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14            # Apple Silicon (arm64)
+          - os: macos-26            # Apple Silicon, Xcode 17 toolchain
             lib: libkintsuki.dylib
             python: "3.13"
           - os: ubuntu-24.04-arm    # public arm64 Linux runner
@@ -41,16 +41,14 @@ jobs:
 
       - name: Configure + build libkintsuki
         run: |
-          cmake -S ares -B build -G Ninja \
+          cmake -S . -B build -G Ninja \
             -DCMAKE_BUILD_TYPE=Release \
             -DCMAKE_C_COMPILER_LAUNCHER=ccache \
             -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
           ninja -C build kintsuki
 
       - name: Stage native library into the wheel
-        run: |
-          mkdir -p python/src/kintsuki/_lib
-          cp build/target-kintsuki/${{ matrix.lib }} python/src/kintsuki/_lib/
+        run: make python-stage
 
       - name: Install python package + a816
         working-directory: python

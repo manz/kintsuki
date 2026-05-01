@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: macos-14
+          - os: macos-26
             lib: libkintsuki.dylib
             plat_tag: macosx_11_0_arm64
           - os: ubuntu-24.04-arm
@@ -41,13 +41,11 @@ jobs:
 
       - name: Configure + build libkintsuki
         run: |
-          cmake -S ares -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           ninja -C build kintsuki
 
       - name: Stage native library
-        run: |
-          mkdir -p python/src/kintsuki/_lib
-          cp build/target-kintsuki/${{ matrix.lib }} python/src/kintsuki/_lib/
+        run: make python-stage
 
       - name: Build wheel + retag with platform
         working-directory: python

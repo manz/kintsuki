@@ -6,6 +6,14 @@ dist/
 *.obj
 *.a
 
+# Auto-generated from resource.bml by scripts/gen_resource.py at cmake
+# configure time. Tracked file is just resource.bml.
+ares/ares/ares/resource/resource.hpp
+ares/ares/ares/resource/resource.cpp
+
+# Built test ROM (assembled from python/tests/asm/test_rom.s by Makefile/CI).
+python/tests/asm/test_rom.sfc
+
 # Built shared libraries (CMake artifacts copied around)
 app/Vendor/libkintsuki.dylib
 python/src/kintsuki/_lib/libkintsuki.dylib
