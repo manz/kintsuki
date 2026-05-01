@@ -1,7 +1,10 @@
 import SwiftUI
+import SwiftData
 
 struct ContentView: View {
     @EnvironmentObject var emulator: Emulator
+    @Environment(\.modelContext) private var modelContext
+    @Binding var showStateBrowser: Bool
 
     var body: some View {
         HStack(spacing: 0) {
@@ -46,5 +49,12 @@ struct ContentView: View {
             }
         }
         .animation(.easeInOut(duration: 0.2), value: emulator.inspectorOpen)
+        .onAppear { emulator.modelContext = modelContext }
+        .sheet(isPresented: $showStateBrowser) {
+            if let url = emulator.loadedROM {
+                SaveStateBrowserView(romPath: url.path)
+                    .environmentObject(emulator)
+            }
+        }
     }
 }

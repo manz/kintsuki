@@ -17,8 +17,6 @@ struct InspectorView: View {
                 tileSection
                 Divider()
                 breakpointSection
-                Divider()
-                saveStateSection
                 Spacer()
             }
             .padding(12)
@@ -262,29 +260,5 @@ struct InspectorView: View {
         return UInt32(trimmed, radix: 16)
     }
 
-    // ----------------------------------------------------------- Save slots
-    private var saveStateSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Save States").font(.headline)
-            Text("⌘1-9 save · ⇧⌘1-9 load")
-                .font(.caption2).foregroundStyle(.secondary)
-            ForEach(1...9, id: \.self) { slot in
-                HStack {
-                    Text("Slot \(slot)").font(.system(.caption, design: .monospaced))
-                    Spacer()
-                    if let s = emulator.saveStateSlots[slot] {
-                        Text(s.savedAt, style: .time)
-                            .font(.caption2).foregroundStyle(.secondary)
-                        Button("Load") { emulator.quickLoad(slot: slot) }
-                            .controlSize(.mini)
-                    } else {
-                        Text("—").foregroundStyle(.tertiary)
-                    }
-                    Button("Save") { emulator.quickSave(slot: slot) }
-                        .controlSize(.mini)
-                }
-            }
-        }
-    }
 }
 

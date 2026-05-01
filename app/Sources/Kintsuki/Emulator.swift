@@ -1,5 +1,6 @@
 import AppKit
 import Foundation
+import SwiftData
 import CKintsuki
 
 /// High-level wrapper around libkintsuki. Lives on the main actor so
@@ -12,8 +13,10 @@ final class Emulator: ObservableObject {
     @Published var inspectorOpen: Bool = false
     @Published private(set) var fps: Double = 0
     @Published private(set) var cpuState = CpuState()
-    @Published private(set) var saveStateSlots: [Int: SaveSlot] = [:]
     @Published private(set) var breakpoints: [Breakpoint] = []
+
+    /// Set by ContentView once SwiftData's ModelContext is available.
+    var modelContext: ModelContext?
 
     enum BreakKind: Int, CaseIterable, Identifiable {
         case exec = 0, read = 1, write = 2
@@ -38,11 +41,6 @@ final class Emulator: ObservableObject {
         var b: UInt8 = 0, p: UInt8 = 0
         var pc: UInt32 = 0
         var e: Bool = false
-    }
-
-    struct SaveSlot {
-        var data: Data
-        var savedAt: Date
     }
 
     /// The most recent framebuffer copied out of libkintsuki (RGBA, 0x00RRGGBB
@@ -334,15 +332,52 @@ final class Emulator: ObservableObject {
         return img
     }
 
-    // ----- Save-state slots -----------------------------------------------
-    func quickSave(slot: Int) {
-        guard let h = handle else { return }
+    // ----- Save states (per-ROM, SwiftData-backed) ------------------------
+    /// Capture current emulator state + framebuffer thumbnail and persist
+    /// under the loaded ROM's path. No-op if no ROM or no ModelContext.
+    @discardableResult
+    func saveState(named name: String) -> SaveStateEntry? {
+        guard let h = handle, let rom = loadedROM, let ctx = modelContext else { return nil }
         let size = kintsuki_save_state(h, nil, 0)
-        guard size > 0 else { return }
+        guard size > 0 else { return nil }
         var blob = Data(count: Int(size))
         blob.withUnsafeMutableBytes { _ = kintsuki_save_state(h, $0.baseAddress, size) }
-        saveStateSlots[slot] = SaveSlot(data: blob, savedAt: .now)
-        NSLog("kintsuki: quick-saved slot \(slot) (\(size) bytes)")
+        let thumb = SaveStateThumbnail.png(fromBGRA: framebuffer,
+                                           width: Int(fbWidth), height: Int(fbHeight))
+            ?? Data()
+        let entry = SaveStateEntry(romPath: rom.path,
+                                   name: name.isEmpty ? defaultStateName() : name,
+                                   blob: blob, thumbnailPNG: thumb)
+        ctx.insert(entry)
+        do { try ctx.save() } catch { NSLog("kintsuki: save state failed: \(error)") }
+        NSLog("kintsuki: saved state \"\(entry.name)\" (\(size) bytes)")
+        return entry
+    }
+
+    func loadState(_ entry: SaveStateEntry) {
+        guard let h = handle else { return }
+        let ok = entry.blob.withUnsafeBytes { raw in
+            kintsuki_load_state(h, raw.baseAddress, UInt32(entry.blob.count))
+        }
+        if ok != 0 { NSLog("kintsuki: loaded state \"\(entry.name)\"") }
+    }
+
+    func renameState(_ entry: SaveStateEntry, to name: String) {
+        guard let ctx = modelContext else { return }
+        entry.name = name
+        do { try ctx.save() } catch { NSLog("kintsuki: rename failed: \(error)") }
+    }
+
+    func deleteState(_ entry: SaveStateEntry) {
+        guard let ctx = modelContext else { return }
+        ctx.delete(entry)
+        do { try ctx.save() } catch { NSLog("kintsuki: delete failed: \(error)") }
+    }
+
+    private func defaultStateName() -> String {
+        let f = DateFormatter()
+        f.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        return f.string(from: .now)
     }
 
     // ----- Breakpoints ----------------------------------------------------
@@ -386,14 +421,6 @@ final class Emulator: ObservableObject {
         kintsuki_remove_callback(h, Int32(bp.kind.rawValue), bp.nativeId)
         breakContexts.removeValue(forKey: bp.id)
         breakpoints.removeAll { $0.id == bp.id }
-    }
-
-    func quickLoad(slot: Int) {
-        guard let h = handle, let snap = saveStateSlots[slot] else { return }
-        let ok = snap.data.withUnsafeBytes { raw in
-            kintsuki_load_state(h, raw.baseAddress, UInt32(snap.data.count))
-        }
-        if ok != 0 { NSLog("kintsuki: quick-loaded slot \(slot)") }
     }
 
     // ----- Framebuffer ------------------------------------------------------
