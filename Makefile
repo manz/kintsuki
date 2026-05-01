@@ -1,4 +1,4 @@
-.PHONY: all build clean test test-rom python-stage
+.PHONY: all build clean test test-rom python-stage wheels
 
 BUILD ?= build
 PYTHON ?= python3
@@ -41,6 +41,13 @@ python/tests/asm/test_rom.sfc: python/tests/asm/test_rom.s
 test: python-stage test-rom
 	cd python && KINTSUKI_TEST_ROM=$(CURDIR)/python/tests/asm/test_rom.sfc \
 	  $(PYTHON) -m pytest tests/ -v
+
+# Build a Python wheel with the staged libkintsuki bundled in. Default
+# platform tag is what hatch infers (py3-none-any); CI retags the wheel
+# per platform with `python -m wheel tags --platform-tag ...`.
+wheels: python-stage
+	rm -rf python/dist
+	cd python && hatch build -t wheel
 
 clean:
 	rm -rf $(BUILD)

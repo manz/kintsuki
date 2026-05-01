@@ -51,14 +51,15 @@ jobs:
           cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
           ninja -C build kintsuki
 
-      - name: Stage native library
-        run: make python-stage
+      - name: Install hatch
+        run: python -m pip install --upgrade pip hatch wheel
 
-      - name: Build wheel + retag with platform
+      - name: Build wheel
+        run: make wheels
+
+      - name: Retag wheel as platform-specific
         working-directory: python
         run: |
-          python -m pip install --upgrade pip build wheel
-          python -m build --wheel
           python -m wheel tags \
             --platform-tag ${{ matrix.plat_tag }} \
             --python-tag py3 \
