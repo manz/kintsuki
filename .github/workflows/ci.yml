@@ -52,9 +52,21 @@ jobs:
           mkdir -p python/src/kintsuki/_lib
           cp build/target-kintsuki/${{ matrix.lib }} python/src/kintsuki/_lib/
 
-      - name: Install python package + run tests
+      - name: Install python package + a816
         working-directory: python
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e . pytest
+          python -m pip install --pre 'a816==1.1.0a3'
+
+      - name: Assemble test ROM
+        working-directory: python/tests/asm
+        run: |
+          a816 -f sfc -o test_rom.sfc test_rom.s
+
+      - name: Run tests against built ROM
+        working-directory: python
+        env:
+          KINTSUKI_TEST_ROM: ${{ github.workspace }}/python/tests/asm/test_rom.sfc
+        run: |
           python -m pytest tests/ -v
