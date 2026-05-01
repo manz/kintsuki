@@ -66,22 +66,27 @@ targets:
         basedOnDependencyAnalysis: false
         script: |
           set -e
-          # Xcode launches scripts with a sanitized PATH (no /opt/homebrew).
-          export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:$PATH"
-          if ! command -v cmake >/dev/null 2>&1; then
-            echo "error: cmake not found on PATH ($PATH)" >&2
+          # Xcode strips /opt/homebrew from PATH, so resolve cmake/ninja
+          # by absolute path. We don't depend on PATH being set right.
+          CMAKE=""
+          for c in /opt/homebrew/bin/cmake /usr/local/bin/cmake /usr/bin/cmake; do
+            [ -x "$c" ] && { CMAKE="$c"; break; }
+          done
+          if [ -z "$CMAKE" ]; then
+            echo "error: cmake not found (tried /opt/homebrew, /usr/local, /usr/bin)" >&2
             echo "install with: brew install cmake ninja" >&2
             exit 1
           fi
+          export PATH="$(dirname "$CMAKE"):$PATH"
           REPO="$SRCROOT/.."
           if [ ! -d "$REPO/build" ]; then
-            cmake -S "$REPO/ares" -B "$REPO/build" -G Ninja \
+            "$CMAKE" -S "$REPO" -B "$REPO/build" -G Ninja \
               -DCMAKE_C_COMPILER=/usr/bin/clang \
               -DCMAKE_CXX_COMPILER=/usr/bin/clang++
           fi
-          cmake --build "$REPO/build" --target kintsuki
+          "$CMAKE" --build "$REPO/build" --target kintsuki
           mkdir -p "$SRCROOT/Vendor"
-          cp "$REPO/build/target-kintsuki/libkintsuki.dylib" "$SRCROOT/Vendor/"
+          cp "$REPO/build/ares/target-kintsuki/libkintsuki.dylib" "$SRCROOT/Vendor/"
           # ares System/ pak (boards.bml + ipl.rom) lives next to the dylib
           # so the bundle copy phase ships it as a Resource.
           rsync -a --delete "$REPO/ares/ares/System/" "$SRCROOT/Vendor/System/"
