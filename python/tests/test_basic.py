@@ -22,6 +22,16 @@ def _need_rom():
         pytest.skip(f"test ROM not present at {ROM_PATH}")
 
 
+def test_emu_lifecycle_no_rom():
+    """Smoke test that runs in CI without any ROM available — proves the
+    native library loads, ctypes bindings resolve, and basic state ops
+    work on a freshly-created emulator."""
+    with Emu() as emu:
+        s = emu.get_state()
+        assert s.pc == 0
+        assert emu.frame_count == 0
+
+
 def test_load_run_read():
     _need_rom()
     with Emu() as emu:

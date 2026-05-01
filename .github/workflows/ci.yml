@@ -1,0 +1,60 @@
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+
+jobs:
+  build-and-test:
+    name: ${{ matrix.os }} / py${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14            # Apple Silicon (arm64)
+            lib: libkintsuki.dylib
+            python: "3.13"
+          - os: ubuntu-24.04-arm    # public arm64 Linux runner
+            lib: libkintsuki.so
+            python: "3.13"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build tools (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y --no-install-recommends \
+            cmake ninja-build ccache build-essential
+
+      - name: Install build tools (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install cmake ninja ccache
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Configure + build libkintsuki
+        run: |
+          cmake -S ares -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_C_COMPILER_LAUNCHER=ccache \
+            -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+          ninja -C build kintsuki
+
+      - name: Stage native library into the wheel
+        run: |
+          mkdir -p python/src/kintsuki/_lib
+          cp build/target-kintsuki/${{ matrix.lib }} python/src/kintsuki/_lib/
+
+      - name: Install python package + run tests
+        working-directory: python
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -e . pytest
+          python -m pytest tests/ -v

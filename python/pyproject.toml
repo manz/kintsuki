@@ -1,13 +1,13 @@
 [project]
 name = "kintsuki"
 version = "0.1.0"
-description = "SNES emulator core for Lua-driven testing and DAP debug adapters (built on bsnes)."
+description = "SNES emulator wheel for scripted testing and tracing, built on a stripped-down ares Super Famicom core."
 authors = [{ name = "Emmanuel Peralta", email = "manz@ringum.net" }]
-license = "GPL-3.0-or-later"
+license = "ISC"
 readme = "README.md"
 requires-python = ">=3.10"
 
-keywords = ["snes", "super famicom", "emulator", "debugger", "bsnes"]
+keywords = ["snes", "super famicom", "emulator", "debugger", "ares"]
 
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -31,7 +31,12 @@ artifacts = ["src/kintsuki/_lib/*.dylib", "src/kintsuki/_lib/*.so", "src/kintsuk
 [tool.hatch.build.targets.wheel.force-include]
 "src/kintsuki/_lib" = "kintsuki/_lib"
 
+# Wheel ships a prebuilt native library; CI retags it as platform-specific
+# via `wheel tags --platform-tag <tag>` after `python -m build --wheel`.
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.0",
+    "build>=1.0",
+    "wheel>=0.42",
 ]
