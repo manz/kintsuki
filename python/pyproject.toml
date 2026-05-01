@@ -32,7 +32,12 @@ variable = "VERSION"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/kintsuki"]
-artifacts = ["src/kintsuki/_lib/*.dylib", "src/kintsuki/_lib/*.so", "src/kintsuki/_lib/*.dll"]
+artifacts = [
+  "src/kintsuki/_lib/*.dylib",
+  "src/kintsuki/_lib/*.so",
+  "src/kintsuki/_lib/*.dll",
+  "src/kintsuki/_lib/System/**/*",
+]
 
 [tool.hatch.build.targets.wheel.force-include]
 "src/kintsuki/_lib" = "kintsuki/_lib"

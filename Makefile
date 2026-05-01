@@ -23,7 +23,7 @@ $(BUILD)/build.ninja:
 	$(Q) cmake -S . -B $(BUILD) -G Ninja -DCMAKE_BUILD_TYPE=Release
 
 .PHONY: python-stage
-python-stage: build  ## Copy the freshly built libkintsuki into the wheel
+python-stage: build  ## Copy libkintsuki + ares System pak into the wheel
 	$(Q) mkdir -p python/src/kintsuki/_lib
 	$(Q) LIB_DIR=$(BUILD)/ares/target-kintsuki; \
 	if [ -f $$LIB_DIR/libkintsuki.dylib ]; then \
@@ -33,6 +33,9 @@ python-stage: build  ## Copy the freshly built libkintsuki into the wheel
 	else \
 	  echo "no libkintsuki found in $$LIB_DIR" >&2; exit 1; \
 	fi
+	$(Q) rm -rf "python/src/kintsuki/_lib/System"
+	$(Q) mkdir -p "python/src/kintsuki/_lib/System"
+	$(Q) cp -R "ares/ares/System/Super Famicom" "python/src/kintsuki/_lib/System/"
 
 .PHONY: test-rom
 test-rom: python/tests/asm/test_rom.sfc  ## Assemble the CI test ROM via a816

@@ -26,6 +26,17 @@ from pathlib import Path
 
 def _load_lib() -> ctypes.CDLL:
     here = Path(__file__).resolve().parent / "_lib"
+
+    # Point libkintsuki at the bundled ares System/ tree (boards.bml +
+    # ipl.rom). The dylib was built with KINTSUKI_SYSTEM_PAK_DEFAULT
+    # baked in at CI time pointing at the runner's filesystem; that path
+    # doesn't exist on the user's machine, so override here unless the
+    # caller already set it explicitly.
+    import os
+    bundled_pak = here / "System" / "Super Famicom"
+    if "KINTSUKI_SYSTEM_PAK" not in os.environ and bundled_pak.is_dir():
+        os.environ["KINTSUKI_SYSTEM_PAK"] = str(bundled_pak)
+
     candidates: list[Path]
     if sys.platform == "darwin":
         candidates = [here / "libkintsuki.dylib"]
@@ -39,9 +50,8 @@ def _load_lib() -> ctypes.CDLL:
         if path.exists():
             return ctypes.CDLL(str(path))
     raise FileNotFoundError(
-        f"libkintsuki not found in {here}. Build with "
-        "`make -C bsnes/bsnes target=kintsuki binary=library` and copy "
-        "out/libkintsuki.dylib into src/kintsuki/_lib/."
+        f"libkintsuki not found in {here}. Run `make build python-stage` "
+        f"from the kintsuki repo, or install a wheel from PyPI."
     )
 
 
