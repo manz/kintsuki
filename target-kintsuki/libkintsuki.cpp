@@ -123,6 +123,13 @@ void kintsuki_set_state(kintsuki_t* h, const kintsuki_cpu_state_t* in) {
   s.a = in->a; s.x = in->x; s.y = in->y;
   s.s = in->s; s.d = in->d; s.b = in->b;
   s.p = in->p; s.pc = in->pc; s.e = in->e != 0;
+  // Without these two, the caller cannot un-halt a CPU that previously
+  // executed STP/WAI — a fresh-Emu test that calls set_state(stp=0)
+  // would still see the inherited libco state's stp/wai flag and
+  // run_until_stp / run_frames would early-exit doing nothing. macOS
+  // happens to zero these on the heap; Linux ARM doesn't.
+  s.stp = in->stp != 0;
+  s.wai = in->wai != 0;
   h->program->setCpuState(s);
 }
 

@@ -3,6 +3,21 @@
 #   kintsuki         (CLI test runner with embedded LuaJIT)
 
 # ---------------------------------------------------------------------------
+# Linux aarch64 portable baseline
+# ---------------------------------------------------------------------------
+# CI builds the Linux ARM wheel on AWS Graviton (ARMv8.2-A + crc + crypto).
+# Without an explicit -march, GCC defaults to whatever the build host
+# advertises, which can include features the same wheel won't run on
+# elsewhere (Apple Silicon under Docker Desktop / HVF lacks SVE; some
+# guests strip BF16 / I8MM). Pin the lowest common denominator so the
+# wheel runs on Graviton, Ampere, and Apple-virt aarch64 Linux containers
+# alike.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux"
+   AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+  add_compile_options(-march=armv8.2-a+crc+crypto -mtune=generic)
+endif()
+
+# ---------------------------------------------------------------------------
 # Shared Program object (compiled once)
 # ---------------------------------------------------------------------------
 add_library(kintsuki-program OBJECT program.cpp heuristics.cpp)
