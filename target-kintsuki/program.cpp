@@ -392,25 +392,23 @@ auto Program::loadStateFile(const char* path) -> bool {
   return loadStateBlob(blob.data(), blob.size());
 }
 
-// ares' performance PPU always emits the framebuffer at 2x horizontal
-// (512 base, ~564 with hires/blur padding) and 1x vertical (~242). A
-// raw save lands a 564x242 PNG that looks crushed wide because the
-// pixels carry a 2:1 PAR baked in. Halve x to get back to roughly
-// SNES-native proportions, then stretch y by 8/7 (NTSC PAR) so the
-// image displays at ~4:3 in a square-pixel viewer. Cheap nearest-
-// neighbour resample in both axes; good enough for screenshots since
-// the source is already pixel art.
+// ares' performance PPU emits the framebuffer at 2x horizontal
+// (~564 wide with hires/blur padding) and 1x vertical (~242). A raw
+// save lands a too-wide PNG (2.33:1) because the 2x x-doubling is
+// baked into the pixel grid. Keep full horizontal resolution and
+// double y instead - the result is ~564x484, much closer to a CRT
+// 4:3 frame and lossless for the source pixels (each scanline shows
+// up twice rather than getting averaged away).
 namespace {
 auto correctedFrame(const std::vector<uint32_t>& fb, u32 fbW, u32 fbH,
                     u32& outW, u32& outH) -> std::vector<uint8_t> {
-  outW = fbW / 2;
-  outH = (u32)((u64)fbH * 8 / 7);
+  outW = fbW;
+  outH = fbH * 2;
   std::vector<uint8_t> rgb(size_t(outW) * outH * 3);
   for(u32 y = 0; y < outH; y++) {
-    u32 sy = (u32)((u64)y * fbH / outH);
+    u32 sy = y / 2;
     for(u32 x = 0; x < outW; x++) {
-      u32 sx = x * 2;
-      u32 px = fb[sy * fbW + sx];
+      u32 px = fb[sy * fbW + x];
       uint8_t* dst = rgb.data() + (y * outW + x) * 3;
       dst[0] = (uint8_t)((px >> 16) & 0xff);
       dst[1] = (uint8_t)((px >>  8) & 0xff);
