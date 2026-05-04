@@ -201,6 +201,14 @@ class PpuStateRaw(Structure):
 
 _bind("kintsuki_get_ppu_state", None, [HANDLE, POINTER(PpuStateRaw)])
 
+# Tracer
+TRACE_RING = 0
+TRACE_FILE = 1
+_bind("kintsuki_tracer_start", None,
+      [HANDLE, c_uint32, c_uint32, c_int, c_char_p, c_uint32])
+_bind("kintsuki_tracer_stop", None, [HANDLE])
+_bind("kintsuki_tracer_drain", c_uint32, [HANDLE, c_char_p, c_uint32])
+
 # Savestate
 _bind("kintsuki_save_state", c_uint32, [HANDLE, c_void_p, c_uint32])
 _bind("kintsuki_load_state", c_int, [HANDLE, c_void_p, c_uint32])

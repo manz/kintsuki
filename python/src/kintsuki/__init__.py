@@ -298,6 +298,37 @@ class Emu:
         _native.lib.kintsuki_get_ppu_state(self._handle, ctypes.byref(raw))
         return PpuState._from_raw(raw)
 
+    # ----------------------------------------------------------------- Tracer
+    def tracer_start(self, lo: int, hi: int, *, ring_capacity: int = 4096,
+                     path: str | None = None) -> None:
+        """Start the formatted execution tracer over [lo, hi]. RING mode by
+        default (lines kept in a `ring_capacity`-byte buffer, oldest evicted
+        on overflow). Pass `path=...` to write lines to disk instead."""
+        mode = _native.TRACE_FILE if path else _native.TRACE_RING
+        cpath = path.encode("utf-8") if path else None
+        _native.lib.kintsuki_tracer_start(
+            self._handle, lo, hi, mode, cpath, ring_capacity)
+
+    def tracer_stop(self) -> None:
+        _native.lib.kintsuki_tracer_stop(self._handle)
+
+    def tracer_drain(self) -> str:
+        """Pull and clear the ring buffer's accumulated lines. FILE mode
+        always returns ''. Caller gets a UTF-8 decoded string."""
+        # First call: query required size with cap=0.
+        size = _native.lib.kintsuki_tracer_drain(self._handle, None, 0)
+        if size == 0:
+            return ""
+        buf = ctypes.create_string_buffer(size)
+        n = _native.lib.kintsuki_tracer_drain(self._handle, buf, size)
+        return bytes(buf.raw[:n]).decode("utf-8", errors="replace")
+
+    def tracer(self, lo: int, hi: int, *, ring_capacity: int = 4096,
+               path: str | None = None) -> "_TracerSession":
+        """Context-manager wrapper. `with emu.tracer(lo, hi) as tr: tr.drain()`."""
+        return _TracerSession(self, lo, hi,
+                              ring_capacity=ring_capacity, path=path)
+
     def set_state(self, s: CpuState) -> None:
         _native.lib.kintsuki_set_state(self._handle, ctypes.byref(s))
 
@@ -535,3 +566,28 @@ class Emu:
             self.close()
         except Exception:
             pass
+
+
+class _TracerSession:
+    """Context-manager wrapper over the tracer C ABI. Starts on enter,
+    stops on exit. `tr.drain()` is the same as `Emu.tracer_drain()`."""
+
+    def __init__(self, emu: Emu, lo: int, hi: int, *,
+                 ring_capacity: int, path: str | None) -> None:
+        self._emu = emu
+        self._lo = lo
+        self._hi = hi
+        self._ring_capacity = ring_capacity
+        self._path = path
+
+    def __enter__(self) -> "_TracerSession":
+        self._emu.tracer_start(self._lo, self._hi,
+                               ring_capacity=self._ring_capacity,
+                               path=self._path)
+        return self
+
+    def __exit__(self, *_) -> None:
+        self._emu.tracer_stop()
+
+    def drain(self) -> str:
+        return self._emu.tracer_drain()
