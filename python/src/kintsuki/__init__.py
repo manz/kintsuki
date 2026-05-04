@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from typing import Callable
 
 from . import _native
-from ._native import CB_EXEC, CB_READ, CB_WRITE, CpuState
+from ._native import CB_EXEC, CB_READ, CB_WRITE, CpuState, PpuStateRaw, DmaChannelRaw
 
 __version__ = "0.1.0"
 
@@ -22,9 +22,124 @@ __all__ = [
     "Emu",
     "Button",
     "CpuState",
+    "PpuState",
+    "DmaChannelState",
     "CallbackKind",
     "SymbolTable",
 ]
+
+
+@dataclass(frozen=True)
+class DmaChannelState:
+    """One DMA / HDMA channel snapshot. Mirrors `kintsuki_dma_channel_t`."""
+
+    ctrl: int        # $43xa low (mode | indirect | direction etc.)
+    dest: int        # $43xb BBADx (PPU register $21XX low byte)
+    src_addr: int    # $43xc-d
+    src_bank: int    # $43xe
+    ind_count: int   # $43xf-g (transferSize / indirectAddress)
+    ind_bank: int    # $43xh
+    line_count: int  # $43xa internal counter
+    enabled: int     # 1 if the HDMAEN bit for this channel is set
+
+
+@dataclass(frozen=True)
+class PpuState:
+    """PPU IO + per-channel HDMA snapshot. All fields are write-only on the
+    SNES bus, so this is the only practical way to inspect them in Python."""
+
+    inidisp: int
+    bgmode: int
+    mosaic: int
+    bg1sc: int
+    bg2sc: int
+    bg3sc: int
+    bg4sc: int
+    bg12nba: int
+    bg34nba: int
+    bg1hofs: int
+    bg1vofs: int
+    bg2hofs: int
+    bg2vofs: int
+    bg3hofs: int
+    bg3vofs: int
+    bg4hofs: int
+    bg4vofs: int
+    vmain: int
+    vmaddr: int
+    m7sel: int
+    m7a: int
+    m7b: int
+    m7c: int
+    m7d: int
+    m7x: int
+    m7y: int
+    cgadd: int
+    tm: int
+    ts: int
+    tmw: int
+    tsw: int
+    cgwsel: int
+    cgadsub: int
+    setini: int
+    hcounter: int
+    vcounter: int
+    dma: tuple  # 8x DmaChannelState
+    mdmaen: int
+    hdmaen: int
+
+    @classmethod
+    def _from_raw(cls, raw: PpuStateRaw) -> "PpuState":
+        dma = tuple(
+            DmaChannelState(
+                ctrl=raw.dma[i].ctrl,
+                dest=raw.dma[i].dest,
+                src_addr=raw.dma[i].src_addr,
+                src_bank=raw.dma[i].src_bank,
+                ind_count=raw.dma[i].ind_count,
+                ind_bank=raw.dma[i].ind_bank,
+                line_count=raw.dma[i].line_count,
+                enabled=raw.dma[i].enabled,
+            )
+            for i in range(8)
+        )
+        return cls(
+            inidisp=raw.inidisp, bgmode=raw.bgmode, mosaic=raw.mosaic,
+            bg1sc=raw.bg1sc, bg2sc=raw.bg2sc, bg3sc=raw.bg3sc, bg4sc=raw.bg4sc,
+            bg12nba=raw.bg12nba, bg34nba=raw.bg34nba,
+            bg1hofs=raw.bg1hofs, bg1vofs=raw.bg1vofs,
+            bg2hofs=raw.bg2hofs, bg2vofs=raw.bg2vofs,
+            bg3hofs=raw.bg3hofs, bg3vofs=raw.bg3vofs,
+            bg4hofs=raw.bg4hofs, bg4vofs=raw.bg4vofs,
+            vmain=raw.vmain, vmaddr=raw.vmaddr,
+            m7sel=raw.m7sel,
+            m7a=raw.m7a, m7b=raw.m7b, m7c=raw.m7c, m7d=raw.m7d,
+            m7x=raw.m7x, m7y=raw.m7y,
+            cgadd=raw.cgadd,
+            tm=raw.tm, ts=raw.ts, tmw=raw.tmw, tsw=raw.tsw,
+            cgwsel=raw.cgwsel, cgadsub=raw.cgadsub, setini=raw.setini,
+            hcounter=raw.hcounter, vcounter=raw.vcounter,
+            dma=dma, mdmaen=raw.mdmaen, hdmaen=raw.hdmaen,
+        )
+
+    # --- Convenience helpers ------------------------------------------------
+    def bg_main_enabled(self, layer: int) -> bool:
+        """layer ∈ {1,2,3,4} → check TM bit. Layer 5 = OBJ."""
+        return bool(self.tm & (1 << (layer - 1)))
+
+    def bg_sub_enabled(self, layer: int) -> bool:
+        return bool(self.ts & (1 << (layer - 1)))
+
+    def bg_vofs(self, layer: int) -> int:
+        return getattr(self, f"bg{layer}vofs")
+
+    def bg_hofs(self, layer: int) -> int:
+        return getattr(self, f"bg{layer}hofs")
+
+    def bg_tilemap_word_base(self, layer: int) -> int:
+        """Tilemap base address as a VRAM word offset (i.e. ($21xxSC>>2)<<10)."""
+        sc = getattr(self, f"bg{layer}sc")
+        return (sc & 0xFC) << 8
 
 
 import re
@@ -175,6 +290,13 @@ class Emu:
         s = CpuState()
         _native.lib.kintsuki_get_state(self._handle, ctypes.byref(s))
         return s
+
+    def get_ppu_state(self) -> PpuState:
+        """Snapshot of write-only PPU IO registers + per-channel DMA state.
+        Returned as an immutable dataclass — read-only view of ares globals."""
+        raw = PpuStateRaw()
+        _native.lib.kintsuki_get_ppu_state(self._handle, ctypes.byref(raw))
+        return PpuState._from_raw(raw)
 
     def set_state(self, s: CpuState) -> None:
         _native.lib.kintsuki_set_state(self._handle, ctypes.byref(s))

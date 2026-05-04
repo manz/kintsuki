@@ -11,8 +11,9 @@ dist/
 ares/ares/ares/resource/resource.hpp
 ares/ares/ares/resource/resource.cpp
 
-# Built test ROM (assembled from python/tests/asm/test_rom.s by Makefile/CI).
-python/tests/asm/test_rom.sfc
+# Built test ROMs (assembled from python/tests/asm/*.s by Makefile/conftest).
+python/tests/asm/*.sfc
+python/tests/asm/*.adbg
 
 # Built shared libraries (CMake artifacts copied around)
 app/Vendor/libkintsuki.dylib

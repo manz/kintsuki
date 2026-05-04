@@ -263,6 +263,12 @@ private:
 
     Channel() : transferSize(0xffff) {}
   } channels[8];
+
+public:
+  // Read-only accessor used by the kintsuki testing shim. Lets the
+  // libkintsuki.cpp PPU/DMA snapshot code reach individual channels
+  // without making `channels[8]` itself public.
+  auto dmaChannel(u32 ch) const -> const Channel& { return channels[ch]; }
 };
 
 extern CPU cpu;

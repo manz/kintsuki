@@ -81,6 +81,45 @@ uint32_t    kintsuki_oam_dump  (kintsuki_t*, uint8_t* out, uint32_t len);
 void        kintsuki_get_state(kintsuki_t*, kintsuki_cpu_state_t* out);
 void        kintsuki_set_state(kintsuki_t*, const kintsuki_cpu_state_t* in);
 
+// PPU/DMA snapshot. Read-only view of registers that are write-only on the
+// CPU bus (BGMODE, BGxSC, BGxHOFS/VOFS, TM/TS/TMW/TSW, CGWSEL/CGADSUB,
+// SETINI) plus per-channel HDMA state (mode, dest reg, src addr/bank,
+// indirect, lineCounter, enabled bit). Reconstructs TM/TS/TMW/TSW from the
+// per-layer enable bits stored inside ares.
+typedef struct {
+  uint8_t  ctrl;        // $43xa low (transferMode | direction | indirect | ...)
+  uint8_t  dest;        // $43xb BBADx (PPU register $21XX low byte)
+  uint16_t src_addr;    // $43xc-d A1Tx
+  uint8_t  src_bank;    // $43xe A1Bx
+  uint16_t ind_count;   // $43xf-g (transferSize / indirectAddress)
+  uint8_t  ind_bank;    // $43xh
+  uint8_t  line_count;  // $43xa internal lineCounter
+  uint8_t  enabled;     // 1 if HDMAEN bit is set
+} kintsuki_dma_channel_t;
+
+typedef struct {
+  uint8_t  inidisp;       // $2100 brightness + force-blank
+  uint8_t  bgmode;        // $2105 (mode | priority | tile-size bits)
+  uint8_t  mosaic;        // $2106
+  uint8_t  bg1sc, bg2sc, bg3sc, bg4sc;     // $2107..$210A
+  uint8_t  bg12nba, bg34nba;                // $210B,$210C
+  uint16_t bg1hofs, bg1vofs, bg2hofs, bg2vofs;
+  uint16_t bg3hofs, bg3vofs, bg4hofs, bg4vofs;
+  uint8_t  vmain;         // $2115 reconstructed
+  uint16_t vmaddr;        // $2116/$2117
+  uint8_t  m7sel;
+  uint16_t m7a, m7b, m7c, m7d, m7x, m7y;
+  uint8_t  cgadd;
+  uint8_t  tm, ts, tmw, tsw;       // $212C..$212F (rebuilt from per-layer bits)
+  uint8_t  cgwsel, cgadsub;        // $2130/$2131
+  uint8_t  setini;        // $2133
+  uint16_t hcounter, vcounter;
+  kintsuki_dma_channel_t dma[8];
+  uint8_t  mdmaen, hdmaen;  // reconstructed from cpu.channels[].dmaEnable/hdmaEnable
+} kintsuki_ppu_state_t;
+
+void kintsuki_get_ppu_state(kintsuki_t*, kintsuki_ppu_state_t* out);
+
 // Savestate. Two-call style: pass buf=NULL,cap=0 to query required size,
 // then call again with a buffer of at least the returned size. Returns
 // the required size on success or 0 on failure.

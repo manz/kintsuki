@@ -137,6 +137,70 @@ _bind("kintsuki_oam_write", None, [HANDLE, c_uint32, c_uint8])
 _bind("kintsuki_get_state", None, [HANDLE, POINTER(CpuState)])
 _bind("kintsuki_set_state", None, [HANDLE, POINTER(CpuState)])
 
+
+# PPU/DMA snapshot. Layout must match `kintsuki_ppu_state_t` in
+# target-kintsuki/kintsuki.h. ctypes lays fields out in declaration order
+# with platform-default alignment; matches the C struct so a single read
+# back via byref(PpuStateRaw()) works.
+class DmaChannelRaw(Structure):
+    _fields_ = [
+        ("ctrl", c_uint8),
+        ("dest", c_uint8),
+        ("src_addr", c_uint16),
+        ("src_bank", c_uint8),
+        ("ind_count", c_uint16),
+        ("ind_bank", c_uint8),
+        ("line_count", c_uint8),
+        ("enabled", c_uint8),
+    ]
+
+
+class PpuStateRaw(Structure):
+    _fields_ = [
+        ("inidisp", c_uint8),
+        ("bgmode", c_uint8),
+        ("mosaic", c_uint8),
+        ("bg1sc", c_uint8),
+        ("bg2sc", c_uint8),
+        ("bg3sc", c_uint8),
+        ("bg4sc", c_uint8),
+        ("bg12nba", c_uint8),
+        ("bg34nba", c_uint8),
+        ("bg1hofs", c_uint16),
+        ("bg1vofs", c_uint16),
+        ("bg2hofs", c_uint16),
+        ("bg2vofs", c_uint16),
+        ("bg3hofs", c_uint16),
+        ("bg3vofs", c_uint16),
+        ("bg4hofs", c_uint16),
+        ("bg4vofs", c_uint16),
+        ("vmain", c_uint8),
+        ("vmaddr", c_uint16),
+        ("m7sel", c_uint8),
+        ("m7a", c_uint16),
+        ("m7b", c_uint16),
+        ("m7c", c_uint16),
+        ("m7d", c_uint16),
+        ("m7x", c_uint16),
+        ("m7y", c_uint16),
+        ("cgadd", c_uint8),
+        ("tm", c_uint8),
+        ("ts", c_uint8),
+        ("tmw", c_uint8),
+        ("tsw", c_uint8),
+        ("cgwsel", c_uint8),
+        ("cgadsub", c_uint8),
+        ("setini", c_uint8),
+        ("hcounter", c_uint16),
+        ("vcounter", c_uint16),
+        ("dma", DmaChannelRaw * 8),
+        ("mdmaen", c_uint8),
+        ("hdmaen", c_uint8),
+    ]
+
+
+_bind("kintsuki_get_ppu_state", None, [HANDLE, POINTER(PpuStateRaw)])
+
 # Savestate
 _bind("kintsuki_save_state", c_uint32, [HANDLE, c_void_p, c_uint32])
 _bind("kintsuki_load_state", c_int, [HANDLE, c_void_p, c_uint32])
