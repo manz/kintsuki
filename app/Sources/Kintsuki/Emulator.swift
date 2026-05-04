@@ -58,6 +58,20 @@ final class Emulator: ObservableObject {
     private var lastFpsTime: Date = .now
     private var framesSinceFpsTick: Int = 0
 
+    // ----- Rewind ---------------------------------------------------------
+    /// Per-frame delta-compressed savestate ring. Capped at ~60s of
+    /// frames @ 60 fps (3600). The buffer stores XOR-compressed deltas
+    /// against periodic keyframes so the worst-case footprint is bounded
+    /// at ~50 MB rather than 60s × 60fps × full state.
+    private let rewindBuffer = RewindBuffer(capacity: 3600,
+                                            keyframeInterval: 60)
+    /// Frames currently retained in the rewind buffer (for the status pill).
+    @Published private(set) var rewindFrames: Int = 0
+    /// Set true while a rewind is in progress so the run loop pauses
+    /// captures (otherwise we'd push the rewound state right back onto
+    /// the buffer and never make progress).
+    private var rewinding: Bool = false
+
     init() {
         // Set KINTSUKI_SYSTEM_PAK env var so the dylib finds boards.bml/ipl.rom
         // bundled at Contents/Resources/System/Super Famicom/.
@@ -116,6 +130,9 @@ final class Emulator: ObservableObject {
         NSLog("kintsuki: ROM loaded successfully")
         loadedROM = url
         running = true
+        // New ROM = fresh timeline. Drop any rewind frames from a
+        // previous session.
+        clearRewindBuffer()
         rememberRecent(url)
         startRunLoop()
     }
@@ -186,6 +203,7 @@ final class Emulator: ObservableObject {
     private func tick() {
         guard running, let h = handle else { return }
         kintsuki_run_frames(h, 1)
+        captureRewindFrame()
         snapshotFramebuffer()
         snapshotCpuState()
         framesSinceFpsTick += 1
@@ -196,6 +214,60 @@ final class Emulator: ObservableObject {
             framesSinceFpsTick = 0
             lastFpsTime = now
         }
+    }
+
+    /// Push the post-tick state into the rewind buffer. Skipped during
+    /// an active rewind (otherwise the buffer would re-record the
+    /// rewound state and we'd never make progress backwards).
+    private func captureRewindFrame() {
+        guard !rewinding, let h = handle else { return }
+        let needed = kintsuki_save_state(h, nil, 0)
+        guard needed > 0 else { return }
+        var blob = Data(count: Int(needed))
+        let written = blob.withUnsafeMutableBytes { raw -> UInt32 in
+            kintsuki_save_state(h, raw.baseAddress, UInt32(needed))
+        }
+        guard written > 0 else { return }
+        blob.count = Int(written)
+        rewindBuffer.push(blob)
+        if rewindFrames != rewindBuffer.count { rewindFrames = rewindBuffer.count }
+    }
+
+    /// Pop the most-recent retained frame and load it. Returns true if
+    /// the buffer had something to rewind to. Triggered by the UI's
+    /// CMD+← shortcut.
+    @discardableResult
+    func rewindOneFrame() -> Bool {
+        guard let h = handle else { return false }
+        rewinding = true
+        defer { rewinding = false }
+        // Pop the most-recent first (current frame), then the next-most-
+        // recent (previous frame) — that's the frame we actually want
+        // to land on. If only one frame was retained, popping it returns
+        // us to the single available point in time and the buffer is
+        // empty afterwards.
+        _ = rewindBuffer.popLast()
+        guard let blob = rewindBuffer.popLast() else {
+            rewindFrames = rewindBuffer.count
+            return false
+        }
+        let ok = blob.withUnsafeBytes { raw -> Int32 in
+            kintsuki_load_state(h, raw.baseAddress, UInt32(blob.count))
+        }
+        rewindFrames = rewindBuffer.count
+        if ok != 0 {
+            // Re-snapshot framebuffer + CPU so SwiftUI redraws.
+            snapshotFramebuffer()
+            snapshotCpuState()
+            return true
+        }
+        return false
+    }
+
+    /// Drop every retained rewind frame (e.g., on ROM unload).
+    func clearRewindBuffer() {
+        rewindBuffer.clear()
+        rewindFrames = 0
     }
 
     private func snapshotCpuState() {
