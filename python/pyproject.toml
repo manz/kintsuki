@@ -50,4 +50,8 @@ dev = [
     "pytest>=9.0.0",
     "build>=1.0",
     "wheel>=0.42",
+    # a816 assembler is a runtime dep of the test suite (conftest.py's
+    # assemble_rom fixture shells out to `a816 -f sfc`). Pinned to the
+    # latest 1.1.0 alpha that's been validated against this repo.
+    "a816>=1.1.0a11",
 ]
