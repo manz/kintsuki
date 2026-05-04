@@ -329,6 +329,16 @@ class Emu:
         return _TracerSession(self, lo, hi,
                               ring_capacity=ring_capacity, path=path)
 
+    # ------------------------------------------------------------- Mesen import
+    def import_mesen_state(self, path: str) -> bool:
+        """Read a Mesen 2 ``.mss`` and push its CPU + WRAM/SRAM/VRAM/CGRAM/OAM
+        into this emulator. Returns False on missing-file / parse / inflate
+        failure (rather than raising) so Swift hosts can show a friendly
+        error without exception unwinding through the C ABI."""
+        c_path = path.encode("utf-8")
+        ok = _native.lib.kintsuki_import_mesen_state(self._handle, c_path)
+        return ok != 0
+
     def set_state(self, s: CpuState) -> None:
         _native.lib.kintsuki_set_state(self._handle, ctypes.byref(s))
 

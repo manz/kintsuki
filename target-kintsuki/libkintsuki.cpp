@@ -7,10 +7,13 @@
 #include "program.hpp"
 #include "kintsuki.h"
 
+#include <nall/decode/inflate.hpp>
+
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <memory>
+#include <string>
 #include <vector>
 
 // kintsuki test-harness bail flag: defined in ares/sfc/system/system.cpp,
@@ -272,6 +275,169 @@ uint32_t kintsuki_save_state(kintsuki_t* h, void* buf, uint32_t cap) {
 int kintsuki_load_state(kintsuki_t* h, const void* buf, uint32_t len) {
   if(!h || !buf) return 0;
   return h->program->loadStateBlob((const uint8_t*)buf, len) ? 1 : 0;
+}
+
+// ---- Mesen 2 .mss importer ------------------------------------------------
+// Stand-alone parser + push into the emulator. Mirrors the Python
+// implementation in python/src/kintsuki/mesen.py (see that file for the
+// full format breakdown). Validated against file_format_version=4,
+// Mesen 2.1.1. Returns 1 on success, 0 on any I/O / parse failure.
+
+namespace {
+
+// Minimal little-endian readers; the .mss format is LE throughout.
+inline uint16_t rdU16LE(const uint8_t* p) {
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+inline uint32_t rdU32LE(const uint8_t* p) {
+  return (uint32_t)p[0] | ((uint32_t)p[1] << 8)
+       | ((uint32_t)p[2] << 16) | ((uint32_t)p[3] << 24);
+}
+
+// Strip the 2-byte zlib header (CMF/FLG) + trailing 4-byte adler32 so
+// the inner deflate stream feeds nall::Decode::inflate. Returns nullopt
+// on a buffer too small to be valid.
+struct DeflateView { const uint8_t* data; uint32_t size; };
+auto stripZlibWrapper(const uint8_t* buf, uint32_t len) -> DeflateView {
+  if(len < 6) return {nullptr, 0};
+  return { buf + 2, len - 2 - 4 };
+}
+
+// CPU register dataclass mirrored from Mesen's record schema.
+struct MesenCpu {
+  uint16_t a = 0, x = 0, y = 0, sp = 0, d = 0;
+  uint8_t  dbr = 0, k = 0;
+  uint16_t pc_low = 0;
+  uint8_t  ps = 0;
+  uint8_t  e = 0;
+  bool     have_pc = false;
+};
+
+// Walk a decompressed payload of [key\0][u32 size][value bytes] records
+// and dispatch each to the emulator. Returns false on a malformed
+// record (key non-printable, oversized value, truncated).
+bool importPayload(const uint8_t* payload, uint32_t plen, Program* program) {
+  constexpr uint32_t MAX_VALUE = 10u * 1024u * 1024u;
+  uint32_t i = 0;
+  MesenCpu cpu;
+  while(i < plen) {
+    // Key: null-terminated printable ASCII.
+    uint32_t keyEnd = i;
+    while(keyEnd < plen && payload[keyEnd] != 0) keyEnd++;
+    if(keyEnd >= plen) break;
+    uint32_t keyLen = keyEnd - i;
+    if(keyLen == 0) break;
+    for(uint32_t j = 0; j < keyLen; j++) {
+      uint8_t c = payload[i + j];
+      if(c < 0x20 || c > 0x7E) return false;
+    }
+    std::string key((const char*)(payload + i), keyLen);
+    i = keyEnd + 1;
+    if(i + 4 > plen) return false;
+    uint32_t vsz = rdU32LE(payload + i);
+    i += 4;
+    if(vsz > MAX_VALUE || i + vsz > plen) return false;
+    const uint8_t* val = payload + i;
+    i += vsz;
+
+    // Memory blobs: push bytes through the CPU bus so any side-effects
+    // (cart mappers etc.) fire as if the game itself wrote them.
+    auto pushRange = [&](uint32_t base, const uint8_t* src, uint32_t n) {
+      for(uint32_t k = 0; k < n; k++) program->memWrite(base + k, src[k]);
+    };
+
+    if(key == "memoryManager.workRam"  && vsz == 128*1024) pushRange(0x7E0000, val, vsz);
+    else if(key == "cart.saveRam"     && vsz > 0)         pushRange(0x700000, val, vsz);
+    else if(key == "ppu.vram"         && vsz == 64*1024)  for(uint32_t k=0;k<vsz;k++) program->vramWrite(k, val[k]);
+    else if(key == "ppu.cgram"        && vsz == 512)       for(uint32_t k=0;k<vsz;k++) program->cgramWrite(k, val[k]);
+    else if(key == "ppu.oamRam"       && vsz == 544)       for(uint32_t k=0;k<vsz;k++) program->oamWrite(k, val[k]);
+
+    // CPU regs: collect, push at the end via setCpuState().
+    else if(key == "cpu.a"     && vsz == 2) cpu.a   = rdU16LE(val);
+    else if(key == "cpu.x"     && vsz == 2) cpu.x   = rdU16LE(val);
+    else if(key == "cpu.y"     && vsz == 2) cpu.y   = rdU16LE(val);
+    else if(key == "cpu.sp"    && vsz == 2) cpu.sp  = rdU16LE(val);
+    else if(key == "cpu.d"     && vsz == 2) cpu.d   = rdU16LE(val);
+    else if(key == "cpu.dbr"   && vsz == 1) cpu.dbr = val[0];
+    else if(key == "cpu.k"     && vsz == 1) cpu.k   = val[0];
+    else if(key == "cpu.pc"    && vsz == 2) { cpu.pc_low = rdU16LE(val); cpu.have_pc = true; }
+    else if(key == "cpu.ps"    && vsz == 1) cpu.ps  = val[0];
+    else if(key == "cpu.emulationMode" && vsz == 1) cpu.e = val[0];
+    // Unknown keys: silently skipped.
+  }
+
+  CpuState s = program->getCpuState();
+  s.a = cpu.a; s.x = cpu.x; s.y = cpu.y; s.s = cpu.sp; s.d = cpu.d;
+  s.b = cpu.dbr; s.p = cpu.ps;
+  if(cpu.have_pc) s.pc = (((uint32_t)cpu.k) << 16) | cpu.pc_low;
+  s.e = (cpu.e != 0);
+  s.stp = false; s.wai = false;
+  program->setCpuState(s);
+  return true;
+}
+
+}  // namespace
+
+int kintsuki_import_mesen_state(kintsuki_t* h, const char* path) {
+  if(!h || !path) return 0;
+
+  // Read file into a buffer.
+  FILE* fp = std::fopen(path, "rb");
+  if(!fp) return 0;
+  std::fseek(fp, 0, SEEK_END);
+  long sz = std::ftell(fp);
+  std::fseek(fp, 0, SEEK_SET);
+  if(sz < 36) { std::fclose(fp); return 0; }
+  std::vector<uint8_t> buf(sz);
+  size_t rd = std::fread(buf.data(), 1, sz, fp);
+  std::fclose(fp);
+  if(rd != (size_t)sz) return 0;
+
+  // Header: "MSS" + emu_ver + fmt_ver + console + framebuf header
+  if(buf[0] != 'M' || buf[1] != 'S' || buf[2] != 'S') return 0;
+  uint32_t off = 3;
+  /* emu_ver */ off += 4;
+  /* fmt_ver */ off += 4;
+  /* console */ off += 4;
+  if(off + 20 > buf.size()) return 0;
+  /* fb.size */ off += 4;
+  /* fb.w   */ off += 4;
+  /* fb.h   */ off += 4;
+  /* fb.s   */ off += 4;
+  uint32_t fbCompSize = rdU32LE(&buf[off]);
+  off += 4;
+  if(off + fbCompSize > buf.size()) return 0;
+  off += fbCompSize;
+  if(off + 4 > buf.size()) return 0;
+  uint32_t romLen = rdU32LE(&buf[off]);
+  off += 4;
+  if(off + romLen > buf.size()) return 0;
+  off += romLen;
+
+  if(off >= buf.size()) return 0;
+  uint8_t flag = buf[off++];
+  std::vector<uint8_t> payload;
+  if(flag == 0) {
+    payload.assign(buf.begin() + off, buf.end());
+  } else if(flag == 1) {
+    if(off + 8 > buf.size()) return 0;
+    uint32_t decompSize = rdU32LE(&buf[off]);
+    uint32_t compSize   = rdU32LE(&buf[off + 4]);
+    off += 8;
+    if(off + compSize > buf.size()) return 0;
+    auto deflate = stripZlibWrapper(&buf[off], compSize);
+    if(!deflate.data) return 0;
+    payload.assign(decompSize, 0);
+    if(!nall::Decode::inflate(payload.data(), decompSize,
+                              deflate.data, deflate.size)) {
+      return 0;
+    }
+  } else {
+    return 0;
+  }
+
+  return importPayload(payload.data(), (uint32_t)payload.size(),
+                       h->program.get()) ? 1 : 0;
 }
 
 const uint32_t* kintsuki_framebuffer(kintsuki_t* h, uint32_t* out_w, uint32_t* out_h) {
