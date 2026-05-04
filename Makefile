@@ -37,16 +37,21 @@ python-stage: build  ## Copy libkintsuki + ares System pak into the wheel
 	$(Q) mkdir -p "python/src/kintsuki/_lib/System"
 	$(Q) cp -R "ares/ares/System/Super Famicom" "python/src/kintsuki/_lib/System/"
 
+.PHONY: dev-deps
+dev-deps:  ## Sync dev environment via uv (kintsuki + a816 + pytest)
+	$(Q) cd python && uv sync --group dev
+
 .PHONY: test-rom
 test-rom: python/tests/asm/test_rom.sfc  ## Assemble the CI test ROM via a816
 
-python/tests/asm/test_rom.sfc: python/tests/asm/test_rom.s
-	$(Q) a816 -f sfc -o $@ $<
+python/tests/asm/test_rom.sfc: python/tests/asm/test_rom.s | dev-deps
+	$(Q) cd python && uv run a816 -f sfc \
+	  -o tests/asm/test_rom.sfc tests/asm/test_rom.s
 
 .PHONY: tests
 tests: python-stage test-rom; $(info $(M) Running tests...) @  ## Run pytest against the staged wheel + test ROM
 	$(Q) cd python && KINTSUKI_TEST_ROM=$(CURDIR)/python/tests/asm/test_rom.sfc \
-	  $(PYTHON) -m pytest tests/ -v
+	  uv run pytest tests/ -v
 
 .PHONY: wheels
 wheels: python-stage  ## Build a python wheel (py3-none-any; CI retags per platform)

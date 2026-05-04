@@ -44,6 +44,11 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
 
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: true
+          cache-dependency-glob: python/uv.lock
+
       - name: Configure + build libkintsuki
         run: |
           cmake -S . -B build -G Ninja \
@@ -55,21 +60,16 @@ jobs:
       - name: Stage native library into the wheel
         run: make python-stage
 
-      - name: Install python package + a816
+      - name: Install dev environment (kintsuki + a816 + pytest)
         working-directory: python
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install -e . pytest
-          python -m pip install --pre 'a816==1.1.0a3'
+        run: uv sync --group dev --python ${{ matrix.python }}
 
       - name: Assemble test ROM
-        working-directory: python/tests/asm
-        run: |
-          a816 -f sfc -o test_rom.sfc test_rom.s
+        working-directory: python
+        run: uv run a816 -f sfc -o tests/asm/test_rom.sfc tests/asm/test_rom.s
 
       - name: Run tests against built ROM
         working-directory: python
         env:
           KINTSUKI_TEST_ROM: ${{ github.workspace }}/python/tests/asm/test_rom.sfc
-        run: |
-          python -m pytest tests/ -v
+        run: uv run pytest tests/ -v
