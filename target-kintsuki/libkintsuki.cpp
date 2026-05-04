@@ -133,6 +133,174 @@ void kintsuki_set_state(kintsuki_t* h, const kintsuki_cpu_state_t* in) {
   h->program->setCpuState(s);
 }
 
+// PPU/DMA state snapshot. Reads ares globals directly to expose registers
+// that are write-only on the CPU bus. Performance PPU implementation is
+// active (Program::Program calls setAccurate(false)).
+struct kintsuki_dma_channel_t {
+  uint8_t  ctrl;
+  uint8_t  dest;
+  uint16_t src_addr;
+  uint8_t  src_bank;
+  uint16_t ind_count;
+  uint8_t  ind_bank;
+  uint8_t  line_count;
+  uint8_t  enabled;
+};
+
+struct kintsuki_ppu_state_t {
+  uint8_t  inidisp;
+  uint8_t  bgmode;
+  uint8_t  mosaic;
+  uint8_t  bg1sc, bg2sc, bg3sc, bg4sc;
+  uint8_t  bg12nba, bg34nba;
+  uint16_t bg1hofs, bg1vofs, bg2hofs, bg2vofs;
+  uint16_t bg3hofs, bg3vofs, bg4hofs, bg4vofs;
+  uint8_t  vmain;
+  uint16_t vmaddr;
+  uint8_t  m7sel;
+  uint16_t m7a, m7b, m7c, m7d, m7x, m7y;
+  uint8_t  cgadd;
+  uint8_t  tm, ts, tmw, tsw;
+  uint8_t  cgwsel, cgadsub;
+  uint8_t  setini;
+  uint16_t hcounter, vcounter;
+  kintsuki_dma_channel_t dma[8];
+  uint8_t  mdmaen, hdmaen;
+};
+
+void kintsuki_get_ppu_state(kintsuki_t* h, kintsuki_ppu_state_t* out) {
+  if(!h || !out) return;
+  std::memset(out, 0, sizeof(*out));
+
+  auto& p = ares::SuperFamicom::ppuPerformanceImpl;
+  auto& c = ares::SuperFamicom::cpu;
+
+  // INIDISP ($2100): brightness in low nybble, force-blank in bit 7.
+  out->inidisp = (uint8_t)((p.io.displayBrightness & 0x0F) | (p.io.displayDisable ? 0x80 : 0x00));
+  // BGMODE ($2105): mode | priority | per-BG tile-size bits.
+  out->bgmode  = (uint8_t)((p.io.bgMode & 0x07) | (p.io.bgPriority ? 0x08 : 0)
+                          | (p.bg1.io.tileSize ? 0x10 : 0)
+                          | (p.bg2.io.tileSize ? 0x20 : 0)
+                          | (p.bg3.io.tileSize ? 0x40 : 0)
+                          | (p.bg4.io.tileSize ? 0x80 : 0));
+  // BGxSC ($2107..$210A): tilemap base in bits 7..2, screenSize in bits 1..0.
+  // screenAddress is the tilemap word base (e.g. $7000 → byte $70).
+  auto packBGSC = [](uint16_t scrAddr, uint8_t scrSize) -> uint8_t {
+    return (uint8_t)((scrAddr >> 8) & 0xFC) | (uint8_t)(scrSize & 0x03);
+  };
+  out->bg1sc = packBGSC(p.bg1.io.screenAddress, p.bg1.io.screenSize);
+  out->bg2sc = packBGSC(p.bg2.io.screenAddress, p.bg2.io.screenSize);
+  out->bg3sc = packBGSC(p.bg3.io.screenAddress, p.bg3.io.screenSize);
+  out->bg4sc = packBGSC(p.bg4.io.screenAddress, p.bg4.io.screenSize);
+  // BG12NBA ($210B): char-data addr / 0x1000 for BG2|BG1.
+  out->bg12nba = (uint8_t)(((p.bg1.io.tiledataAddress >> 12) & 0x0F)
+                          | (((p.bg2.io.tiledataAddress >> 12) & 0x0F) << 4));
+  out->bg34nba = (uint8_t)(((p.bg3.io.tiledataAddress >> 12) & 0x0F)
+                          | (((p.bg4.io.tiledataAddress >> 12) & 0x0F) << 4));
+
+  // BGxHOFS / BGxVOFS — full 16-bit shadow ares keeps after the double-write.
+  out->bg1hofs = (uint16_t)p.bg1.io.hoffset;
+  out->bg1vofs = (uint16_t)p.bg1.io.voffset;
+  out->bg2hofs = (uint16_t)p.bg2.io.hoffset;
+  out->bg2vofs = (uint16_t)p.bg2.io.voffset;
+  out->bg3hofs = (uint16_t)p.bg3.io.hoffset;
+  out->bg3vofs = (uint16_t)p.bg3.io.voffset;
+  out->bg4hofs = (uint16_t)p.bg4.io.hoffset;
+  out->bg4vofs = (uint16_t)p.bg4.io.voffset;
+
+  // M7SEL + M7A..D + M7X/Y — mode-7 transform regs, all in mode7 substate.
+  out->m7sel = (uint8_t)((p.mode7.hflip ? 0x01 : 0)
+                       | (p.mode7.vflip ? 0x02 : 0)
+                       | ((p.mode7.repeat & 0x03) << 6));
+  out->m7a = (uint16_t)p.mode7.a;
+  out->m7b = (uint16_t)p.mode7.b;
+  out->m7c = (uint16_t)p.mode7.c;
+  out->m7d = (uint16_t)p.mode7.d;
+  out->m7x = (uint16_t)p.mode7.hcenter;
+  out->m7y = (uint16_t)p.mode7.vcenter;
+
+  // VMAIN/VMADDR — performance PPU stores increment as size (1/32/128/128),
+  // map back to the bit-pattern.
+  uint8_t vmainBits = 0;
+  switch(p.vram.increment) {
+    case 1:   vmainBits = 0; break;
+    case 32:  vmainBits = 1; break;
+    case 128: vmainBits = 2; break;  // 0b10 and 0b11 both give 128
+  }
+  out->vmain  = (uint8_t)((vmainBits & 0x03)
+                       | ((p.vram.mapping & 0x03) << 2)
+                       | (p.vram.mode ? 0x80 : 0));
+  out->vmaddr = (uint16_t)p.vram.address;
+
+  out->cgadd  = (uint8_t)p.io.cgramAddress;
+
+  // TM/TS/TMW/TSW reconstructed from per-layer enable bits inside ares.
+  auto mkTm = [](bool b1, bool b2, bool b3, bool b4, bool ob) -> uint8_t {
+    return (uint8_t)((b1 ? 0x01 : 0) | (b2 ? 0x02 : 0)
+                   | (b3 ? 0x04 : 0) | (b4 ? 0x08 : 0)
+                   | (ob ? 0x10 : 0));
+  };
+  out->tm = mkTm(p.bg1.io.aboveEnable, p.bg2.io.aboveEnable,
+                 p.bg3.io.aboveEnable, p.bg4.io.aboveEnable,
+                 p.obj.io.aboveEnable);
+  out->ts = mkTm(p.bg1.io.belowEnable, p.bg2.io.belowEnable,
+                 p.bg3.io.belowEnable, p.bg4.io.belowEnable,
+                 p.obj.io.belowEnable);
+  out->tmw = mkTm(p.bg1.window.aboveEnable, p.bg2.window.aboveEnable,
+                  p.bg3.window.aboveEnable, p.bg4.window.aboveEnable,
+                  p.obj.window.aboveEnable);
+  out->tsw = mkTm(p.bg1.window.belowEnable, p.bg2.window.belowEnable,
+                  p.bg3.window.belowEnable, p.bg4.window.belowEnable,
+                  p.obj.window.belowEnable);
+
+  out->cgwsel  = (uint8_t)((p.dac.io.directColor ? 0x01 : 0)
+                        | (p.dac.io.blendMode ? 0x02 : 0)
+                        | ((p.dac.window.belowMask & 0x03) << 4)
+                        | ((p.dac.window.aboveMask & 0x03) << 6));
+  // CGADDSUB ($2131): performance PPU stores colorEnable as a 7-element
+  // n1 array indexed by Source::{BG1,BG2,BG3,BG4,OBJ1,OBJ2,COL}.
+  using PerfPPU = ares::SuperFamicom::PPUPerformance;
+  out->cgadsub = (uint8_t)((p.dac.io.colorEnable[PerfPPU::Source::BG1]  ? 0x01 : 0)
+                        | (p.dac.io.colorEnable[PerfPPU::Source::BG2]  ? 0x02 : 0)
+                        | (p.dac.io.colorEnable[PerfPPU::Source::BG3]  ? 0x04 : 0)
+                        | (p.dac.io.colorEnable[PerfPPU::Source::BG4]  ? 0x08 : 0)
+                        | (p.dac.io.colorEnable[PerfPPU::Source::OBJ2] ? 0x10 : 0)
+                        | (p.dac.io.colorEnable[PerfPPU::Source::COL]  ? 0x20 : 0)
+                        | (p.dac.io.colorHalve ? 0x40 : 0)
+                        | (p.dac.io.colorMode ? 0x80 : 0));
+  out->setini = (uint8_t)((p.io.interlace ? 0x01 : 0)
+                       | (p.io.overscan ? 0x10 : 0)
+                       | (p.io.pseudoHires ? 0x40 : 0)
+                       | (p.io.extbg ? 0x80 : 0));
+
+  out->hcounter = (uint16_t)p.io.hcounter;
+  out->vcounter = (uint16_t)p.io.vcounter;
+
+  // DMA / HDMA channels
+  uint8_t mdmaen = 0, hdmaen = 0;
+  for(uint32_t ch = 0; ch < 8; ch++) {
+    auto& src = c.dmaChannel(ch);
+    auto& dst = out->dma[ch];
+    dst.ctrl = (uint8_t)((src.transferMode & 0x07)
+                       | (src.fixedTransfer ? 0x08 : 0)
+                       | (src.reverseTransfer ? 0x10 : 0)
+                       | (src.unused ? 0x20 : 0)
+                       | (src.indirect ? 0x40 : 0)
+                       | (src.direction ? 0x80 : 0));
+    dst.dest      = (uint8_t)src.targetAddress;
+    dst.src_addr  = (uint16_t)src.sourceAddress;
+    dst.src_bank  = (uint8_t)src.sourceBank;
+    dst.ind_count = (uint16_t)src.transferSize;  // union with indirectAddress
+    dst.ind_bank  = (uint8_t)src.indirectBank;
+    dst.line_count = (uint8_t)src.lineCounter;
+    dst.enabled   = (uint8_t)(src.hdmaEnable ? 1 : 0);
+    if(src.dmaEnable)  mdmaen |= (uint8_t)(1 << ch);
+    if(src.hdmaEnable) hdmaen |= (uint8_t)(1 << ch);
+  }
+  out->mdmaen = mdmaen;
+  out->hdmaen = hdmaen;
+}
+
 uint32_t kintsuki_save_state(kintsuki_t* h, void* buf, uint32_t cap) {
   if(!h) return 0;
   auto blob = h->program->saveStateBlob();
