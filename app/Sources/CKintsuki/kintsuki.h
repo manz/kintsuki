@@ -17,6 +17,8 @@ typedef struct {
   uint8_t  b, p;
   uint32_t pc;   // 24-bit
   uint8_t  e;    // emulation flag (1 = 6502 mode)
+  uint8_t  stp;  // 1 if CPU is halted by STP
+  uint8_t  wai;  // 1 if CPU is waiting for IRQ via WAI
 } kintsuki_cpu_state_t;
 
 // 0=exec, 1=read, 2=write
@@ -39,6 +41,18 @@ int         kintsuki_load_rom(kintsuki_t*, const char* path);
 void        kintsuki_run_frames(kintsuki_t*, uint32_t n);
 void        kintsuki_step(kintsuki_t*);
 uint64_t    kintsuki_frame_count(kintsuki_t*);
+
+// Mid-frame run-until. Yields the scheduler the moment the CPU is about
+// to execute target_pc — does NOT wait for vblank. Returns 1 on hit,
+// 0 if max_frames of emulated time elapsed without reaching the target.
+int         kintsuki_run_until(kintsuki_t*, uint32_t target_pc, uint32_t max_frames);
+
+// Rearm the CPU coroutine. Use this between back-to-back test stubs that
+// end with STP — the CPU coroutine is suspended inside instructionStop's
+// idle loop, and just clearing r.stp doesn't unwind it cleanly. Rearm
+// destroys + recreates the libco coroutine, clears pending interrupts,
+// preserves WRAM and all other emulator state. Cheap (microseconds).
+void        kintsuki_rearm_cpu(kintsuki_t*);
 
 // Memory (CPU bus, 24-bit address)
 uint8_t     kintsuki_read_u8 (kintsuki_t*, uint32_t addr);
@@ -67,6 +81,45 @@ uint32_t    kintsuki_oam_dump  (kintsuki_t*, uint8_t* out, uint32_t len);
 void        kintsuki_get_state(kintsuki_t*, kintsuki_cpu_state_t* out);
 void        kintsuki_set_state(kintsuki_t*, const kintsuki_cpu_state_t* in);
 
+// PPU/DMA snapshot. Read-only view of registers that are write-only on the
+// CPU bus (BGMODE, BGxSC, BGxHOFS/VOFS, TM/TS/TMW/TSW, CGWSEL/CGADSUB,
+// SETINI) plus per-channel HDMA state (mode, dest reg, src addr/bank,
+// indirect, lineCounter, enabled bit). Reconstructs TM/TS/TMW/TSW from the
+// per-layer enable bits stored inside ares.
+typedef struct {
+  uint8_t  ctrl;        // $43xa low (transferMode | direction | indirect | ...)
+  uint8_t  dest;        // $43xb BBADx (PPU register $21XX low byte)
+  uint16_t src_addr;    // $43xc-d A1Tx
+  uint8_t  src_bank;    // $43xe A1Bx
+  uint16_t ind_count;   // $43xf-g (transferSize / indirectAddress)
+  uint8_t  ind_bank;    // $43xh
+  uint8_t  line_count;  // $43xa internal lineCounter
+  uint8_t  enabled;     // 1 if HDMAEN bit is set
+} kintsuki_dma_channel_t;
+
+typedef struct {
+  uint8_t  inidisp;       // $2100 brightness + force-blank
+  uint8_t  bgmode;        // $2105 (mode | priority | tile-size bits)
+  uint8_t  mosaic;        // $2106
+  uint8_t  bg1sc, bg2sc, bg3sc, bg4sc;     // $2107..$210A
+  uint8_t  bg12nba, bg34nba;                // $210B,$210C
+  uint16_t bg1hofs, bg1vofs, bg2hofs, bg2vofs;
+  uint16_t bg3hofs, bg3vofs, bg4hofs, bg4vofs;
+  uint8_t  vmain;         // $2115 reconstructed
+  uint16_t vmaddr;        // $2116/$2117
+  uint8_t  m7sel;
+  uint16_t m7a, m7b, m7c, m7d, m7x, m7y;
+  uint8_t  cgadd;
+  uint8_t  tm, ts, tmw, tsw;       // $212C..$212F (rebuilt from per-layer bits)
+  uint8_t  cgwsel, cgadsub;        // $2130/$2131
+  uint8_t  setini;        // $2133
+  uint16_t hcounter, vcounter;
+  kintsuki_dma_channel_t dma[8];
+  uint8_t  mdmaen, hdmaen;  // reconstructed from cpu.channels[].dmaEnable/hdmaEnable
+} kintsuki_ppu_state_t;
+
+void kintsuki_get_ppu_state(kintsuki_t*, kintsuki_ppu_state_t* out);
+
 // Savestate. Two-call style: pass buf=NULL,cap=0 to query required size,
 // then call again with a buffer of at least the returned size. Returns
 // the required size on success or 0 on failure.
@@ -86,6 +139,36 @@ void        kintsuki_press(kintsuki_t*, int port, int button, int pressed);
 int         kintsuki_add_callback(kintsuki_t*, int kind, uint32_t lo, uint32_t hi,
                                   kintsuki_cb_t fn, void* userdata);
 void        kintsuki_remove_callback(kintsuki_t*, int kind, int id);
+
+// Mesen 2 .mss import. Reads the file at `path`, decompresses the
+// serialized state payload, walks the records, and pushes CPU
+// registers + WRAM/SRAM/VRAM/CGRAM/OAM into the emulator. Returns
+// 1 on success, 0 on any I/O / parse failure (failures log to
+// stderr so the caller can inspect them). Validated against
+// file_format_version=4, Mesen 2.1.x. Surface intentionally narrow:
+// settings, controllers, dummy DMA channels are skipped.
+int         kintsuki_import_mesen_state(kintsuki_t*, const char* path);
+
+// Formatted execution tracer. Wraps an exec callback that disassembles
+// the instruction at PC + dumps CPU registers, producing one Mesen-
+// style line per exec event in [lo,hi]. Single tracer per emulator —
+// `tracer_start` stops the previous one. Modes:
+//   RING: in-memory bounded ring; oldest bytes evicted when full so
+//         drain returns at most `ring_capacity` bytes.
+//   FILE: lines appended to `path` (truncated on start). `drain` is 0.
+typedef enum {
+  KINTSUKI_TRACE_RING = 0,
+  KINTSUKI_TRACE_FILE = 1,
+} kintsuki_trace_mode_t;
+
+void        kintsuki_tracer_start(kintsuki_t*, uint32_t lo, uint32_t hi,
+                                  kintsuki_trace_mode_t mode,
+                                  const char* path,
+                                  uint32_t ring_capacity);
+void        kintsuki_tracer_stop(kintsuki_t*);
+// Copy ring contents to `out` (max `cap` bytes), return bytes written.
+// Drain clears the ring. In FILE mode returns 0.
+uint32_t    kintsuki_tracer_drain(kintsuki_t*, char* out, uint32_t cap);
 
 #ifdef __cplusplus
 }

@@ -553,6 +553,27 @@ final class Emulator: ObservableObject {
         if ok != 0 { NSLog("kintsuki: loaded state \"\(entry.name)\"") }
     }
 
+    /// Pull a Mesen 2 .mss into the running emulator via the C ABI.
+    /// Returns false on missing-file / parse / inflate failure so the
+    /// caller can surface a friendly NSAlert rather than crashing.
+    /// After a successful import, run one frame so the PPU repaints
+    /// the restored scene (savestate restores registers, not the live
+    /// framebuffer the MTKView reads).
+    func importMesenState(url: URL) -> Bool {
+        guard let h = handle else { return false }
+        let ok = url.path.withCString { kintsuki_import_mesen_state(h, $0) }
+        if ok != 0 {
+            kintsuki_run_frames(h, 1)
+            snapshotFramebuffer()
+            snapshotCpuState()
+            clearRewindBuffer()
+            NSLog("kintsuki: imported Mesen state from \(url.path)")
+            return true
+        }
+        NSLog("kintsuki: failed to import Mesen state from \(url.path)")
+        return false
+    }
+
     func renameState(_ entry: SaveStateEntry, to name: String) {
         guard let ctx = modelContext else { return }
         entry.name = name
