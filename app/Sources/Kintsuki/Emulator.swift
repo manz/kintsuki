@@ -85,6 +85,13 @@ final class Emulator: ObservableObject {
     /// Single concurrent worker preserves push order.
     private let rewindQueue = DispatchQueue(label: "net.ringum.kintsuki.rewind",
                                             qos: .userInitiated)
+    /// True while the user is actively scrubbing backwards (a CMD+←
+    /// fired in the last `rewindHoldTimeout` seconds). While held, the
+    /// run loop suspends forward emulation so `tick()` doesn't re-push
+    /// a frame between repeats and turn the buffer into a no-op churn.
+    private var rewindHolding: Bool = false
+    private var rewindHoldResumeWork: DispatchWorkItem?
+    private let rewindHoldTimeout: TimeInterval = 0.15
 
     init() {
         // Set KINTSUKI_SYSTEM_PAK env var so the dylib finds boards.bml/ipl.rom
@@ -239,6 +246,11 @@ final class Emulator: ObservableObject {
 
     private func tick() {
         guard running, let h = handle else { return }
+        // While the user is actively rewinding (held CMD+←), suspend
+        // forward emulation. Otherwise tick re-captures a frame between
+        // each key-repeat event and rewindOneFrame's pop-pop pattern
+        // ends up oscillating around the same point in time.
+        if rewindHolding { return }
         kintsuki_run_frames(h, 1)
         captureRewindFrame()
         snapshotFramebuffer()
@@ -287,6 +299,18 @@ final class Emulator: ObservableObject {
     @discardableResult
     func rewindOneFrame() -> Bool {
         guard let h = handle else { return false }
+        // Mark the run loop as "user is scrubbing"; tick() will skip
+        // forward emulation until the hold timeout fires.
+        rewindHolding = true
+        rewindHoldResumeWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.rewindHolding = false
+            self?.rewindHoldResumeWork = nil
+        }
+        rewindHoldResumeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + rewindHoldTimeout,
+                                      execute: work)
+
         rewinding = true
         defer { rewinding = false }
         // Drain pending pushes so popLast sees them. Sync hop to the
