@@ -60,7 +60,7 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -e . pytest
-          python -m pip install --pre 'a816==1.1.0a3'
+          python -m pip install --pre 'a816==1.1.0a11'
 
       - name: Assemble test ROM
         working-directory: python/tests/asm
