@@ -392,32 +392,50 @@ auto Program::loadStateFile(const char* path) -> bool {
   return loadStateBlob(blob.data(), blob.size());
 }
 
+// ares' performance PPU always emits the framebuffer at 2x horizontal
+// (512 base, ~564 with hires/blur padding) and 1x vertical (~242). A
+// raw save lands a 564x242 PNG that looks crushed wide because the
+// pixels carry a 2:1 PAR baked in. Halve x to get back to roughly
+// SNES-native proportions, then stretch y by 8/7 (NTSC PAR) so the
+// image displays at ~4:3 in a square-pixel viewer. Cheap nearest-
+// neighbour resample in both axes; good enough for screenshots since
+// the source is already pixel art.
+namespace {
+auto correctedFrame(const std::vector<uint32_t>& fb, u32 fbW, u32 fbH,
+                    u32& outW, u32& outH) -> std::vector<uint8_t> {
+  outW = fbW / 2;
+  outH = (u32)((u64)fbH * 8 / 7);
+  std::vector<uint8_t> rgb(size_t(outW) * outH * 3);
+  for(u32 y = 0; y < outH; y++) {
+    u32 sy = (u32)((u64)y * fbH / outH);
+    for(u32 x = 0; x < outW; x++) {
+      u32 sx = x * 2;
+      u32 px = fb[sy * fbW + sx];
+      uint8_t* dst = rgb.data() + (y * outW + x) * 3;
+      dst[0] = (uint8_t)((px >> 16) & 0xff);
+      dst[1] = (uint8_t)((px >>  8) & 0xff);
+      dst[2] = (uint8_t)((px >>  0) & 0xff);
+    }
+  }
+  return rgb;
+}
+}  // namespace
+
 auto Program::writePNG(const char* path) -> bool {
   if(!fbWidth || !fbHeight) return false;
-  std::vector<uint8_t> rgb(size_t(fbWidth) * fbHeight * 3);
-  for(u32 i = 0; i < fbWidth * fbHeight; i++) {
-    u32 px = fb[i];
-    rgb[i*3 + 0] = (uint8_t)((px >> 16) & 0xff);
-    rgb[i*3 + 1] = (uint8_t)((px >>  8) & 0xff);
-    rgb[i*3 + 2] = (uint8_t)((px >>  0) & 0xff);
-  }
-  return stbi_write_png(path, fbWidth, fbHeight, 3, rgb.data(), fbWidth * 3) != 0;
+  u32 outW, outH;
+  auto rgb = correctedFrame(fb, fbWidth, fbHeight, outW, outH);
+  return stbi_write_png(path, outW, outH, 3, rgb.data(), outW * 3) != 0;
 }
 
 auto Program::writePPM(const char* path) -> bool {
   if(!fbWidth || !fbHeight) return false;
   std::ofstream f(path, std::ios::binary);
   if(!f) return false;
-  f << "P6\n" << fbWidth << " " << fbHeight << "\n255\n";
-  for(u32 i = 0; i < fbWidth * fbHeight; i++) {
-    u32 px = fb[i];
-    uint8_t rgb[3] = {
-      (uint8_t)((px >> 16) & 0xff),
-      (uint8_t)((px >>  8) & 0xff),
-      (uint8_t)((px >>  0) & 0xff),
-    };
-    f.write((const char*)rgb, 3);
-  }
+  u32 outW, outH;
+  auto rgb = correctedFrame(fb, fbWidth, fbHeight, outW, outH);
+  f << "P6\n" << outW << " " << outH << "\n255\n";
+  f.write((const char*)rgb.data(), rgb.size());
   return f.good();
 }
 
