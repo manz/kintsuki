@@ -71,6 +71,15 @@ final class Emulator: ObservableObject {
     /// captures (otherwise we'd push the rewound state right back onto
     /// the buffer and never make progress).
     private var rewinding: Bool = false
+    /// NSEvent local monitor that consumes CMD+← while we have a ROM
+    /// loaded. AppKit's auto-repeat (controlled by the Keyboard
+    /// preference pane) keeps firing the event while the keys are held,
+    /// so a single monitor + per-event call to rewindOneFrame() is all
+    /// we need for "hold to scrub backwards" UX.
+    private var rewindKeyMonitor: Any?
+
+    /// Virtual key code for the left-arrow key on every Apple keyboard.
+    private let leftArrowKeyCode: UInt16 = 0x7B
 
     init() {
         // Set KINTSUKI_SYSTEM_PAK env var so the dylib finds boards.bml/ipl.rom
@@ -89,12 +98,35 @@ final class Emulator: ObservableObject {
         }
         handle = kintsuki_create()
         loadRecents()
+        installRewindKeyMonitor()
     }
 
     deinit {
+        if let mon = rewindKeyMonitor {
+            NSEvent.removeMonitor(mon)
+        }
         if let h = handle {
             kintsuki_destroy(h)
         }
+    }
+
+    /// Install a window-local NSEvent monitor that intercepts CMD+←
+    /// keyDowns (including auto-repeat events) and steps the rewind
+    /// buffer back one frame each time. Returning nil consumes the
+    /// event so it doesn't bubble up and trigger the menu shortcut a
+    /// second time.
+    private func installRewindKeyMonitor() {
+        rewindKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown)
+            { [weak self] event in
+                guard let self else { return event }
+                guard event.modifierFlags.contains(.command),
+                      event.keyCode == self.leftArrowKeyCode
+                else { return event }
+                // No ROM = nothing to rewind to; pass the event through.
+                guard self.loadedROM != nil else { return event }
+                self.rewindOneFrame()
+                return nil  // consume so the menu shortcut doesn't double-fire
+            }
     }
 
     // ----- ROM lifecycle ---------------------------------------------------
