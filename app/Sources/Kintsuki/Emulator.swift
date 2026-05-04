@@ -136,7 +136,10 @@ final class Emulator: ObservableObject {
                 else { return event }
                 // No ROM = nothing to rewind to; pass the event through.
                 guard self.loadedROM != nil else { return event }
-                self.rewindOneFrame()
+                // CMD+Shift+← steps back 1 second (60 frames at 60 fps);
+                // bare CMD+← steps back 1 frame.
+                let stride = event.modifierFlags.contains(.shift) ? 60 : 1
+                self.rewindBy(frames: stride)
                 return nil  // consume so the menu shortcut doesn't double-fire
             }
     }
@@ -298,7 +301,14 @@ final class Emulator: ObservableObject {
     /// CMD+← shortcut.
     @discardableResult
     func rewindOneFrame() -> Bool {
-        guard let h = handle else { return false }
+        return rewindBy(frames: 1)
+    }
+
+    /// Step the emulator back by `frames` retained frames. Used by the
+    /// CMD+← (1 frame) and CMD+Shift+← (1 second = 60 frames) shortcuts.
+    @discardableResult
+    func rewindBy(frames n: Int) -> Bool {
+        guard let h = handle, n >= 1 else { return false }
         // Mark the run loop as "user is scrubbing"; tick() will skip
         // forward emulation until the hold timeout fires.
         rewindHolding = true
@@ -313,17 +323,17 @@ final class Emulator: ObservableObject {
 
         rewinding = true
         defer { rewinding = false }
-        // Drain pending pushes so popLast sees them. Sync hop to the
-        // rewind queue costs ~µs when the queue is idle.
-        rewindQueue.sync { /* barrier */ }
-        // Pop the most-recent first (current frame), then the next-most-
-        // recent (previous frame) — that's the frame we actually want
-        // to land on. If only one frame was retained, popping it returns
-        // us to the single available point in time and the buffer is
-        // empty afterwards.
+        // Pop n+1 frames and load the last one popped: the first pop
+        // discards the current state (already live in the emulator),
+        // the next n step backward by n frames. If the buffer is
+        // shallower than that, we land on the oldest frame retained.
         let blob: Data? = rewindQueue.sync {
-            _ = rewindBuffer.popLast()
-            return rewindBuffer.popLast()
+            var lastPopped: Data?
+            for _ in 0..<(n + 1) {
+                guard let b = rewindBuffer.popLast() else { return lastPopped }
+                lastPopped = b
+            }
+            return lastPopped
         }
         guard let blob else {
             rewindFrames = rewindBuffer.count
@@ -334,7 +344,11 @@ final class Emulator: ObservableObject {
         }
         rewindFrames = rewindBuffer.count
         if ok != 0 {
-            // Re-snapshot framebuffer + CPU so SwiftUI redraws.
+            // The savestate restores PPU registers but not the live
+            // render output buffer. Advance one frame so the PPU
+            // re-paints the restored scene; otherwise the MTKView
+            // keeps showing whatever was last drawn before the rewind.
+            kintsuki_run_frames(h, 1)
             snapshotFramebuffer()
             snapshotCpuState()
             return true
