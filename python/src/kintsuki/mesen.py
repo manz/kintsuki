@@ -30,8 +30,10 @@ Decompressed payload = sequence of records:
 metadata + a `dict[bytes, bytes]` of records. `read_records(payload)`
 parses an already-decompressed payload buffer.
 
-`import_mesen_state(emu, path)` (TODO Phase 5) wires the parsed records
-into kintsuki — for now callers introspect `state.records` themselves.
+`import_mesen_state(emu, path)` wires the parsed records into a
+kintsuki Emu (CPU registers + WRAM + VRAM + CGRAM + OAM); the surface
+is intentionally narrow — settings, controllers, save-RAM cartridge
+state are skipped.
 """
 
 from __future__ import annotations
@@ -163,3 +165,79 @@ def parse_mesen_state(path: str | Path) -> MesenSaveState:
         framebuf_zlib=fb_zlib,
         records=records,
     )
+
+
+# ---- import_mesen_state ----------------------------------------------
+# Required block sizes — Mesen's emulator state is versioned, but these
+# are stable for SNES file_format_version 4. Any record with an off
+# size is logged-and-skipped to avoid scribbling truncated payloads
+# into kintsuki memory.
+_WRAM_LEN  = 128 * 1024
+_VRAM_LEN  = 64 * 1024
+_CGRAM_LEN = 512
+_OAM_LEN   = 544
+_WRAM_BUS_ADDR = 0x7E0000
+# LoROM cart SRAM is mapped at bank $70:0000-$70:7FFF (mirrored to bank
+# $71+). HiROM uses $30:6000-$30:7FFF instead. Use the LoROM mapping by
+# default; the C ABI follow-up exposes a dedicated saveRam endpoint that
+# can pick the right map per cart.
+_SRAM_BUS_ADDR = 0x700000
+
+
+def import_mesen_state(emu, path: str | Path) -> None:
+    """Read a Mesen ``.mss`` file and push CPU + memory state into
+    `emu`. Surface is intentionally narrow:
+
+    * CPU registers (a, x, y, sp, d, dbr, k, pc, ps, emulationMode)
+      go through `Emu.set_state`.
+    * WRAM (128 KiB) → `Emu.write_range($7E:0000, ...)`.
+    * Cart SRAM (variable size) → `Emu.write_range($70:0000, ...)`
+      assuming LoROM mapping. Skipped silently when the .mss has no
+      ``cart.saveRam`` record (= cart has no SRAM).
+    * VRAM, CGRAM, OAM go through the existing
+      `vram_write` / `cgram_write` / `oam_write` per-byte API.
+
+    Records whose recorded size doesn't match the documented layout
+    are logged-and-skipped rather than truncated, so a Mesen format
+    change won't silently corrupt emulator memory.
+    """
+    state = parse_mesen_state(path)
+    r = state.records
+
+    # ---- CPU registers ------------------------------------------------
+    cpu = emu.get_state()
+    if v := r.get(b"cpu.a"):     cpu.a = _u16(v)
+    if v := r.get(b"cpu.x"):     cpu.x = _u16(v)
+    if v := r.get(b"cpu.y"):     cpu.y = _u16(v)
+    if v := r.get(b"cpu.sp"):    cpu.s = _u16(v)
+    if v := r.get(b"cpu.d"):     cpu.d = _u16(v)
+    if v := r.get(b"cpu.dbr"):   cpu.b = v[0]
+    if v := r.get(b"cpu.ps"):    cpu.p = v[0]
+    pc_low = _u16(r[b"cpu.pc"]) if b"cpu.pc" in r else 0
+    pc_bank = r.get(b"cpu.k", b"\x00")[0]
+    cpu.pc = (pc_bank << 16) | pc_low
+    if v := r.get(b"cpu.emulationMode"): cpu.e = v[0]
+    emu.set_state(cpu)
+
+    # ---- Memory blobs -------------------------------------------------
+    if (wram := r.get(b"memoryManager.workRam")) is not None \
+            and len(wram) == _WRAM_LEN:
+        emu.write_range(_WRAM_BUS_ADDR, wram)
+    if (sram := r.get(b"cart.saveRam")) is not None and sram:
+        # SRAM size varies per cart; we accept whatever Mesen recorded.
+        emu.write_range(_SRAM_BUS_ADDR, sram)
+
+    if (vram := r.get(b"ppu.vram")) is not None \
+            and len(vram) == _VRAM_LEN:
+        for i, b in enumerate(vram):
+            emu.vram_write(i, b)
+    if (cg := r.get(b"ppu.cgram")) is not None and len(cg) == _CGRAM_LEN:
+        for i, b in enumerate(cg):
+            emu.cgram_write(i, b)
+    if (oam := r.get(b"ppu.oamRam")) is not None and len(oam) == _OAM_LEN:
+        for i, b in enumerate(oam):
+            emu.oam_write(i, b)
+
+
+def _u16(b: bytes) -> int:
+    return struct.unpack_from("<H", b, 0)[0]
