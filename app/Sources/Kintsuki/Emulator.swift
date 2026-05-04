@@ -80,6 +80,11 @@ final class Emulator: ObservableObject {
 
     /// Virtual key code for the left-arrow key on every Apple keyboard.
     private let leftArrowKeyCode: UInt16 = 0x7B
+    /// Serial queue for rewind buffer ops — XOR + LZ4 compress costs
+    /// 1-2 ms per frame which we don't want on the run-loop thread.
+    /// Single concurrent worker preserves push order.
+    private let rewindQueue = DispatchQueue(label: "net.ringum.kintsuki.rewind",
+                                            qos: .userInitiated)
 
     init() {
         // Set KINTSUKI_SYSTEM_PAK env var so the dylib finds boards.bml/ipl.rom
@@ -251,6 +256,11 @@ final class Emulator: ObservableObject {
     /// Push the post-tick state into the rewind buffer. Skipped during
     /// an active rewind (otherwise the buffer would re-record the
     /// rewound state and we'd never make progress backwards).
+    ///
+    /// Hot path optimisation: the C save_state copy stays on main (it's
+    /// the cheap part), but the XOR + LZ4 compression that follows is
+    /// dispatched to a serial background queue so the run loop doesn't
+    /// pay it. push order is preserved by the queue's serial nature.
     private func captureRewindFrame() {
         guard !rewinding, let h = handle else { return }
         let needed = kintsuki_save_state(h, nil, 0)
@@ -261,8 +271,14 @@ final class Emulator: ObservableObject {
         }
         guard written > 0 else { return }
         blob.count = Int(written)
-        rewindBuffer.push(blob)
-        if rewindFrames != rewindBuffer.count { rewindFrames = rewindBuffer.count }
+        rewindQueue.async { [weak self, blob] in
+            guard let self else { return }
+            self.rewindBuffer.push(blob)
+            let n = self.rewindBuffer.count
+            DispatchQueue.main.async {
+                if self.rewindFrames != n { self.rewindFrames = n }
+            }
+        }
     }
 
     /// Pop the most-recent retained frame and load it. Returns true if
@@ -273,13 +289,19 @@ final class Emulator: ObservableObject {
         guard let h = handle else { return false }
         rewinding = true
         defer { rewinding = false }
+        // Drain pending pushes so popLast sees them. Sync hop to the
+        // rewind queue costs ~µs when the queue is idle.
+        rewindQueue.sync { /* barrier */ }
         // Pop the most-recent first (current frame), then the next-most-
         // recent (previous frame) — that's the frame we actually want
         // to land on. If only one frame was retained, popping it returns
         // us to the single available point in time and the buffer is
         // empty afterwards.
-        _ = rewindBuffer.popLast()
-        guard let blob = rewindBuffer.popLast() else {
+        let blob: Data? = rewindQueue.sync {
+            _ = rewindBuffer.popLast()
+            return rewindBuffer.popLast()
+        }
+        guard let blob else {
             rewindFrames = rewindBuffer.count
             return false
         }
@@ -298,7 +320,7 @@ final class Emulator: ObservableObject {
 
     /// Drop every retained rewind frame (e.g., on ROM unload).
     func clearRewindBuffer() {
-        rewindBuffer.clear()
+        rewindQueue.sync { rewindBuffer.clear() }
         rewindFrames = 0
     }
 
