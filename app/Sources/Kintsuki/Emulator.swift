@@ -630,6 +630,21 @@ final class Emulator: ObservableObject {
         loadROM(url)
     }
 
+    /// Write the current PPU framebuffer to `url` as a PNG (or PPM if
+    /// the path ends in `.ppm`). Delegates to libkintsuki, which holds
+    /// the live RGBA pixels - taking the snapshot from `framebuffer`
+    /// here would race with the run loop.
+    func saveScreenshot(url: URL) -> Bool {
+        guard let h = handle else { return false }
+        let ok = url.path.withCString { kintsuki_screenshot(h, $0) }
+        if ok != 0 {
+            NSLog("kintsuki: wrote screenshot to \(url.path)")
+            return true
+        }
+        NSLog("kintsuki: screenshot failed for \(url.path)")
+        return false
+    }
+
     /// Export the current emulator state to `url` as a kintsuki blob.
     func exportStateToFile(url: URL) -> Bool {
         guard let h = handle else { return false }

@@ -56,6 +56,10 @@ struct KintsukiApp: App {
                     .keyboardShortcut(.leftArrow, modifiers: [.command, .shift])
                     .disabled(emulator.rewindFrames < 2)
                 Divider()
+                Button("Save Screenshot…") { saveScreenshotViaPanel() }
+                    .keyboardShortcut("p", modifiers: [.command, .shift])
+                    .disabled(emulator.loadedROM == nil)
+                Divider()
                 Button(emulator.inspectorOpen ? "Hide Inspector" : "Show Inspector") {
                     emulator.inspectorOpen.toggle()
                 }
@@ -97,6 +101,19 @@ struct KintsukiApp: App {
                 alert.informativeText = "Could not inject \(url.lastPathComponent) into cart SRAM."
                 alert.runModal()
             }
+        }
+    }
+
+    private func saveScreenshotViaPanel() {
+        let panel = NSSavePanel()
+        panel.message = "Save screenshot"
+        panel.prompt = "Save"
+        let stem = emulator.loadedROM?.deletingPathExtension().lastPathComponent ?? "screenshot"
+        let f = DateFormatter()
+        f.dateFormat = "yyyyMMdd-HHmmss"
+        panel.nameFieldStringValue = "\(stem)-\(f.string(from: .now)).png"
+        if panel.runModal() == .OK, let url = panel.url {
+            _ = emulator.saveScreenshot(url: url)
         }
     }
 
