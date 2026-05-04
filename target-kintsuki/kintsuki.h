@@ -140,6 +140,15 @@ int         kintsuki_add_callback(kintsuki_t*, int kind, uint32_t lo, uint32_t h
                                   kintsuki_cb_t fn, void* userdata);
 void        kintsuki_remove_callback(kintsuki_t*, int kind, int id);
 
+// Mesen 2 .mss import. Reads the file at `path`, decompresses the
+// serialized state payload, walks the records, and pushes CPU
+// registers + WRAM/SRAM/VRAM/CGRAM/OAM into the emulator. Returns
+// 1 on success, 0 on any I/O / parse failure (failures log to
+// stderr so the caller can inspect them). Validated against
+// file_format_version=4, Mesen 2.1.x. Surface intentionally narrow:
+// settings, controllers, dummy DMA channels are skipped.
+int         kintsuki_import_mesen_state(kintsuki_t*, const char* path);
+
 // Formatted execution tracer. Wraps an exec callback that disassembles
 // the instruction at PC + dumps CPU registers, producing one Mesen-
 // style line per exec event in [lo,hi]. Single tracer per emulator —
