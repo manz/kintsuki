@@ -209,9 +209,10 @@ _bind("kintsuki_tracer_start", None,
 _bind("kintsuki_tracer_stop", None, [HANDLE])
 _bind("kintsuki_tracer_drain", c_uint32, [HANDLE, c_char_p, c_uint32])
 
-# Mesen .mss import (single source of truth in C; the Python helper in
-# kintsuki.mesen.import_mesen_state stays for tests / introspection).
-_bind("kintsuki_import_mesen_state", c_int, [HANDLE, c_char_p])
+# Reset + SRAM injection
+_bind("kintsuki_reset", None, [HANDLE])
+_bind("kintsuki_inject_sram", c_uint32, [HANDLE, POINTER(c_uint8), c_uint32])
+_bind("kintsuki_set_srm_sidecar", None, [HANDLE, c_int])
 
 # Savestate
 _bind("kintsuki_save_state", c_uint32, [HANDLE, c_void_p, c_uint32])

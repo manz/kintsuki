@@ -221,12 +221,20 @@ class _Registered:
 class Emu:
     """High-level wrapper. Single-instance for now (bsnes core uses globals)."""
 
-    def __init__(self) -> None:
+    # Process-wide default for the .srm-sidecar auto-seed at load_rom
+    # time. Emu(load_srm_sidecar=...) overrides per instance; tests flip
+    # this class attribute in conftest so a stray fixture .srm doesn't
+    # leak into the deterministic SRAM the harness expects.
+    default_load_srm_sidecar: bool = True
+
+    def __init__(self, *, load_srm_sidecar: bool | None = None) -> None:
         h = _native.lib.kintsuki_create()
         if not h:
             raise RuntimeError("kintsuki_create failed")
         self._handle = h
         self._registered: list[_Registered] = []
+        on = Emu.default_load_srm_sidecar if load_srm_sidecar is None else load_srm_sidecar
+        _native.lib.kintsuki_set_srm_sidecar(self._handle, 1 if on else 0)
 
     # ------------------------------------------------------------------ ROM
     def load_rom(self, path: str) -> None:
@@ -329,15 +337,20 @@ class Emu:
         return _TracerSession(self, lo, hi,
                               ring_capacity=ring_capacity, path=path)
 
-    # ------------------------------------------------------------- Mesen import
-    def import_mesen_state(self, path: str) -> bool:
-        """Read a Mesen 2 ``.mss`` and push its CPU + WRAM/SRAM/VRAM/CGRAM/OAM
-        into this emulator. Returns False on missing-file / parse / inflate
-        failure (rather than raising) so Swift hosts can show a friendly
-        error without exception unwinding through the C ABI."""
-        c_path = path.encode("utf-8")
-        ok = _native.lib.kintsuki_import_mesen_state(self._handle, c_path)
-        return ok != 0
+    # ------------------------------------------------------------- Reset / SRAM
+    def reset(self) -> None:
+        """Soft reset (power-cycle) the emulator without re-reading the ROM
+        from disk. Preserves cart SRAM."""
+        _native.lib.kintsuki_reset(self._handle)
+
+    def inject_sram(self, data: bytes) -> int:
+        """Copy `data` into the cart's in-memory SRAM. The original `.srm`
+        file (if any) is never touched. Returns bytes copied (clamped to
+        cart SRAM size)."""
+        if not data:
+            return 0
+        buf = (ctypes.c_uint8 * len(data))(*data)
+        return _native.lib.kintsuki_inject_sram(self._handle, buf, len(data))
 
     def set_state(self, s: CpuState) -> None:
         _native.lib.kintsuki_set_state(self._handle, ctypes.byref(s))

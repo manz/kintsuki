@@ -39,3 +39,4 @@ xcuserdata/
 .vscode/
 .DS_Store
 Thumbs.db
+python/src/kintsuki/_lib/System/

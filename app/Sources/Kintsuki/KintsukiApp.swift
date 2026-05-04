@@ -32,10 +32,17 @@ struct KintsukiApp: App {
                     }
                 }
                 .disabled(emulator.recentROMs.isEmpty)
+                Divider()
+                Button("Load Save File (.srm)…") { loadSRMViaPanel() }
+                    .disabled(emulator.loadedROM == nil)
             }
             CommandGroup(after: .toolbar) {
                 Button("Reset") { emulator.reset() }
                     .keyboardShortcut("r", modifiers: .command)
+                    .disabled(emulator.loadedROM == nil)
+                Button("Reload ROM From Disk") { emulator.reloadROMFromDisk() }
+                    .keyboardShortcut("r", modifiers: [.command, .shift])
+                    .disabled(emulator.loadedROM == nil)
                 Button(emulator.running ? "Pause" : "Resume") {
                     emulator.togglePause()
                 }
@@ -65,6 +72,60 @@ struct KintsukiApp: App {
                 Button("Manage Save States…") { showStateBrowser = true }
                     .keyboardShortcut("s", modifiers: [.command, .shift])
                     .disabled(emulator.loadedROM == nil)
+                Divider()
+                Button("Export State to File…") { exportStateViaPanel() }
+                    .disabled(emulator.loadedROM == nil)
+                Button("Import State from File…") { importStateViaPanel() }
+                    .disabled(emulator.loadedROM == nil)
+            }
+        }
+    }
+
+    private func loadSRMViaPanel() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.message = "Select a cart save (.srm)"
+        panel.prompt = "Inject"
+        if panel.runModal() == .OK, let url = panel.url {
+            let ok = emulator.loadSRM(url: url)
+            if !ok {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "SRM load failed"
+                alert.informativeText = "Could not inject \(url.lastPathComponent) into cart SRAM."
+                alert.runModal()
+            }
+        }
+    }
+
+    private func exportStateViaPanel() {
+        let panel = NSSavePanel()
+        panel.message = "Save kintsuki state"
+        panel.prompt = "Save"
+        let stem = emulator.loadedROM?.deletingPathExtension().lastPathComponent ?? "state"
+        panel.nameFieldStringValue = "\(stem).kss"
+        if panel.runModal() == .OK, let url = panel.url {
+            _ = emulator.exportStateToFile(url: url)
+        }
+    }
+
+    private func importStateViaPanel() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.message = "Select a kintsuki state file"
+        panel.prompt = "Load"
+        if panel.runModal() == .OK, let url = panel.url {
+            let ok = emulator.importStateFromFile(url: url)
+            if !ok {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "State load failed"
+                alert.informativeText = "Could not load \(url.lastPathComponent) - blob mismatch or corrupt file."
+                alert.runModal()
             }
         }
     }

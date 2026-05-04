@@ -80,6 +80,11 @@ final class Emulator: ObservableObject {
 
     /// Virtual key code for the left-arrow key on every Apple keyboard.
     private let leftArrowKeyCode: UInt16 = 0x7B
+    /// Virtual key code for ESC. Used as a single-tap pause toggle so
+    /// the user can freeze the emulator mid-frame to capture a clean
+    /// savestate without fighting menu shortcuts.
+    private let escKeyCode: UInt16 = 0x35
+    private var pauseKeyMonitor: Any?
     /// Serial queue for rewind buffer ops — XOR + LZ4 compress costs
     /// 1-2 ms per frame which we don't want on the run-loop thread.
     /// Single concurrent worker preserves push order.
@@ -111,10 +116,22 @@ final class Emulator: ObservableObject {
         handle = kintsuki_create()
         loadRecents()
         installRewindKeyMonitor()
+        installPauseKeyMonitor()
+        // Auto-reload the most recent ROM so a fresh app launch lands
+        // straight back in the previous session's game. NSOpenPanel
+        // only fires when the user explicitly wants a different ROM.
+        if let last = recentROMs.first {
+            DispatchQueue.main.async { [weak self] in
+                self?.loadROM(last)
+            }
+        }
     }
 
     deinit {
         if let mon = rewindKeyMonitor {
+            NSEvent.removeMonitor(mon)
+        }
+        if let mon = pauseKeyMonitor {
             NSEvent.removeMonitor(mon)
         }
         if let h = handle {
@@ -127,6 +144,20 @@ final class Emulator: ObservableObject {
     /// buffer back one frame each time. Returning nil consumes the
     /// event so it doesn't bubble up and trigger the menu shortcut a
     /// second time.
+    private func installPauseKeyMonitor() {
+        pauseKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown)
+            { [weak self] event in
+                guard let self else { return event }
+                guard event.keyCode == self.escKeyCode,
+                      !event.isARepeat,
+                      event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty
+                else { return event }
+                guard self.loadedROM != nil else { return event }
+                self.togglePause()
+                return nil
+            }
+    }
+
     private func installRewindKeyMonitor() {
         rewindKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown)
             { [weak self] event in
@@ -206,10 +237,19 @@ final class Emulator: ObservableObject {
         NSDocumentController.shared.noteNewRecentDocumentURL(url)
     }
 
+    /// Soft reset: power-cycle the emulator without re-reading the ROM
+    /// from disk. Cart SRAM survives. Use `reloadROMFromDisk()` for the
+    /// full re-read + IPS reapply flow.
     func reset() {
-        guard let url = loadedROM else { return }
-        stopRunLoop()
-        loadROM(url)
+        guard let h = handle, loadedROM != nil else { return }
+        kintsuki_reset(h)
+        clearRewindBuffer()
+        snapshotFramebuffer()
+        snapshotCpuState()
+        if !running {
+            running = true
+            startRunLoop()
+        }
     }
 
     // ----- Run loop --------------------------------------------------------
@@ -553,25 +593,83 @@ final class Emulator: ObservableObject {
         if ok != 0 { NSLog("kintsuki: loaded state \"\(entry.name)\"") }
     }
 
-    /// Pull a Mesen 2 .mss into the running emulator via the C ABI.
-    /// Returns false on missing-file / parse / inflate failure so the
-    /// caller can surface a friendly NSAlert rather than crashing.
-    /// After a successful import, run one frame so the PPU repaints
-    /// the restored scene (savestate restores registers, not the live
-    /// framebuffer the MTKView reads).
-    func importMesenState(url: URL) -> Bool {
+    /// Read a `.srm` file and push it into the cart's in-memory SRAM.
+    /// The file on disk is never touched: emulator writes stay in RAM
+    /// and don't propagate back. Resets the emulator after injection so
+    /// the game boots with the new save data visible. Returns false on
+    /// I/O failure or if no cart SRAM region exists.
+    func loadSRM(url: URL) -> Bool {
         guard let h = handle else { return false }
-        let ok = url.path.withCString { kintsuki_import_mesen_state(h, $0) }
-        if ok != 0 {
-            kintsuki_run_frames(h, 1)
-            snapshotFramebuffer()
-            snapshotCpuState()
-            clearRewindBuffer()
-            NSLog("kintsuki: imported Mesen state from \(url.path)")
-            return true
+        guard let data = try? Data(contentsOf: url), !data.isEmpty else {
+            NSLog("kintsuki: loadSRM read failed: \(url.path)")
+            return false
         }
-        NSLog("kintsuki: failed to import Mesen state from \(url.path)")
-        return false
+        let copied: UInt32 = data.withUnsafeBytes { raw -> UInt32 in
+            guard let base = raw.bindMemory(to: UInt8.self).baseAddress else { return 0 }
+            return kintsuki_inject_sram(h, base, UInt32(data.count))
+        }
+        guard copied > 0 else {
+            NSLog("kintsuki: loadSRM cart has no SRAM (or 0 copied)")
+            return false
+        }
+        kintsuki_reset(h)
+        snapshotFramebuffer()
+        snapshotCpuState()
+        clearRewindBuffer()
+        NSLog("kintsuki: injected \(copied) bytes from \(url.lastPathComponent), reset emu")
+        return true
+    }
+
+    /// Re-read the current ROM file from disk (re-applies any IPS
+    /// sidecar) and reboot. Different from `reset()` only insofar as
+    /// `kintsuki_load_rom` re-parses the cart manifest from the file -
+    /// useful when the patched ROM on disk has been rebuilt.
+    func reloadROMFromDisk() {
+        guard let url = loadedROM else { return }
+        stopRunLoop()
+        loadROM(url)
+    }
+
+    /// Export the current emulator state to `url` as a kintsuki blob.
+    func exportStateToFile(url: URL) -> Bool {
+        guard let h = handle else { return false }
+        let needed = kintsuki_save_state(h, nil, 0)
+        guard needed > 0 else { return false }
+        var blob = Data(count: Int(needed))
+        let wrote = blob.withUnsafeMutableBytes { raw -> UInt32 in
+            kintsuki_save_state(h, raw.baseAddress, needed)
+        }
+        guard wrote == needed else { return false }
+        do {
+            try blob.write(to: url, options: .atomic)
+            NSLog("kintsuki: exported state to \(url.path) (\(wrote) bytes)")
+            return true
+        } catch {
+            NSLog("kintsuki: exportState write failed: \(error)")
+            return false
+        }
+    }
+
+    /// Load an emulator state blob from `url`.
+    func importStateFromFile(url: URL) -> Bool {
+        guard let h = handle else { return false }
+        guard let blob = try? Data(contentsOf: url), !blob.isEmpty else {
+            NSLog("kintsuki: importState read failed: \(url.path)")
+            return false
+        }
+        let ok = blob.withUnsafeBytes { raw -> Int32 in
+            kintsuki_load_state(h, raw.baseAddress, UInt32(blob.count))
+        }
+        guard ok != 0 else {
+            NSLog("kintsuki: importState rejected blob from \(url.path)")
+            return false
+        }
+        kintsuki_run_frames(h, 1)
+        snapshotFramebuffer()
+        snapshotCpuState()
+        clearRewindBuffer()
+        NSLog("kintsuki: imported state from \(url.path)")
+        return true
     }
 
     func renameState(_ entry: SaveStateEntry, to name: String) {
@@ -582,8 +680,15 @@ final class Emulator: ObservableObject {
 
     func deleteState(_ entry: SaveStateEntry) {
         guard let ctx = modelContext else { return }
-        ctx.delete(entry)
-        do { try ctx.save() } catch { NSLog("kintsuki: delete failed: \(error)") }
+        // Defer to next runloop tick so the SwiftUI cell that triggered
+        // this delete can drop its `let entry` reference before SwiftData
+        // detaches the backing store. Otherwise the immediate ctx.save()
+        // can land while the cell is still in the view tree, and its
+        // next render reads thumbnailPNG off a detached PersistentModel.
+        DispatchQueue.main.async {
+            ctx.delete(entry)
+            do { try ctx.save() } catch { NSLog("kintsuki: delete failed: \(error)") }
+        }
     }
 
     private func defaultStateName() -> String {

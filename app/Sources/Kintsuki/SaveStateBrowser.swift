@@ -31,8 +31,6 @@ struct SaveStateBrowserView: View {
                 }
                 .keyboardShortcut("n", modifiers: .command)
                 .disabled(emulator.loadedROM == nil)
-                Button("Import Mesen…") { importMesenState() }
-                    .disabled(emulator.loadedROM == nil)
                 Button("Done") { dismiss() }
                     .keyboardShortcut(.defaultAction)
             }
@@ -57,32 +55,6 @@ struct SaveStateBrowserView: View {
             }
         }
         .frame(minWidth: 540, minHeight: 380)
-    }
-
-    /// Pop an NSOpenPanel scoped to .mss files, then call the C ABI
-    /// importer. Surfaces success/failure as a non-modal NSAlert so
-    /// the user knows whether the state actually loaded.
-    private func importMesenState() {
-        let panel = NSOpenPanel()
-        panel.allowsMultipleSelection = false
-        panel.canChooseDirectories = false
-        panel.canChooseFiles = true
-        panel.message = "Select a Mesen 2 savestate (.mss)"
-        panel.prompt = "Import"
-        if panel.runModal() == .OK, let url = panel.url {
-            let ok = emulator.importMesenState(url: url)
-            let alert = NSAlert()
-            if ok {
-                alert.messageText = "Imported \(url.lastPathComponent)"
-                alert.informativeText = "Emulator state loaded from the Mesen savestate."
-            } else {
-                alert.alertStyle = .warning
-                alert.messageText = "Import failed"
-                alert.informativeText = "Could not parse \(url.lastPathComponent) as a Mesen 2 .mss file."
-            }
-            alert.runModal()
-            if ok { dismiss() }
-        }
     }
 
     private var emptyState: some View {
@@ -167,7 +139,14 @@ private struct SaveStateCard: View {
 
     @ViewBuilder
     private var thumbnail: some View {
-        if let img = NSImage(data: entry.thumbnailPNG) {
+        // Guard against the brief window between ctx.delete() and SwiftUI
+        // tearing down this card: the @Query result still includes the
+        // entry but its modelContext is gone, so reading the
+        // .externalStorage thumbnailPNG attribute traps with a "detached
+        // backing data" fatal error. Treat detached/deleted entries as
+        // having no thumbnail.
+        if entry.modelContext != nil, !entry.isDeleted,
+           let img = NSImage(data: entry.thumbnailPNG) {
             Image(nsImage: img)
                 .resizable()
                 .interpolation(.none)
