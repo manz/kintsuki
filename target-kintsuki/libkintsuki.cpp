@@ -5,6 +5,7 @@
 // may exist at a time.
 
 #include "program.hpp"
+#include "kintsuki.h"
 
 #include <cstdint>
 #include <cstdio>
@@ -98,14 +99,7 @@ uint32_t kintsuki_oam_dump(kintsuki_t* h, uint8_t* out, uint32_t len) {
   return n;
 }
 
-struct kintsuki_cpu_state_t {
-  uint16_t a, x, y, s, d;
-  uint8_t  b, p;
-  uint32_t pc;
-  uint8_t  e;
-  uint8_t  stp;
-  uint8_t  wai;
-};
+// Struct definitions live in kintsuki.h (typedef'd via the C ABI header).
 
 void kintsuki_get_state(kintsuki_t* h, kintsuki_cpu_state_t* out) {
   if(!h || !out) return;
@@ -133,40 +127,7 @@ void kintsuki_set_state(kintsuki_t* h, const kintsuki_cpu_state_t* in) {
   h->program->setCpuState(s);
 }
 
-// PPU/DMA state snapshot. Reads ares globals directly to expose registers
-// that are write-only on the CPU bus. Performance PPU implementation is
-// active (Program::Program calls setAccurate(false)).
-struct kintsuki_dma_channel_t {
-  uint8_t  ctrl;
-  uint8_t  dest;
-  uint16_t src_addr;
-  uint8_t  src_bank;
-  uint16_t ind_count;
-  uint8_t  ind_bank;
-  uint8_t  line_count;
-  uint8_t  enabled;
-};
-
-struct kintsuki_ppu_state_t {
-  uint8_t  inidisp;
-  uint8_t  bgmode;
-  uint8_t  mosaic;
-  uint8_t  bg1sc, bg2sc, bg3sc, bg4sc;
-  uint8_t  bg12nba, bg34nba;
-  uint16_t bg1hofs, bg1vofs, bg2hofs, bg2vofs;
-  uint16_t bg3hofs, bg3vofs, bg4hofs, bg4vofs;
-  uint8_t  vmain;
-  uint16_t vmaddr;
-  uint8_t  m7sel;
-  uint16_t m7a, m7b, m7c, m7d, m7x, m7y;
-  uint8_t  cgadd;
-  uint8_t  tm, ts, tmw, tsw;
-  uint8_t  cgwsel, cgadsub;
-  uint8_t  setini;
-  uint16_t hcounter, vcounter;
-  kintsuki_dma_channel_t dma[8];
-  uint8_t  mdmaen, hdmaen;
-};
+// PPU/DMA state snapshot — types declared in kintsuki.h.
 
 void kintsuki_get_ppu_state(kintsuki_t* h, kintsuki_ppu_state_t* out) {
   if(!h || !out) return;
@@ -388,7 +349,13 @@ auto cFire(std::vector<CCallback>& list, uint32_t addr, uint8_t value) -> void {
   }
 }
 
+// Forward to the tracer hook (defined further down) if PC falls in its
+// configured range. Inlined into cOnExec so a single execHook supports
+// both user callbacks and the tracer.
+void tracerOnExec(uint32_t pc);
+
 void cOnExec(uint32_t pc) {
+  tracerOnExec(pc);
   if(g_cExecPages[(pc & 0xffffff) >> 8] == 0) return;
   cFire(g_cExec, pc, 0);
 }
@@ -451,6 +418,118 @@ void kintsuki_remove_callback(kintsuki_t* h, int kind, int id) {
     if(kind == CB_READ)  ares::SuperFamicom::memReadHook = nullptr;
     if(kind == CB_WRITE) ares::SuperFamicom::memWriteHook = nullptr;
   }
+}
+
+// ---- Formatted execution tracer ------------------------------------------
+// Single tracer per emulator instance. Hooked from cOnExec via tracerOnExec.
+namespace {
+struct Tracer {
+  bool      active = false;
+  uint32_t  lo = 0, hi = 0;
+  bool      file_mode = false;
+  FILE*     fp = nullptr;
+  // Ring buffer (RING mode): bounded byte buffer, oldest evicted on append.
+  std::vector<char> ring;
+  uint32_t  ring_cap = 0;
+  uint32_t  ring_head = 0;  // next write position
+  uint32_t  ring_size = 0;  // bytes currently in the ring
+};
+Tracer g_tracer;
+
+auto tracerAppendBytes(const char* s, uint32_t n) -> void {
+  if(g_tracer.file_mode) {
+    if(g_tracer.fp) std::fwrite(s, 1, n, g_tracer.fp);
+    return;
+  }
+  if(g_tracer.ring_cap == 0) return;
+  // If the new chunk alone exceeds capacity, only keep the trailing tail.
+  if(n >= g_tracer.ring_cap) {
+    s += (n - g_tracer.ring_cap);
+    n  = g_tracer.ring_cap;
+    g_tracer.ring_size = 0;
+    g_tracer.ring_head = 0;
+  }
+  // Free space we'd lose by writing n more bytes.
+  if(g_tracer.ring_size + n > g_tracer.ring_cap) {
+    uint32_t overflow = (g_tracer.ring_size + n) - g_tracer.ring_cap;
+    g_tracer.ring_size -= overflow;
+    // Note: head/size sliding works because we never read from the
+    // dropped region; drain copies via mod arithmetic.
+  }
+  for(uint32_t i = 0; i < n; i++) {
+    g_tracer.ring[g_tracer.ring_head] = s[i];
+    g_tracer.ring_head = (g_tracer.ring_head + 1) % g_tracer.ring_cap;
+    if(g_tracer.ring_size < g_tracer.ring_cap) g_tracer.ring_size++;
+  }
+}
+}  // namespace
+
+void tracerOnExec(uint32_t pc) {
+  if(!g_tracer.active) return;
+  if(pc < g_tracer.lo || pc > g_tracer.hi) return;
+
+  // ares::WDC65816 helpers: disassembleInstruction() returns the formatted
+  // operand line for the current PC (already padded). disassembleContext()
+  // returns the register dump (A:.. X:.. Y:.. ...). Combine on one line
+  // separated by ';' so each entry is greppable.
+  auto& cpu = ares::SuperFamicom::cpu;
+  nall::string ins = cpu.disassembleInstruction();
+  nall::string ctx = cpu.disassembleContext({});
+  nall::string line = nall::string(ins, "  ; ", ctx, "\n");
+  tracerAppendBytes((const char*)line.data(), (uint32_t)line.size());
+}
+
+void kintsuki_tracer_start(kintsuki_t* h, uint32_t lo, uint32_t hi,
+                           kintsuki_trace_mode_t mode, const char* path,
+                           uint32_t ring_capacity) {
+  if(!h) return;
+  // Stop any prior tracer first to keep a clean single-tracer model.
+  kintsuki_tracer_stop(h);
+
+  g_tracer.lo = lo;
+  g_tracer.hi = hi;
+  g_tracer.file_mode = (mode == KINTSUKI_TRACE_FILE);
+  if(g_tracer.file_mode) {
+    g_tracer.fp = path ? std::fopen(path, "wb") : nullptr;
+    g_tracer.ring.clear();
+    g_tracer.ring_cap = 0;
+  } else {
+    if(ring_capacity == 0) ring_capacity = 4096;
+    g_tracer.ring.assign(ring_capacity, 0);
+    g_tracer.ring_cap  = ring_capacity;
+    g_tracer.ring_head = 0;
+    g_tracer.ring_size = 0;
+    g_tracer.fp = nullptr;
+  }
+  g_tracer.active = true;
+  // Make sure the global execHook is wired (cOnExec dispatches to us).
+  if(!ares::SuperFamicom::execHook) ares::SuperFamicom::execHook = &cOnExec;
+}
+
+void kintsuki_tracer_stop(kintsuki_t* h) {
+  (void)h;
+  if(g_tracer.fp) { std::fclose(g_tracer.fp); g_tracer.fp = nullptr; }
+  g_tracer.active = false;
+  g_tracer.ring.clear();
+  g_tracer.ring_cap  = 0;
+  g_tracer.ring_head = 0;
+  g_tracer.ring_size = 0;
+}
+
+uint32_t kintsuki_tracer_drain(kintsuki_t* h, char* out, uint32_t cap) {
+  (void)h;
+  if(g_tracer.file_mode) return 0;
+  if(!out || cap == 0)   return g_tracer.ring_size;
+  uint32_t n = g_tracer.ring_size < cap ? g_tracer.ring_size : cap;
+  // Oldest byte sits `ring_size` slots behind head (mod cap).
+  uint32_t start = (g_tracer.ring_head + g_tracer.ring_cap - g_tracer.ring_size)
+                   % g_tracer.ring_cap;
+  for(uint32_t i = 0; i < n; i++) {
+    out[i] = g_tracer.ring[(start + i) % g_tracer.ring_cap];
+  }
+  g_tracer.ring_head = 0;
+  g_tracer.ring_size = 0;
+  return n;
 }
 
 // Best-effort single-instruction step: arms execHook for one fire and

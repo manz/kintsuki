@@ -140,6 +140,27 @@ int         kintsuki_add_callback(kintsuki_t*, int kind, uint32_t lo, uint32_t h
                                   kintsuki_cb_t fn, void* userdata);
 void        kintsuki_remove_callback(kintsuki_t*, int kind, int id);
 
+// Formatted execution tracer. Wraps an exec callback that disassembles
+// the instruction at PC + dumps CPU registers, producing one Mesen-
+// style line per exec event in [lo,hi]. Single tracer per emulator —
+// `tracer_start` stops the previous one. Modes:
+//   RING: in-memory bounded ring; oldest bytes evicted when full so
+//         drain returns at most `ring_capacity` bytes.
+//   FILE: lines appended to `path` (truncated on start). `drain` is 0.
+typedef enum {
+  KINTSUKI_TRACE_RING = 0,
+  KINTSUKI_TRACE_FILE = 1,
+} kintsuki_trace_mode_t;
+
+void        kintsuki_tracer_start(kintsuki_t*, uint32_t lo, uint32_t hi,
+                                  kintsuki_trace_mode_t mode,
+                                  const char* path,
+                                  uint32_t ring_capacity);
+void        kintsuki_tracer_stop(kintsuki_t*);
+// Copy ring contents to `out` (max `cap` bytes), return bytes written.
+// Drain clears the ring. In FILE mode returns 0.
+uint32_t    kintsuki_tracer_drain(kintsuki_t*, char* out, uint32_t cap);
+
 #ifdef __cplusplus
 }
 #endif
