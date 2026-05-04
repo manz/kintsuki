@@ -58,6 +58,41 @@ final class Emulator: ObservableObject {
     private var lastFpsTime: Date = .now
     private var framesSinceFpsTick: Int = 0
 
+    // ----- Rewind ---------------------------------------------------------
+    /// Per-frame delta-compressed savestate ring. Capped at ~60s of
+    /// frames @ 60 fps (3600). The buffer stores XOR-compressed deltas
+    /// against periodic keyframes so the worst-case footprint is bounded
+    /// at ~50 MB rather than 60s × 60fps × full state.
+    private let rewindBuffer = RewindBuffer(capacity: 3600,
+                                            keyframeInterval: 60)
+    /// Frames currently retained in the rewind buffer (for the status pill).
+    @Published private(set) var rewindFrames: Int = 0
+    /// Set true while a rewind is in progress so the run loop pauses
+    /// captures (otherwise we'd push the rewound state right back onto
+    /// the buffer and never make progress).
+    private var rewinding: Bool = false
+    /// NSEvent local monitor that consumes CMD+← while we have a ROM
+    /// loaded. AppKit's auto-repeat (controlled by the Keyboard
+    /// preference pane) keeps firing the event while the keys are held,
+    /// so a single monitor + per-event call to rewindOneFrame() is all
+    /// we need for "hold to scrub backwards" UX.
+    private var rewindKeyMonitor: Any?
+
+    /// Virtual key code for the left-arrow key on every Apple keyboard.
+    private let leftArrowKeyCode: UInt16 = 0x7B
+    /// Serial queue for rewind buffer ops — XOR + LZ4 compress costs
+    /// 1-2 ms per frame which we don't want on the run-loop thread.
+    /// Single concurrent worker preserves push order.
+    private let rewindQueue = DispatchQueue(label: "net.ringum.kintsuki.rewind",
+                                            qos: .userInitiated)
+    /// True while the user is actively scrubbing backwards (a CMD+←
+    /// fired in the last `rewindHoldTimeout` seconds). While held, the
+    /// run loop suspends forward emulation so `tick()` doesn't re-push
+    /// a frame between repeats and turn the buffer into a no-op churn.
+    private var rewindHolding: Bool = false
+    private var rewindHoldResumeWork: DispatchWorkItem?
+    private let rewindHoldTimeout: TimeInterval = 0.15
+
     init() {
         // Set KINTSUKI_SYSTEM_PAK env var so the dylib finds boards.bml/ipl.rom
         // bundled at Contents/Resources/System/Super Famicom/.
@@ -75,12 +110,38 @@ final class Emulator: ObservableObject {
         }
         handle = kintsuki_create()
         loadRecents()
+        installRewindKeyMonitor()
     }
 
     deinit {
+        if let mon = rewindKeyMonitor {
+            NSEvent.removeMonitor(mon)
+        }
         if let h = handle {
             kintsuki_destroy(h)
         }
+    }
+
+    /// Install a window-local NSEvent monitor that intercepts CMD+←
+    /// keyDowns (including auto-repeat events) and steps the rewind
+    /// buffer back one frame each time. Returning nil consumes the
+    /// event so it doesn't bubble up and trigger the menu shortcut a
+    /// second time.
+    private func installRewindKeyMonitor() {
+        rewindKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown)
+            { [weak self] event in
+                guard let self else { return event }
+                guard event.modifierFlags.contains(.command),
+                      event.keyCode == self.leftArrowKeyCode
+                else { return event }
+                // No ROM = nothing to rewind to; pass the event through.
+                guard self.loadedROM != nil else { return event }
+                // CMD+Shift+← steps back 1 second (60 frames at 60 fps);
+                // bare CMD+← steps back 1 frame.
+                let stride = event.modifierFlags.contains(.shift) ? 60 : 1
+                self.rewindBy(frames: stride)
+                return nil  // consume so the menu shortcut doesn't double-fire
+            }
     }
 
     // ----- ROM lifecycle ---------------------------------------------------
@@ -116,6 +177,9 @@ final class Emulator: ObservableObject {
         NSLog("kintsuki: ROM loaded successfully")
         loadedROM = url
         running = true
+        // New ROM = fresh timeline. Drop any rewind frames from a
+        // previous session.
+        clearRewindBuffer()
         rememberRecent(url)
         startRunLoop()
     }
@@ -185,7 +249,13 @@ final class Emulator: ObservableObject {
 
     private func tick() {
         guard running, let h = handle else { return }
+        // While the user is actively rewinding (held CMD+←), suspend
+        // forward emulation. Otherwise tick re-captures a frame between
+        // each key-repeat event and rewindOneFrame's pop-pop pattern
+        // ends up oscillating around the same point in time.
+        if rewindHolding { return }
         kintsuki_run_frames(h, 1)
+        captureRewindFrame()
         snapshotFramebuffer()
         snapshotCpuState()
         framesSinceFpsTick += 1
@@ -196,6 +266,100 @@ final class Emulator: ObservableObject {
             framesSinceFpsTick = 0
             lastFpsTime = now
         }
+    }
+
+    /// Push the post-tick state into the rewind buffer. Skipped during
+    /// an active rewind (otherwise the buffer would re-record the
+    /// rewound state and we'd never make progress backwards).
+    ///
+    /// Hot path optimisation: the C save_state copy stays on main (it's
+    /// the cheap part), but the XOR + LZ4 compression that follows is
+    /// dispatched to a serial background queue so the run loop doesn't
+    /// pay it. push order is preserved by the queue's serial nature.
+    private func captureRewindFrame() {
+        guard !rewinding, let h = handle else { return }
+        let needed = kintsuki_save_state(h, nil, 0)
+        guard needed > 0 else { return }
+        var blob = Data(count: Int(needed))
+        let written = blob.withUnsafeMutableBytes { raw -> UInt32 in
+            kintsuki_save_state(h, raw.baseAddress, UInt32(needed))
+        }
+        guard written > 0 else { return }
+        blob.count = Int(written)
+        rewindQueue.async { [weak self, blob] in
+            guard let self else { return }
+            self.rewindBuffer.push(blob)
+            let n = self.rewindBuffer.count
+            DispatchQueue.main.async {
+                if self.rewindFrames != n { self.rewindFrames = n }
+            }
+        }
+    }
+
+    /// Pop the most-recent retained frame and load it. Returns true if
+    /// the buffer had something to rewind to. Triggered by the UI's
+    /// CMD+← shortcut.
+    @discardableResult
+    func rewindOneFrame() -> Bool {
+        return rewindBy(frames: 1)
+    }
+
+    /// Step the emulator back by `frames` retained frames. Used by the
+    /// CMD+← (1 frame) and CMD+Shift+← (1 second = 60 frames) shortcuts.
+    @discardableResult
+    func rewindBy(frames n: Int) -> Bool {
+        guard let h = handle, n >= 1 else { return false }
+        // Mark the run loop as "user is scrubbing"; tick() will skip
+        // forward emulation until the hold timeout fires.
+        rewindHolding = true
+        rewindHoldResumeWork?.cancel()
+        let work = DispatchWorkItem { [weak self] in
+            self?.rewindHolding = false
+            self?.rewindHoldResumeWork = nil
+        }
+        rewindHoldResumeWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + rewindHoldTimeout,
+                                      execute: work)
+
+        rewinding = true
+        defer { rewinding = false }
+        // Pop n+1 frames and load the last one popped: the first pop
+        // discards the current state (already live in the emulator),
+        // the next n step backward by n frames. If the buffer is
+        // shallower than that, we land on the oldest frame retained.
+        let blob: Data? = rewindQueue.sync {
+            var lastPopped: Data?
+            for _ in 0..<(n + 1) {
+                guard let b = rewindBuffer.popLast() else { return lastPopped }
+                lastPopped = b
+            }
+            return lastPopped
+        }
+        guard let blob else {
+            rewindFrames = rewindBuffer.count
+            return false
+        }
+        let ok = blob.withUnsafeBytes { raw -> Int32 in
+            kintsuki_load_state(h, raw.baseAddress, UInt32(blob.count))
+        }
+        rewindFrames = rewindBuffer.count
+        if ok != 0 {
+            // The savestate restores PPU registers but not the live
+            // render output buffer. Advance one frame so the PPU
+            // re-paints the restored scene; otherwise the MTKView
+            // keeps showing whatever was last drawn before the rewind.
+            kintsuki_run_frames(h, 1)
+            snapshotFramebuffer()
+            snapshotCpuState()
+            return true
+        }
+        return false
+    }
+
+    /// Drop every retained rewind frame (e.g., on ROM unload).
+    func clearRewindBuffer() {
+        rewindQueue.sync { rewindBuffer.clear() }
+        rewindFrames = 0
     }
 
     private func snapshotCpuState() {

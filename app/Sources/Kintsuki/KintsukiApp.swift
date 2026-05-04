@@ -42,6 +42,12 @@ struct KintsukiApp: App {
                 .keyboardShortcut("p", modifiers: .command)
                 Button("Step Frame") { emulator.stepOneFrame() }
                     .keyboardShortcut(".", modifiers: .command)
+                Button("Rewind 1 Frame") { emulator.rewindOneFrame() }
+                    .keyboardShortcut(.leftArrow, modifiers: .command)
+                    .disabled(emulator.rewindFrames < 2)
+                Button("Rewind 1 Second") { emulator.rewindBy(frames: 60) }
+                    .keyboardShortcut(.leftArrow, modifiers: [.command, .shift])
+                    .disabled(emulator.rewindFrames < 2)
                 Divider()
                 Button(emulator.inspectorOpen ? "Hide Inspector" : "Show Inspector") {
                     emulator.inspectorOpen.toggle()

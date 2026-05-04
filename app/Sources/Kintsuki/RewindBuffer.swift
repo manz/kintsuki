@@ -190,10 +190,20 @@ private func xor(_ a: Data, _ b: Data) -> Data {
     out.withUnsafeMutableBytes { dstRaw in
         a.withUnsafeBytes { aRaw in
             b.withUnsafeBytes { bRaw in
+                // Word-at-a-time XOR over the head of the buffer; per-byte
+                // tail handles any size that isn't a multiple of 8.
+                let dstU64 = dstRaw.bindMemory(to: UInt64.self)
+                let aU64   = aRaw.bindMemory(to: UInt64.self)
+                let bU64   = bRaw.bindMemory(to: UInt64.self)
+                let words  = dstU64.count
+                for i in 0..<words {
+                    dstU64[i] = aU64[i] ^ bU64[i]
+                }
+                let tailStart = words * 8
                 let dst = dstRaw.bindMemory(to: UInt8.self)
                 let pa  = aRaw.bindMemory(to: UInt8.self)
                 let pb  = bRaw.bindMemory(to: UInt8.self)
-                for i in 0..<dst.count {
+                for i in tailStart..<dst.count {
                     dst[i] = pa[i] ^ pb[i]
                 }
             }

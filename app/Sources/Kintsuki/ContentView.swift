@@ -32,12 +32,22 @@ struct ContentView: View {
                     VStack {
                         HStack {
                             Spacer()
-                            Text(String(format: "%.0f fps", emulator.fps))
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 6).padding(.vertical, 2)
-                                .background(.black.opacity(0.4), in: Capsule())
-                                .padding(8)
+                            VStack(alignment: .trailing, spacing: 4) {
+                                Text(String(format: "%.0f fps", emulator.fps))
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(.white)
+                                    .padding(.horizontal, 6).padding(.vertical, 2)
+                                    .background(.black.opacity(0.4), in: Capsule())
+                                if emulator.rewindFrames > 1 {
+                                    let secs = Double(emulator.rewindFrames) / 60.0
+                                    Text(String(format: "↶ %.1fs", secs))
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 6).padding(.vertical, 2)
+                                        .background(.black.opacity(0.4), in: Capsule())
+                                }
+                            }
+                            .padding(8)
                         }
                         Spacer()
                     }
