@@ -45,6 +45,16 @@ artifacts = [
 # Wheel ships a prebuilt native library; CI retags it as platform-specific
 # via `wheel tags --platform-tag <tag>` after `python -m build --wheel`.
 
+[project.optional-dependencies]
+# `pip install kintsuki[pixelmatch]` for the visual-diff oracle. Keeps
+# the base wheel slim (no heavy numba/numpy/Pillow chain) for production
+# users that only need the emulator core.
+pixelmatch = [
+    "numpy>=1.26",
+    "numba>=0.59",
+    "Pillow>=10",
+]
+
 [dependency-groups]
 dev = [
     "pytest>=9.0.0",
@@ -54,7 +64,8 @@ dev = [
     # assemble_rom fixture shells out to `a816 -f sfc`). Pinned to the
     # latest 1.1.0 alpha that's been validated against this repo.
     "a816>=1.1.0a11",
-    # kintsuki.visual pixel-diff oracle (vendored mapbox/pixelmatch port).
+    # Mirror the [pixelmatch] extras so dev installs get the visual
+    # oracle out of the box without the package depending on itself.
     "numpy>=1.26",
     "numba>=0.59",
     "Pillow>=10",
