@@ -10,7 +10,10 @@ struct SaveStateBrowserView: View {
     @Query private var entries: [SaveStateEntry]
 
     init(romPath: String) {
-        let predicate = #Predicate<SaveStateEntry> { $0.romPath == romPath }
+        let autosave = Emulator.autosaveSlotName
+        let predicate = #Predicate<SaveStateEntry> {
+            $0.romPath == romPath && $0.name != autosave
+        }
         _entries = Query(filter: predicate,
                          sort: [SortDescriptor(\.createdAt, order: .reverse)])
     }

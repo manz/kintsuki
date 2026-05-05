@@ -22,11 +22,30 @@ struct ContentView: View {
                     .padding(40)
                     .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
                 }
-                if !emulator.running, emulator.loadedROM != nil {
+                if !emulator.running, emulator.loadedROM != nil, !emulator.halted {
                     Text("PAUSED")
                         .font(.system(.title2, design: .monospaced))
                         .padding(.horizontal, 16).padding(.vertical, 8)
                         .background(.ultraThinMaterial, in: Capsule())
+                }
+                if emulator.halted {
+                    VStack(spacing: 8) {
+                        Text("Game stopped due to a crash")
+                            .font(.system(.title3, design: .monospaced))
+                            .bold()
+                        Text(String(format: "CPU STP @ %02X:%04X",
+                                    (emulator.cpuState.pc >> 16) & 0xFF,
+                                    emulator.cpuState.pc & 0xFFFF))
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                        Text("⌘R to reset · ⌘⇧R to reload from disk")
+                            .font(.caption2)
+                            .foregroundStyle(.tertiary)
+                    }
+                    .padding(20)
+                    .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 12))
+                    .overlay(RoundedRectangle(cornerRadius: 12)
+                                .stroke(.red.opacity(0.6), lineWidth: 1.5))
                 }
                 if emulator.loadedROM != nil {
                     VStack {

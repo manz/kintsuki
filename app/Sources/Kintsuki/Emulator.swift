@@ -44,7 +44,14 @@ final class Emulator: ObservableObject {
         var b: UInt8 = 0, p: UInt8 = 0
         var pc: UInt32 = 0
         var e: Bool = false
+        var stp: Bool = false
+        var wai: Bool = false
     }
+
+    /// True when the CPU executed STP and is sitting in instructionStop's
+    /// idle loop — the game has effectively crashed (or hit a manual halt).
+    /// Drives the "Game stopped" overlay in ContentView.
+    @Published private(set) var halted: Bool = false
 
     /// The most recent framebuffer copied out of libkintsuki (RGBA, 0x00RRGGBB
     /// packed). Width/height refresh per frame. Surface is BGRA in memory
@@ -123,6 +130,15 @@ final class Emulator: ObservableObject {
         if let last = recentROMs.first {
             DispatchQueue.main.async { [weak self] in
                 self?.loadROM(last)
+            }
+        }
+        // Persist the autosave slot whenever the app is on its way out
+        // so the next launch (or a hot-reload) can restore exactly here.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                _ = self?.saveAutosave()
             }
         }
     }
@@ -384,6 +400,11 @@ final class Emulator: ObservableObject {
         }
         rewindFrames = rewindBuffer.count
         if ok != 0 {
+            // ares doesn't serialize the libco coroutine RIP, so the
+            // next run_frames would otherwise wake the coroutine inside
+            // whatever wait loop it suspended in — rearm gives us a
+            // fresh coroutine that picks up the restored register file.
+            kintsuki_rearm_cpu(h)
             // The savestate restores PPU registers but not the live
             // render output buffer. Advance one frame so the PPU
             // re-paints the restored scene; otherwise the MTKView
@@ -408,8 +429,10 @@ final class Emulator: ObservableObject {
         kintsuki_get_state(h, &raw)
         // Only republish on change so SwiftUI doesn't redraw 60Hz for nothing.
         let s = CpuState(a: raw.a, x: raw.x, y: raw.y, s: raw.s, d: raw.d,
-                         b: raw.b, p: raw.p, pc: raw.pc, e: raw.e != 0)
+                         b: raw.b, p: raw.p, pc: raw.pc, e: raw.e != 0,
+                         stp: raw.stp != 0, wai: raw.wai != 0)
         if s != cpuState { cpuState = s }
+        if halted != s.stp { halted = s.stp }
     }
 
     // ----- Memory snapshot for hex/palette/tile views ---------------------
@@ -590,7 +613,14 @@ final class Emulator: ObservableObject {
         let ok = entry.blob.withUnsafeBytes { raw in
             kintsuki_load_state(h, raw.baseAddress, UInt32(entry.blob.count))
         }
-        if ok != 0 { NSLog("kintsuki: loaded state \"\(entry.name)\"") }
+        guard ok != 0 else { return }
+        // ares serializes r.stp/r.wai + register file but not the libco
+        // coroutine RIP. Without rearming, the next scheduler tick wakes
+        // the coroutine inside whatever wait loop it happened to suspend
+        // in (commonly STP/WAI), so PC sits frozen even though registers
+        // were restored cleanly.
+        kintsuki_rearm_cpu(h)
+        NSLog("kintsuki: loaded state \"\(entry.name)\"")
     }
 
     /// Read a `.srm` file and push it into the cart's in-memory SRAM.
@@ -630,6 +660,98 @@ final class Emulator: ObservableObject {
         loadROM(url)
     }
 
+    /// Reserved name for the per-ROM autosave slot. Hidden from the
+    /// state browser and overwritten in place by `saveAutosave()`.
+    static let autosaveSlotName = "__autosave__"
+
+    /// Snapshot the running emulator into the per-ROM autosave slot,
+    /// overwriting whatever was there. Used both by app-quit and by
+    /// hot-reload to ferry state across a `kintsuki_load_rom` call.
+    @discardableResult
+    func saveAutosave() -> SaveStateEntry? {
+        guard let h = handle, let rom = loadedROM, let ctx = modelContext else { return nil }
+        let size = kintsuki_save_state(h, nil, 0)
+        guard size > 0 else { return nil }
+        var blob = Data(count: Int(size))
+        blob.withUnsafeMutableBytes { _ = kintsuki_save_state(h, $0.baseAddress, size) }
+        let thumb = SaveStateThumbnail.png(fromBGRA: framebuffer,
+                                           width: Int(fbWidth), height: Int(fbHeight)) ?? Data()
+        let romPath = rom.path
+        let slot = Self.autosaveSlotName
+        let predicate = #Predicate<SaveStateEntry> { $0.romPath == romPath && $0.name == slot }
+        let descriptor = FetchDescriptor<SaveStateEntry>(predicate: predicate)
+        if let existing = (try? ctx.fetch(descriptor))?.first {
+            existing.blob = blob
+            existing.thumbnailPNG = thumb
+            existing.createdAt = .now
+            do { try ctx.save() } catch { NSLog("kintsuki: autosave update failed: \(error)") }
+            return existing
+        }
+        let entry = SaveStateEntry(romPath: romPath, name: slot,
+                                   blob: blob, thumbnailPNG: thumb)
+        ctx.insert(entry)
+        do { try ctx.save() } catch { NSLog("kintsuki: autosave insert failed: \(error)") }
+        return entry
+    }
+
+    /// Restore the per-ROM autosave slot. Returns false when no such
+    /// slot exists or the load fails — caller can fall back to a fresh
+    /// boot in that case.
+    @discardableResult
+    func loadAutosave() -> Bool {
+        guard let rom = loadedROM, let ctx = modelContext else { return false }
+        let romPath = rom.path
+        let slot = Self.autosaveSlotName
+        let predicate = #Predicate<SaveStateEntry> { $0.romPath == romPath && $0.name == slot }
+        let descriptor = FetchDescriptor<SaveStateEntry>(predicate: predicate)
+        guard let entry = (try? ctx.fetch(descriptor))?.first else { return false }
+        loadState(entry)
+        return true
+    }
+
+    /// Reload the ROM from disk while preserving live emulator state
+    /// across the swap. Captures state in-memory (skipping SwiftData so
+    /// the externalStorage write/flush cycle can't race with the load)
+    /// and applies it after the cart re-boots. Only sane when the new
+    /// ROM is layout-compatible (typical iterative dev rebuild).
+    func hotReloadKeepingState() {
+        guard let url = loadedROM, let h = handle else { return }
+        let needed = kintsuki_save_state(h, nil, 0)
+        guard needed > 0 else {
+            NSLog("kintsuki: hot-reload aborted — save_state size=0")
+            return
+        }
+        var blob = Data(count: Int(needed))
+        let written = blob.withUnsafeMutableBytes { raw -> UInt32 in
+            kintsuki_save_state(h, raw.baseAddress, needed)
+        }
+        guard written == needed else {
+            NSLog("kintsuki: hot-reload aborted — save_state short write")
+            return
+        }
+        stopRunLoop()
+        let path = url.path
+        let ok = path.withCString { kintsuki_load_rom(h, $0) }
+        guard ok != 0 else {
+            NSLog("kintsuki: hot-reload load_rom failed at \(path)")
+            return
+        }
+        clearRewindBuffer()
+        let loaded = blob.withUnsafeBytes { raw -> Int32 in
+            kintsuki_load_state(h, raw.baseAddress, UInt32(blob.count))
+        }
+        if loaded == 0 {
+            NSLog("kintsuki: hot-reload load_state rejected blob — booting cold")
+        } else {
+            kintsuki_rearm_cpu(h)
+        }
+        snapshotFramebuffer()
+        snapshotCpuState()
+        running = true
+        startRunLoop()
+        NSLog("kintsuki: hot-reload complete")
+    }
+
     /// Export the current emulator state to `url` as a kintsuki blob.
     func exportStateToFile(url: URL) -> Bool {
         guard let h = handle else { return false }
@@ -664,6 +786,7 @@ final class Emulator: ObservableObject {
             NSLog("kintsuki: importState rejected blob from \(url.path)")
             return false
         }
+        kintsuki_rearm_cpu(h)
         kintsuki_run_frames(h, 1)
         snapshotFramebuffer()
         snapshotCpuState()
