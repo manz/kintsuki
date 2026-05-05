@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import ctypes
+import os
+import re
 from dataclasses import dataclass
 from typing import Callable
 
@@ -142,8 +144,51 @@ class PpuState:
         return (sc & 0xFC) << 8
 
 
-import re
 from pathlib import Path
+
+
+def _load_adbg_labels(path: str | os.PathLike[str]) -> dict[int, str]:
+    """Parse an a816 .adbg debug-info file and return ``{addr: name}`` for
+    every label-kind symbol. Imports a816 lazily so kintsuki stays usable
+    without a816 installed when ``adbg=...`` isn't passed."""
+    from a816 import debug_info  # type: ignore[import-not-found]
+
+    info = debug_info.read(Path(path))
+    out: dict[int, str] = {}
+    for sym in info.symbols:
+        # Only labels resolve to a meaningful PC; constants/aliases do not.
+        if int(sym.kind) != int(debug_info.SymbolKind.LABEL):
+            continue
+        # First writer wins on collision — duplicate labels at the same
+        # address are merged silently rather than overwriting arbitrarily.
+        out.setdefault(sym.address & 0xFFFFFF, sym.name)
+    return out
+
+
+_TRACE_PC_RE = re.compile(r"^([0-9A-Fa-f]{2}):([0-9A-Fa-f]{4}) ")
+
+
+def annotate_trace(text: str, labels: dict[int, str]) -> str:
+    """Insert ``; --- name ---`` headers above every line whose leading
+    PC matches a label in ``labels``. Consecutive lines at the same PC
+    only emit the header once. Safe on FILE-mode trace logs too — feed
+    in the file contents and write the result back."""
+    if not labels:
+        return text
+    out: list[str] = []
+    last_label_pc: int | None = None
+    for line in text.splitlines(keepends=True):
+        m = _TRACE_PC_RE.match(line)
+        if m:
+            pc = (int(m.group(1), 16) << 16) | int(m.group(2), 16)
+            name = labels.get(pc)
+            if name is not None and pc != last_label_pc:
+                out.append(f"; --- {name} ---\n")
+                last_label_pc = pc
+            elif name is None:
+                last_label_pc = None
+        out.append(line)
+    return "".join(out)
 
 
 class SymbolTable:
@@ -240,12 +285,18 @@ class Emu:
         self._registered: list[_Registered] = []
         on = Emu.default_load_srm_sidecar if load_srm_sidecar is None else load_srm_sidecar
         _native.lib.kintsuki_set_srm_sidecar(self._handle, 1 if on else 0)
+        self._labels: dict[int, str] = {}
 
     # ------------------------------------------------------------------ ROM
-    def load_rom(self, path: str) -> None:
+    def load_rom(self, path: str, *, adbg: str | os.PathLike[str] | None = None) -> None:
+        """Load `path` (sfc/smc). Pass `adbg=...` to also pull labels from an
+        a816 .adbg file — used by `tracer_drain(annotate=True)` to inject
+        symbol headers above matching PC lines."""
         ok = _native.lib.kintsuki_load_rom(self._handle, path.encode("utf-8"))
         if not ok:
             raise RuntimeError(f"failed to load ROM: {path}")
+        if adbg is not None:
+            self._labels = _load_adbg_labels(adbg)
 
     # -------------------------------------------------------------- Run/step
     def run_frames(self, n: int) -> None:
@@ -361,16 +412,21 @@ class Emu:
     def tracer_stop(self) -> None:
         _native.lib.kintsuki_tracer_stop(self._handle)
 
-    def tracer_drain(self) -> str:
+    def tracer_drain(self, *, annotate: bool = False) -> str:
         """Pull and clear the ring buffer's accumulated lines. FILE mode
-        always returns ''. Caller gets a UTF-8 decoded string."""
+        always returns ''. Caller gets a UTF-8 decoded string. Pass
+        ``annotate=True`` to splice in label headers from the .adbg file
+        passed to ``load_rom(adbg=...)``; no-op if no labels are loaded."""
         # First call: query required size with cap=0.
         size = _native.lib.kintsuki_tracer_drain(self._handle, None, 0)
         if size == 0:
             return ""
         buf = ctypes.create_string_buffer(size)
         n = _native.lib.kintsuki_tracer_drain(self._handle, buf, size)
-        return bytes(buf.raw[:n]).decode("utf-8", errors="replace")
+        text = bytes(buf.raw[:n]).decode("utf-8", errors="replace")
+        if annotate and self._labels:
+            text = annotate_trace(text, self._labels)
+        return text
 
     def tracer(self, lo: int, hi: int, *, ring_capacity: int = 4096,
                path: str | None = None) -> "_TracerSession":

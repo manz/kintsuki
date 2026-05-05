@@ -533,7 +533,15 @@ void tracerOnExec(uint32_t pc) {
   auto& cpu = ares::SuperFamicom::cpu;
   nall::string ins = cpu.disassembleInstruction();
   nall::string ctx = cpu.disassembleContext({});
-  nall::string line = nall::string(ins, "  ; ", ctx, "\n");
+  // Prefix the line with the executing PC so post-processors (e.g. .adbg
+  // label annotation) can recover it without parsing nall's varied bracket
+  // formatting (operand brackets only appear for memory-touching opcodes).
+  // Format BB:AAAA so PB jumps stand out — when PC goes wild we land in
+  // bank $05/etc and the bank is the only signal we left expected territory.
+  char pcbuf[12];
+  std::snprintf(pcbuf, sizeof(pcbuf), "%02X:%04X ",
+                (pc >> 16) & 0xFF, pc & 0xFFFF);
+  nall::string line = nall::string(pcbuf, ins, "  ; ", ctx, "\n");
   tracerAppendBytes((const char*)line.data(), (uint32_t)line.size());
 }
 
