@@ -29,7 +29,7 @@ struct ContentView: View {
                         .background(.ultraThinMaterial, in: Capsule())
                 }
                 if emulator.halted {
-                    VStack(spacing: 8) {
+                    VStack(alignment: .leading, spacing: 8) {
                         Text("Game stopped due to a crash")
                             .font(.system(.title3, design: .monospaced))
                             .bold()
@@ -38,6 +38,23 @@ struct ContentView: View {
                                     emulator.cpuState.pc & 0xFFFF))
                             .font(.system(.caption, design: .monospaced))
                             .foregroundStyle(.secondary)
+                        if !emulator.crashBacktrace.isEmpty {
+                            Divider()
+                            ForEach(Array(emulator.crashBacktrace.enumerated()), id: \.offset) { idx, frame in
+                                HStack(spacing: 8) {
+                                    Text(String(format: "#%-2d", idx))
+                                        .foregroundStyle(.tertiary)
+                                    Text(String(format: "%02X:%04X",
+                                                (frame.callsite >> 16) & 0xFF,
+                                                frame.callsite & 0xFFFF))
+                                    if let label = frame.label {
+                                        Text("in \(label)").foregroundStyle(.secondary)
+                                    }
+                                }
+                                .font(.system(.caption, design: .monospaced))
+                            }
+                        }
+                        Divider()
                         Text("⌘R to reset · ⌘⇧R to reload from disk")
                             .font(.caption2)
                             .foregroundStyle(.tertiary)

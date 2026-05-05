@@ -50,7 +50,7 @@ target_link_libraries(kintsuki-program PUBLIC
 # ---------------------------------------------------------------------------
 # Shared library: C ABI shim
 # ---------------------------------------------------------------------------
-add_library(kintsuki SHARED libkintsuki.cpp)
+add_library(kintsuki SHARED libkintsuki.cpp adbg.cpp)
 
 set_target_properties(kintsuki PROPERTIES
   CXX_STANDARD 20

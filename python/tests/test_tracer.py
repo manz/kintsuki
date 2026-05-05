@@ -20,7 +20,7 @@ from pathlib import Path
 
 import pytest
 
-from kintsuki import Emu, annotate_trace
+from kintsuki import Emu
 
 
 def test_tracer_api_exists():
@@ -89,27 +89,10 @@ def test_tracer_context_manager(assemble_rom):
         assert empty == "", "tracer_drain after stop should return empty"
 
 
-def test_annotate_trace_pure():
-    """Pure-string helper: PC matches a label → header line gets injected
-    above; consecutive lines at the same PC don't repeat the header."""
-    text = (
-        "00:8000 lda #$01    ; A:00\n"
-        "00:8000 lda #$01    ; A:00\n"
-        "00:8002 sta $00     ; A:01\n"
-    )
-    out = annotate_trace(text, {0x008000: "reset", 0x008002: "store"})
-    assert "; --- reset ---" in out
-    assert "; --- store ---" in out
-    # Header for `reset` only appears once, not twice for the duplicate PC.
-    assert out.count("; --- reset ---") == 1
-
-
-def test_tracer_annotate_with_adbg(assemble_rom, tmp_path):
+def test_tracer_native_label_injection(assemble_rom, tmp_path):
     """End-to-end: load ROM with its .adbg, FILE-trace the reset path,
-    annotate the trace.log, verify a label header is spliced in.
-
-    FILE mode is used so ring eviction doesn't drop the reset entry once
-    the boot drops into its idle loop."""
+    verify the trace.log already contains ``; --- reset ---`` headers
+    spliced in natively (no Python post-processing)."""
     rom = assemble_rom("test_ppu_state.s")
     adbg = Path(str(rom) + ".adbg")
     if not adbg.exists():
@@ -117,12 +100,28 @@ def test_tracer_annotate_with_adbg(assemble_rom, tmp_path):
     log = tmp_path / "trace.log"
     with Emu() as emu:
         emu.load_rom(str(rom), adbg=adbg)
-        assert emu._labels, "label table empty after load_rom(adbg=...)"
+        assert emu.lookup_label(0x008000) is not None, (
+            "no label resolved at reset vector — adbg load looks broken")
         emu.tracer_start(lo=0x008000, hi=0x0080FF, path=str(log))
         emu.run_frames(1)
         emu.tracer_stop()
-    annotated = annotate_trace(log.read_text(), emu._labels)
-    assert "; --- reset ---" in annotated, (
-        "expected `reset` label header in annotated trace; got:\n"
-        + "\n".join(annotated.splitlines()[:5])
+    text = log.read_text()
+    assert "; --- reset ---" in text, (
+        "expected native `reset` label header in trace; got:\n"
+        + "\n".join(text.splitlines()[:5])
     )
+
+
+def test_lookup_label_roundtrip(assemble_rom):
+    """``Emu.load_adbg`` + ``Emu.lookup_label`` resolve assembled symbols."""
+    rom = assemble_rom("test_ppu_state.s")
+    adbg = Path(str(rom) + ".adbg")
+    if not adbg.exists():
+        pytest.skip(f"missing .adbg next to {rom.name}")
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        emu.load_adbg(adbg)
+        # Assembled reset vector lives at $00:8000 in the test ROM.
+        assert emu.lookup_label(0x008000) == "reset"
+        emu.clear_adbg()
+        assert emu.lookup_label(0x008000) is None

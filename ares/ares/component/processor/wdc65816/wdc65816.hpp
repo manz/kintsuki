@@ -292,4 +292,15 @@ struct WDC65816 {
   } r;
 };
 
+// Call/return hooks fired from instructions-pc.cpp's CallShort/CallLong/
+// ReturnShort/ReturnLong implementations. nullptr by default (branch
+// predictor folds them out for release builds); the kintsuki shim wires
+// them to maintain a shadow callstack for crash backtraces.
+//   call kind: 0=JSR, 1=JSL
+//   ret  kind: 0=RTS, 1=RTL
+using CallHook   = void (*)(u32 callsite_pc, u32 target_pc, u8 kind);
+using ReturnHook = void (*)(u8 kind);
+extern CallHook   callHook;
+extern ReturnHook returnHook;
+
 }

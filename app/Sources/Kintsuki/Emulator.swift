@@ -53,6 +53,19 @@ final class Emulator: ObservableObject {
     /// Drives the "Game stopped" overlay in ContentView.
     @Published private(set) var halted: Bool = false
 
+    struct BacktraceFrame: Identifiable, Equatable {
+        let id = UUID()
+        var callsite: UInt32   // 24-bit
+        var target:   UInt32   // 24-bit
+        var kind:     UInt8    // 0=JSR, 1=JSL
+        var label:    String?  // resolved via .adbg, nil if no match
+    }
+
+    /// Captured shadow callstack at the moment the CPU first transitioned
+    /// to halted=true. Cleared when the CPU resumes (after rearm, reset,
+    /// hot-reload). Topmost frame first (deepest call).
+    @Published private(set) var crashBacktrace: [BacktraceFrame] = []
+
     /// The most recent framebuffer copied out of libkintsuki (RGBA, 0x00RRGGBB
     /// packed). Width/height refresh per frame. Surface is BGRA in memory
     /// (little-endian) so MTLPixelFormat.bgra8Unorm uploads without swizzle.
@@ -228,6 +241,17 @@ final class Emulator: ObservableObject {
         // previous session.
         clearRewindBuffer()
         rememberRecent(url)
+        // Auto-load `<rom>.adbg` if it sits next to the cart so the halt
+        // overlay can resolve crash callstacks without an explicit user
+        // action. Failure (missing / unreadable) is silent — most ROMs
+        // ship without one.
+        let adbg = URL(fileURLWithPath: url.path + ".adbg")
+        if FileManager.default.fileExists(atPath: adbg.path) {
+            let ok = adbg.path.withCString { kintsuki_load_adbg(h, $0) }
+            NSLog("kintsuki: load_adbg \(adbg.lastPathComponent) -> \(ok != 0 ? "ok" : "failed")")
+        } else {
+            kintsuki_clear_adbg(h)
+        }
         startRunLoop()
     }
 
@@ -432,7 +456,38 @@ final class Emulator: ObservableObject {
                          b: raw.b, p: raw.p, pc: raw.pc, e: raw.e != 0,
                          stp: raw.stp != 0, wai: raw.wai != 0)
         if s != cpuState { cpuState = s }
-        if halted != s.stp { halted = s.stp }
+        if halted != s.stp {
+            halted = s.stp
+            // Capture once on the rising edge of the halt — calling the
+            // C ABI is cheap but doing it 60Hz while the CPU is idle in
+            // STP would churn @Published for nothing.
+            crashBacktrace = s.stp ? captureBacktrace() : []
+        }
+    }
+
+    /// Snapshot the native shadow callstack and resolve each frame's
+    /// callsite via the loaded `.adbg` (if any). Top-of-stack last so the
+    /// SwiftUI rendering can iterate frame[0] = deepest call.
+    private func captureBacktrace(maxFrames: Int = 32) -> [BacktraceFrame] {
+        guard let h = handle else { return [] }
+        var buf = [kintsuki_call_frame_t](repeating: kintsuki_call_frame_t(),
+                                           count: maxFrames)
+        let n = buf.withUnsafeMutableBufferPointer { ptr -> UInt32 in
+            kintsuki_callstack_snapshot(h, ptr.baseAddress, UInt32(maxFrames))
+        }
+        var out: [BacktraceFrame] = []
+        out.reserveCapacity(Int(n))
+        for i in 0..<Int(n) {
+            let f = buf[i]
+            let label = kintsuki_lookup_label(h, f.callsite_pc).map {
+                String(cString: $0)
+            }
+            out.append(BacktraceFrame(callsite: f.callsite_pc,
+                                      target:   f.target_pc,
+                                      kind:     f.kind,
+                                      label:    label))
+        }
+        return out
     }
 
     // ----- Memory snapshot for hex/palette/tile views ---------------------
