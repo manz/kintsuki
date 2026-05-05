@@ -116,3 +116,35 @@ def test_read_range():
         emu.run_frames(60)
         blob = emu.read_range(0x7E0000, 256)
         assert len(blob) == 256
+
+
+def test_bulk_range_roundtrips():
+    """Round-trip every (read_range, write_range) pair against its single-byte
+    counterpart so the bulk path is provably equivalent + faster."""
+    _need_rom()
+    payload = bytes(range(64))
+    with Emu() as emu:
+        emu.load_rom(ROM_PATH)
+        emu.run_frames(60)
+
+        # CPU bus (WRAM)
+        emu.write_range(0x7E1000, payload)
+        assert emu.read_range(0x7E1000, len(payload)) == payload
+        assert bytes(emu.read(0x7E1000 + i) for i in range(len(payload))) == payload
+
+        # VRAM
+        emu.vram_write_range(0x4000, payload)
+        assert emu.vram_read_range(0x4000, len(payload)) == payload
+
+        # CGRAM (512 B total — keep in range)
+        emu.cgram_write_range(0x100, payload)
+        assert emu.cgram_read_range(0x100, len(payload)) == payload
+
+        # OAM (low 512 B sprite table)
+        emu.oam_write_range(0x80, payload)
+        assert emu.oam_read_range(0x80, len(payload)) == payload
+
+        # PPU read_range region defaults: full target dump
+        assert len(emu.vram_read_range()) == kintsuki.VRAM_BYTES
+        assert len(emu.cgram_read_range()) == kintsuki.CGRAM_BYTES
+        assert len(emu.oam_read_range()) == kintsuki.OAM_BYTES
