@@ -183,14 +183,37 @@ auto Program::loadRom(const char* path) -> bool {
   cartPak->setAttribute("board",  string{info.board.c_str()});
   attachFile(cartPak, "manifest.bml", std::vector<uint8_t>(m.begin(), m.end()));
 
-  // Zero-filled save.ram if the board declares SRAM. ares' loadMap binds
-  // a reader function pointing into cart.ram.data(); if ram was never
-  // allocated (no save.ram in pak), the first SRAM access dereferences
-  // null and crashes — happens fast for games that touch cart RAM during
-  // boot (e.g. FF4 reads $38:07FE during its startup vector).
+  // Seed save.ram from a `.srm` sidecar if one exists next to the ROM,
+  // otherwise zero-fill. ares' loadMap binds a reader function pointing
+  // into cart.ram.data(); if ram was never allocated (no save.ram in
+  // pak), the first SRAM access dereferences null and crashes - happens
+  // fast for games that touch cart RAM during boot (e.g. FF4 reads
+  // $38:07FE during its startup vector). The sidecar is read-only:
+  // kintsuki has no save() callback wired to disk so the file is
+  // never written back, mirroring the manual `kintsuki_inject_sram`
+  // semantics (in-memory edit, original file untouched).
   if(info.hasSaveRam && info.saveRamSize > 0) {
-    attachFile(cartPak, "save.ram",
-               std::vector<uint8_t>(info.saveRamSize, 0));
+    std::vector<uint8_t> ram(info.saveRamSize, 0);
+    // Tests opt out via Program::loadSrmSidecar=false so a stray .srm
+    // next to a fixture ROM doesn't seed deterministic SRAM with random
+    // save data. Default true so end-user clients (Swift app, CLI) get
+    // mia-equivalent behaviour.
+    if(loadSrmSidecar) {
+      auto trySrm = [&](const std::string& srmPath) {
+        auto srm = readFile(srmPath.c_str());
+        if(srm.empty()) return false;
+        size_t n = srm.size() < ram.size() ? srm.size() : ram.size();
+        for(size_t i = 0; i < n; i++) ram[i] = srm[i];
+        std::fprintf(stderr, "kintsuki: seeded SRAM from %s (%zu bytes)\n",
+                     srmPath.c_str(), n);
+        return true;
+      };
+      if(!trySrm(p + ".srm")) {
+        auto dot = p.find_last_of('.');
+        if(dot != std::string::npos) trySrm(p.substr(0, dot) + ".srm");
+      }
+    }
+    attachFile(cartPak, "save.ram", std::move(ram));
   }
 
   if(romData.size() < info.programSize) {
@@ -236,6 +259,21 @@ auto Program::bootRom() -> bool {
   SuperFamicom::system.power(false);
   loaded = true;
   return true;
+}
+
+auto Program::softReset() -> void {
+  if(!loaded) return;
+  SuperFamicom::system.power(true);
+}
+
+auto Program::injectSram(const u8* data, u32 len) -> u32 {
+  if(!loaded || !data) return 0;
+  auto& ram = SuperFamicom::cartridge.ram;
+  u32 cap = (u32)ram.size();
+  if(cap == 0) return 0;
+  u32 n = len < cap ? len : cap;
+  for(u32 i = 0; i < n; i++) ram.data()[i] = data[i];
+  return n;
 }
 
 auto Program::runFrames(u32 n) -> void {

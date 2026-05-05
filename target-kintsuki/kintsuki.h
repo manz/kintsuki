@@ -37,6 +37,26 @@ kintsuki_t* kintsuki_create(void);
 void        kintsuki_destroy(kintsuki_t*);
 int         kintsuki_load_rom(kintsuki_t*, const char* path);
 
+// Soft reset. Power-cycles the emulator without re-reading the ROM
+// from disk. Equivalent to physically tapping the SNES reset button.
+// Preserves cart SRAM contents. No-op if no ROM loaded.
+void        kintsuki_reset(kintsuki_t*);
+
+// Toggle automatic seeding of cart SRAM from a `<rom>.srm` sidecar
+// file at `kintsuki_load_rom` time. Default 1 (mirrors mia loader);
+// pass 0 before loading a ROM when you need deterministic zero-filled
+// SRAM regardless of files on disk (e.g. test fixtures with stray
+// `.srm` siblings). Set persists for the handle's lifetime.
+void        kintsuki_set_srm_sidecar(kintsuki_t*, int enable);
+
+// Load `len` bytes from `data` into the cart's SRAM region (the
+// in-memory `save.ram` buffer ares allocated at boot). Use this to
+// inject a `.srm` blob without binding the file on disk: the emulator
+// writes stay in memory and the original file is never touched.
+// Returns the number of bytes copied (clamped to the cart's actual
+// SRAM size; 0 if no SRAM or no ROM).
+uint32_t    kintsuki_inject_sram(kintsuki_t*, const uint8_t* data, uint32_t len);
+
 // Execution
 void        kintsuki_run_frames(kintsuki_t*, uint32_t n);
 void        kintsuki_step(kintsuki_t*);
@@ -139,15 +159,6 @@ void        kintsuki_press(kintsuki_t*, int port, int button, int pressed);
 int         kintsuki_add_callback(kintsuki_t*, int kind, uint32_t lo, uint32_t hi,
                                   kintsuki_cb_t fn, void* userdata);
 void        kintsuki_remove_callback(kintsuki_t*, int kind, int id);
-
-// Mesen 2 .mss import. Reads the file at `path`, decompresses the
-// serialized state payload, walks the records, and pushes CPU
-// registers + WRAM/SRAM/VRAM/CGRAM/OAM into the emulator. Returns
-// 1 on success, 0 on any I/O / parse failure (failures log to
-// stderr so the caller can inspect them). Validated against
-// file_format_version=4, Mesen 2.1.x. Surface intentionally narrow:
-// settings, controllers, dummy DMA channels are skipped.
-int         kintsuki_import_mesen_state(kintsuki_t*, const char* path);
 
 // Formatted execution tracer. Wraps an exec callback that disassembles
 // the instruction at PC + dumps CPU registers, producing one Mesen-

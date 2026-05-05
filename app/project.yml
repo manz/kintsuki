@@ -92,6 +92,11 @@ targets:
           rsync -a --delete "$REPO/ares/ares/System/" "$SRCROOT/Vendor/System/"
           # Fix install_name to @rpath for embedded loading.
           install_name_tool -id @rpath/libkintsuki.dylib "$SRCROOT/Vendor/libkintsuki.dylib" || true
+          # install_name_tool mutates the dylib in-place so any ad-hoc
+          # signature embedded by the linker no longer covers the
+          # current bytes. Re-sign here so the staged Vendor/ copy is
+          # already valid before the bundle-embed phase.
+          /usr/bin/codesign --force --sign - "$SRCROOT/Vendor/libkintsuki.dylib" || true
     postBuildScripts:
       - name: Embed libkintsuki + System pak into bundle
         basedOnDependencyAnalysis: false
@@ -100,12 +105,18 @@ targets:
           mkdir -p "$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH"
           cp "$SRCROOT/Vendor/libkintsuki.dylib" \
              "$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH/"
-          # ares System pak (boards.bml + ipl.rom) — Emulator.swift sets
+          # ares System pak (boards.bml + ipl.rom). Emulator.swift sets
           # KINTSUKI_SYSTEM_PAK from Bundle.main.resourcePath at startup.
           mkdir -p "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
           rsync -a --delete "$SRCROOT/Vendor/System/" \
              "$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH/System/"
-          # Re-sign now that Frameworks/ is populated.
+          # The dylib copied in from Vendor/ may carry a stale ad-hoc
+          # signature: install_name_tool ran in the prebuild script
+          # invalidates whatever signature was embedded by the linker.
+          # Re-sign the embedded dylib first, then re-sign the .app so
+          # both signatures cover their actual on-disk contents.
+          /usr/bin/codesign --force --sign - \
+             "$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH/libkintsuki.dylib"
           /usr/bin/codesign --force --sign - \
              --entitlements "$BUILT_PRODUCTS_DIR/$TARGET_NAME.app.xcent" \
              "$TARGET_BUILD_DIR/$WRAPPER_NAME" || true

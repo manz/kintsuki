@@ -38,6 +38,8 @@ struct Program : ares::Platform {
   auto loadRom(const char* path) -> bool;
   auto bootRom() -> bool;
   auto runFrames(u32 n) -> void;
+  auto softReset() -> void;
+  auto injectSram(const u8* data, u32 len) -> u32;
 
   // Memory: CPU bus (24-bit address)
   auto memRead(u32 addr) -> u8;
@@ -79,6 +81,11 @@ struct Program : ares::Platform {
 
   // Per-port input bitmask. 12 bits used.
   uint16_t inputState[2] = {0, 0};
+
+  // When true (default), `loadRom` seeds cart SRAM from a `<rom>.srm`
+  // sidecar if one exists. Tests flip this off so deterministic SRAM
+  // doesn't get clobbered by an accidental save file.
+  bool loadSrmSidecar = true;
 
 private:
   // ROM image + cart pak built at load_rom().

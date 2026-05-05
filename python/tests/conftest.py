@@ -19,6 +19,13 @@ from pathlib import Path
 
 import pytest
 
+from kintsuki import Emu
+
+# Tests must not pick up stray .srm sidecars next to fixture ROMs.
+# Flip the process-wide default so every Emu() instance the suite
+# constructs gets deterministic zero-filled SRAM.
+Emu.default_load_srm_sidecar = False
+
 
 _ASM_DIR = Path(__file__).parent / "asm"
 

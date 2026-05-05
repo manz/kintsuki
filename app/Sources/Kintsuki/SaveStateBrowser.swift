@@ -139,7 +139,14 @@ private struct SaveStateCard: View {
 
     @ViewBuilder
     private var thumbnail: some View {
-        if let img = NSImage(data: entry.thumbnailPNG) {
+        // Guard against the brief window between ctx.delete() and SwiftUI
+        // tearing down this card: the @Query result still includes the
+        // entry but its modelContext is gone, so reading the
+        // .externalStorage thumbnailPNG attribute traps with a "detached
+        // backing data" fatal error. Treat detached/deleted entries as
+        // having no thumbnail.
+        if entry.modelContext != nil, !entry.isDeleted,
+           let img = NSImage(data: entry.thumbnailPNG) {
             Image(nsImage: img)
                 .resizable()
                 .interpolation(.none)
