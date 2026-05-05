@@ -402,13 +402,13 @@ auto Program::loadStateFile(const char* path) -> bool {
 namespace {
 auto correctedFrame(const std::vector<uint32_t>& fb, u32 fbW, u32 fbH,
                     u32& outW, u32& outH) -> std::vector<uint8_t> {
-  outW = fbW;
-  outH = fbH * 2;
+  outW = fbW / 2;
+  outH = fbH;
   std::vector<uint8_t> rgb(size_t(outW) * outH * 3);
   for(u32 y = 0; y < outH; y++) {
-    u32 sy = y / 2;
     for(u32 x = 0; x < outW; x++) {
-      u32 px = fb[sy * fbW + x];
+      u32 sx = x * 2;
+      u32 px = fb[y * fbW + sx];
       uint8_t* dst = rgb.data() + (y * outW + x) * 3;
       dst[0] = (uint8_t)((px >> 16) & 0xff);
       dst[1] = (uint8_t)((px >>  8) & 0xff);
