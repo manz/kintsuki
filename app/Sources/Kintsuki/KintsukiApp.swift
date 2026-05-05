@@ -56,6 +56,10 @@ struct KintsukiApp: App {
                     .keyboardShortcut(.leftArrow, modifiers: [.command, .shift])
                     .disabled(emulator.rewindFrames < 2)
                 Divider()
+                Button("Save Screenshot") { saveScreenshotToPicturesFolder() }
+                    .keyboardShortcut("p", modifiers: [.command, .shift])
+                    .disabled(emulator.loadedROM == nil)
+                Divider()
                 Button(emulator.inspectorOpen ? "Hide Inspector" : "Show Inspector") {
                     emulator.inspectorOpen.toggle()
                 }
@@ -98,6 +102,23 @@ struct KintsukiApp: App {
                 alert.runModal()
             }
         }
+    }
+
+    /// Drop the screenshot in `~/Pictures/Kintsuki/<rom>-<timestamp>.png`
+    /// without an NSSavePanel - the dialog adds friction for what is
+    /// usually a "grab this frame, keep playing" action. Folder is
+    /// created on demand so a fresh install Just Works.
+    private func saveScreenshotToPicturesFolder() {
+        let fm = FileManager.default
+        let pictures = fm.urls(for: .picturesDirectory, in: .userDomainMask).first
+            ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Pictures")
+        let dir = pictures.appendingPathComponent("Kintsuki", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let stem = emulator.loadedROM?.deletingPathExtension().lastPathComponent ?? "screenshot"
+        let f = DateFormatter()
+        f.dateFormat = "yyyyMMdd-HHmmss"
+        let url = dir.appendingPathComponent("\(stem)-\(f.string(from: .now)).png")
+        _ = emulator.saveScreenshot(url: url)
     }
 
     private func exportStateViaPanel() {
