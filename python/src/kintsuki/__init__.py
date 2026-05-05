@@ -218,6 +218,11 @@ class _Registered:
     trampoline: ctypes._FuncPointer
 
 
+VRAM_BYTES = 0x10000   # 64 KB, byte-addressed
+CGRAM_BYTES = 0x200    # 256 colors × 2 bytes
+OAM_BYTES = 0x220      # 512 B sprite table + 32 B high table
+
+
 class Emu:
     """High-level wrapper. Single-instance for now (bsnes core uses globals)."""
 
@@ -263,8 +268,8 @@ class Emu:
     def write_range(self, addr: int, data: bytes | bytearray) -> None:
         """Bulk write `data` starting at `addr` (CPU bus, 24-bit). Useful
         for dropping assembled stubs into WRAM as test harnesses."""
-        for i, b in enumerate(data):
-            _native.lib.kintsuki_write_u8(self._handle, addr + i, b & 0xFF)
+        buf = (ctypes.c_uint8 * len(data))(*data)
+        _native.lib.kintsuki_write_range(self._handle, addr, len(data), buf)
 
     # PPU memory
     def vram_read(self, addr: int) -> int:
@@ -273,17 +278,53 @@ class Emu:
     def vram_write(self, addr: int, value: int) -> None:
         _native.lib.kintsuki_vram_write(self._handle, addr, value & 0xFF)
 
+    def vram_read_range(self, addr: int = 0, length: int | None = None) -> bytes:
+        """Default: full 64 KB VRAM dump from `addr`."""
+        if length is None:
+            length = VRAM_BYTES - addr
+        buf = (ctypes.c_uint8 * length)()
+        n = _native.lib.kintsuki_vram_read_range(self._handle, addr, length, buf)
+        return bytes(buf[:n])
+
+    def vram_write_range(self, addr: int, data: bytes | bytearray) -> None:
+        buf = (ctypes.c_uint8 * len(data))(*data)
+        _native.lib.kintsuki_vram_write_range(self._handle, addr, len(data), buf)
+
     def cgram_read(self, addr: int) -> int:
         return int(_native.lib.kintsuki_cgram_read(self._handle, addr))
 
     def cgram_write(self, addr: int, value: int) -> None:
         _native.lib.kintsuki_cgram_write(self._handle, addr, value & 0xFF)
 
+    def cgram_read_range(self, addr: int = 0, length: int | None = None) -> bytes:
+        """Default: full 512 B CGRAM dump from `addr`."""
+        if length is None:
+            length = CGRAM_BYTES - addr
+        buf = (ctypes.c_uint8 * length)()
+        n = _native.lib.kintsuki_cgram_read_range(self._handle, addr, length, buf)
+        return bytes(buf[:n])
+
+    def cgram_write_range(self, addr: int, data: bytes | bytearray) -> None:
+        buf = (ctypes.c_uint8 * len(data))(*data)
+        _native.lib.kintsuki_cgram_write_range(self._handle, addr, len(data), buf)
+
     def oam_read(self, addr: int) -> int:
         return int(_native.lib.kintsuki_oam_read(self._handle, addr))
 
     def oam_write(self, addr: int, value: int) -> None:
         _native.lib.kintsuki_oam_write(self._handle, addr, value & 0xFF)
+
+    def oam_read_range(self, addr: int = 0, length: int | None = None) -> bytes:
+        """Default: full 544 B OAM dump (512 sprite table + 32 high) from `addr`."""
+        if length is None:
+            length = OAM_BYTES - addr
+        buf = (ctypes.c_uint8 * length)()
+        n = _native.lib.kintsuki_oam_read_range(self._handle, addr, length, buf)
+        return bytes(buf[:n])
+
+    def oam_write_range(self, addr: int, data: bytes | bytearray) -> None:
+        buf = (ctypes.c_uint8 * len(data))(*data)
+        _native.lib.kintsuki_oam_write_range(self._handle, addr, len(data), buf)
 
     # ------------------------------------------------------------ CPU state
     def get_state(self) -> CpuState:

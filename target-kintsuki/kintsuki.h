@@ -58,14 +58,21 @@ void        kintsuki_rearm_cpu(kintsuki_t*);
 uint8_t     kintsuki_read_u8 (kintsuki_t*, uint32_t addr);
 void        kintsuki_write_u8(kintsuki_t*, uint32_t addr, uint8_t val);
 uint32_t    kintsuki_read_range(kintsuki_t*, uint32_t addr, uint32_t len, uint8_t* out);
+uint32_t    kintsuki_write_range(kintsuki_t*, uint32_t addr, uint32_t len, const uint8_t* in_);
 
 // PPU memory (off-bus)
 uint8_t     kintsuki_vram_read (kintsuki_t*, uint32_t addr);
 void        kintsuki_vram_write(kintsuki_t*, uint32_t addr, uint8_t v);
+uint32_t    kintsuki_vram_read_range (kintsuki_t*, uint32_t addr, uint32_t len, uint8_t* out);
+uint32_t    kintsuki_vram_write_range(kintsuki_t*, uint32_t addr, uint32_t len, const uint8_t* in_);
 uint8_t     kintsuki_cgram_read (kintsuki_t*, uint32_t addr);
 void        kintsuki_cgram_write(kintsuki_t*, uint32_t addr, uint8_t v);
+uint32_t    kintsuki_cgram_read_range (kintsuki_t*, uint32_t addr, uint32_t len, uint8_t* out);
+uint32_t    kintsuki_cgram_write_range(kintsuki_t*, uint32_t addr, uint32_t len, const uint8_t* in_);
 uint8_t     kintsuki_oam_read (kintsuki_t*, uint32_t addr);
 void        kintsuki_oam_write(kintsuki_t*, uint32_t addr, uint8_t v);
+uint32_t    kintsuki_oam_read_range (kintsuki_t*, uint32_t addr, uint32_t len, uint8_t* out);
+uint32_t    kintsuki_oam_write_range(kintsuki_t*, uint32_t addr, uint32_t len, const uint8_t* in_);
 
 // Bulk dumps. One FFI hop for the whole region — way faster than looping
 // per-byte read for inspector views.

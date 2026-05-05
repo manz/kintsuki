@@ -124,14 +124,21 @@ _bind("kintsuki_rearm_cpu", None, [HANDLE])
 _bind("kintsuki_read_u8", c_uint8, [HANDLE, c_uint32])
 _bind("kintsuki_write_u8", None, [HANDLE, c_uint32, c_uint8])
 _bind("kintsuki_read_range", c_uint32, [HANDLE, c_uint32, c_uint32, POINTER(c_uint8)])
+_bind("kintsuki_write_range", c_uint32, [HANDLE, c_uint32, c_uint32, POINTER(c_uint8)])
 
 # PPU memory
 _bind("kintsuki_vram_read", c_uint8, [HANDLE, c_uint32])
 _bind("kintsuki_vram_write", None, [HANDLE, c_uint32, c_uint8])
+_bind("kintsuki_vram_read_range", c_uint32, [HANDLE, c_uint32, c_uint32, POINTER(c_uint8)])
+_bind("kintsuki_vram_write_range", c_uint32, [HANDLE, c_uint32, c_uint32, POINTER(c_uint8)])
 _bind("kintsuki_cgram_read", c_uint8, [HANDLE, c_uint32])
 _bind("kintsuki_cgram_write", None, [HANDLE, c_uint32, c_uint8])
+_bind("kintsuki_cgram_read_range", c_uint32, [HANDLE, c_uint32, c_uint32, POINTER(c_uint8)])
+_bind("kintsuki_cgram_write_range", c_uint32, [HANDLE, c_uint32, c_uint32, POINTER(c_uint8)])
 _bind("kintsuki_oam_read", c_uint8, [HANDLE, c_uint32])
 _bind("kintsuki_oam_write", None, [HANDLE, c_uint32, c_uint8])
+_bind("kintsuki_oam_read_range", c_uint32, [HANDLE, c_uint32, c_uint32, POINTER(c_uint8)])
+_bind("kintsuki_oam_write_range", c_uint32, [HANDLE, c_uint32, c_uint32, POINTER(c_uint8)])
 
 # CPU state
 _bind("kintsuki_get_state", None, [HANDLE, POINTER(CpuState)])

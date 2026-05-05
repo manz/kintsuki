@@ -76,8 +76,50 @@ uint32_t kintsuki_read_range(kintsuki_t* h, uint32_t addr, uint32_t len, uint8_t
   return len;
 }
 
+uint32_t kintsuki_write_range(kintsuki_t* h, uint32_t addr, uint32_t len, const uint8_t* in_) {
+  if(!h || !in_) return 0;
+  for(uint32_t i = 0; i < len; i++) h->program->memWrite(addr + i, in_[i]);
+  return len;
+}
+
 uint8_t kintsuki_vram_read(kintsuki_t* h, uint32_t addr)             { return h ? h->program->vramRead(addr)  : 0; }
 void    kintsuki_vram_write(kintsuki_t* h, uint32_t addr, uint8_t v) { if(h) h->program->vramWrite(addr, v); }
+
+uint32_t kintsuki_vram_read_range(kintsuki_t* h, uint32_t addr, uint32_t len, uint8_t* out) {
+  if(!h || !out) return 0;
+  for(uint32_t i = 0; i < len; i++) out[i] = h->program->vramRead(addr + i);
+  return len;
+}
+
+uint32_t kintsuki_vram_write_range(kintsuki_t* h, uint32_t addr, uint32_t len, const uint8_t* in_) {
+  if(!h || !in_) return 0;
+  for(uint32_t i = 0; i < len; i++) h->program->vramWrite(addr + i, in_[i]);
+  return len;
+}
+
+uint32_t kintsuki_cgram_read_range(kintsuki_t* h, uint32_t addr, uint32_t len, uint8_t* out) {
+  if(!h || !out) return 0;
+  for(uint32_t i = 0; i < len; i++) out[i] = h->program->cgramRead(addr + i);
+  return len;
+}
+
+uint32_t kintsuki_cgram_write_range(kintsuki_t* h, uint32_t addr, uint32_t len, const uint8_t* in_) {
+  if(!h || !in_) return 0;
+  for(uint32_t i = 0; i < len; i++) h->program->cgramWrite(addr + i, in_[i]);
+  return len;
+}
+
+uint32_t kintsuki_oam_read_range(kintsuki_t* h, uint32_t addr, uint32_t len, uint8_t* out) {
+  if(!h || !out) return 0;
+  for(uint32_t i = 0; i < len; i++) out[i] = h->program->oamRead(addr + i);
+  return len;
+}
+
+uint32_t kintsuki_oam_write_range(kintsuki_t* h, uint32_t addr, uint32_t len, const uint8_t* in_) {
+  if(!h || !in_) return 0;
+  for(uint32_t i = 0; i < len; i++) h->program->oamWrite(addr + i, in_[i]);
+  return len;
+}
 uint8_t kintsuki_cgram_read(kintsuki_t* h, uint32_t addr)            { return h ? h->program->cgramRead(addr) : 0; }
 void    kintsuki_cgram_write(kintsuki_t* h, uint32_t addr, uint8_t v){ if(h) h->program->cgramWrite(addr, v); }
 uint8_t kintsuki_oam_read(kintsuki_t* h, uint32_t addr)              { return h ? h->program->oamRead(addr)   : 0; }
