@@ -16,7 +16,11 @@ this test exercises the RING path end-to-end.
 
 from __future__ import annotations
 
-from kintsuki import Emu
+from pathlib import Path
+
+import pytest
+
+from kintsuki import Emu, annotate_trace
 
 
 def test_tracer_api_exists():
@@ -46,10 +50,12 @@ def test_tracer_ring_captures_executed_lines(assemble_rom):
     assert text, "tracer drained empty string — exec callback didn't fire?"
     lines = [ln for ln in text.splitlines() if ln.strip()]
     assert lines, "no non-empty trace lines"
-    # Every line should contain the PC at column 0 (6 hex digits) and at
-    # least the A: register marker. Mesen-style format.
-    for ln in lines[:5]:
-        assert ln[:6].strip(), f"line missing PC prefix: {ln!r}"
+    # Every full line carries the PC as `BB:AAAA` at column 0 and the
+    # A: register marker downstream. Skip the first entry — it can be a
+    # partial fragment when the ring evicted bytes mid-line.
+    for ln in lines[1:6]:
+        assert ln[:7].strip(), f"line missing PC prefix: {ln!r}"
+        assert ":" in ln[:7], f"line missing PB:PC marker: {ln!r}"
         assert "A:" in ln, f"line missing A register: {ln!r}"
 
 
@@ -81,3 +87,42 @@ def test_tracer_context_manager(assemble_rom):
         # After exit, tracer is stopped — drain returns empty / cleared.
         empty = emu.tracer_drain()
         assert empty == "", "tracer_drain after stop should return empty"
+
+
+def test_annotate_trace_pure():
+    """Pure-string helper: PC matches a label → header line gets injected
+    above; consecutive lines at the same PC don't repeat the header."""
+    text = (
+        "00:8000 lda #$01    ; A:00\n"
+        "00:8000 lda #$01    ; A:00\n"
+        "00:8002 sta $00     ; A:01\n"
+    )
+    out = annotate_trace(text, {0x008000: "reset", 0x008002: "store"})
+    assert "; --- reset ---" in out
+    assert "; --- store ---" in out
+    # Header for `reset` only appears once, not twice for the duplicate PC.
+    assert out.count("; --- reset ---") == 1
+
+
+def test_tracer_annotate_with_adbg(assemble_rom, tmp_path):
+    """End-to-end: load ROM with its .adbg, FILE-trace the reset path,
+    annotate the trace.log, verify a label header is spliced in.
+
+    FILE mode is used so ring eviction doesn't drop the reset entry once
+    the boot drops into its idle loop."""
+    rom = assemble_rom("test_ppu_state.s")
+    adbg = Path(str(rom) + ".adbg")
+    if not adbg.exists():
+        pytest.skip(f"missing .adbg next to {rom.name}")
+    log = tmp_path / "trace.log"
+    with Emu() as emu:
+        emu.load_rom(str(rom), adbg=adbg)
+        assert emu._labels, "label table empty after load_rom(adbg=...)"
+        emu.tracer_start(lo=0x008000, hi=0x0080FF, path=str(log))
+        emu.run_frames(1)
+        emu.tracer_stop()
+    annotated = annotate_trace(log.read_text(), emu._labels)
+    assert "; --- reset ---" in annotated, (
+        "expected `reset` label header in annotated trace; got:\n"
+        + "\n".join(annotated.splitlines()[:5])
+    )
