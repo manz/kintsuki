@@ -66,7 +66,16 @@ L PC.h = read(vector.w + 1);
 
 auto WDC65816::instructionStop() -> void {
   r.stp = true;
-  while(r.stp && !synchronizing()) {
+  // The original implementation looped on idle() until r.stp cleared,
+  // never returning to Thread::Enter. Under kintsuki that starves the
+  // host loop: scheduler.enter() never sees a frame boundary because
+  // the PPU is starved by the CPU/SMP libco ping-pong, and runFrames
+  // hangs forever. Doing one idle() and returning preserves the STP
+  // semantics (Thread::Enter immediately calls main() again, which
+  // re-checks r.stp via CPU::main and re-enters instructionStop) but
+  // gives the scheduler a chance to deliver the frame event between
+  // each idle, so the host can paint a halt overlay or reset.
+  if(r.stp && !synchronizing()) {
 L   idle();
   }
 }

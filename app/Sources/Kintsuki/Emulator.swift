@@ -76,7 +76,19 @@ final class Emulator: ObservableObject {
     private var handle: OpaquePointer?
     private var runTimer: Timer?
     private var lastFpsTime: Date = .now
-    private var framesSinceFpsTick: Int = 0
+    /// Snapshot of `kintsuki_frame_count` at the last fps tick. Diffing
+    /// against the live count gives the *actual* emulator throughput
+    /// (frames produced per wall second), not 1/tick-interval — which
+    /// stays pinned to 60Hz regardless of whether ares is making progress
+    /// (e.g. CPU is in STP, or runFrames is stuck synchronizing).
+    private var lastFpsFrameCount: UInt64 = 0
+    /// Re-entrancy guard for the run-loop tick. `Task { @MainActor }`
+    /// queues every Timer fire even if the previous tick is still inside
+    /// runFrames (slow path under STP / heavy DMA), and the queue piles
+    /// up faster than we drain it — the main-actor backlog beach-balls
+    /// the UI. Setting this to true while a tick is in flight makes
+    /// subsequent enqueues no-op until the current one returns.
+    private var ticking: Bool = false
 
     // ----- Rewind ---------------------------------------------------------
     /// Per-frame delta-compressed savestate ring. Capped at ~60s of
@@ -306,6 +318,13 @@ final class Emulator: ObservableObject {
 
     private func startRunLoop() {
         guard runTimer == nil else { return }
+        // Reset the FPS window so the first sample uses the post-load
+        // frame count, not stale values from a previous session that
+        // would either inflate or zero the first reading.
+        if let h = handle {
+            lastFpsFrameCount = kintsuki_frame_count(h)
+        }
+        lastFpsTime = .now
         // 60 Hz Timer is simpler than CADisplayLink for emulation pacing.
         // The MTKView runs its own display sync, so we just need to advance
         // the emulator at roughly the source frame rate.
@@ -329,21 +348,33 @@ final class Emulator: ObservableObject {
 
     private func tick() {
         guard running, let h = handle else { return }
-        // While the user is actively rewinding (held CMD+←), suspend
-        // forward emulation. Otherwise tick re-captures a frame between
-        // each key-repeat event and rewindOneFrame's pop-pop pattern
-        // ends up oscillating around the same point in time.
+        // Re-entrancy guard: a slow runFrames (heavy DMA, halted CPU,
+        // host hiccup) lets the next Timer fire enqueue another Task on
+        // the main actor before this one returns. Without this skip the
+        // backlog beach-balls the UI.
+        if ticking { return }
+        ticking = true
+        defer { ticking = false }
         if rewindHolding { return }
+        // Read CPU state cheaply before runFrames so we can short-circuit
+        // when the CPU is already halted — runFrames would otherwise spin
+        // a full frame's worth of cycles on STP for no progress.
+        var rawCpu = kintsuki_cpu_state_t()
+        kintsuki_get_state(h, &rawCpu)
+        if rawCpu.stp != 0 {
+            snapshotCpuState()
+            return
+        }
         kintsuki_run_frames(h, 1)
         captureRewindFrame()
         snapshotFramebuffer()
         snapshotCpuState()
-        framesSinceFpsTick += 1
         let now = Date.now
         let elapsed = now.timeIntervalSince(lastFpsTime)
         if elapsed >= 0.5 {
-            fps = Double(framesSinceFpsTick) / elapsed
-            framesSinceFpsTick = 0
+            let count = kintsuki_frame_count(h)
+            fps = Double(count - lastFpsFrameCount) / elapsed
+            lastFpsFrameCount = count
             lastFpsTime = now
         }
     }

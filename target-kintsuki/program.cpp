@@ -283,6 +283,12 @@ auto Program::runFrames(u32 n) -> void {
   u64 spinCap = u64(n) * 10'000'000ull;
   while(framesRendered < target && spin++ < spinCap) {
     SuperFamicom::system.run();
+    // If the CPU has executed STP, instructionStop sits in a tight
+    // libco wait loop with the SMP coroutine — PPU eventually gets
+    // starved and `framesRendered` never advances. Bail as soon as
+    // r.stp is observed so the host loop can react (paint the halt
+    // overlay, prompt for reset) instead of spinning the scheduler.
+    if(SuperFamicom::cpu.r.stp) break;
   }
 }
 
