@@ -71,9 +71,16 @@ final class Emulator: ObservableObject {
     /// The most recent framebuffer copied out of libkintsuki (RGBA, 0x00RRGGBB
     /// packed). Width/height refresh per frame. Surface is BGRA in memory
     /// (little-endian) so MTLPixelFormat.bgra8Unorm uploads without swizzle.
-    private(set) var framebuffer: Data = .init()
+    /// Storage is preallocated to the SNES hires upper bound so the per-tick
+    /// snapshot mutates in place rather than allocating a fresh ~545 KB Data
+    /// every frame (Allocations called this out as ~33 MB/s of churn).
+    private(set) var framebuffer: Data = Data(count: 564 * 478 * 4)
     private(set) var fbWidth: UInt32 = 0
     private(set) var fbHeight: UInt32 = 0
+    /// Reusable scratch for `kintsuki_save_state` to dodge per-frame Data
+    /// allocs while rewind capture is on. Resized only when ares' state
+    /// payload grows past what we've previously seen.
+    private var saveStateScratch = Data(count: 0)
 
     private var handle: OpaquePointer?
     private var runTimer: Timer?
@@ -969,7 +976,21 @@ final class Emulator: ObservableObject {
         var h2: UInt32 = 0
         guard let ptr = kintsuki_framebuffer(h, &w, &h2), w > 0, h2 > 0 else { return }
         let byteCount = Int(w) * Int(h2) * 4
-        framebuffer = Data(bytes: ptr, count: byteCount)
+        // Grow only if we underprovisioned at init — typical SNES hires
+        // output (564×478) lands inside the preallocated buffer so this
+        // path is dead code in practice.
+        if framebuffer.count < byteCount {
+            framebuffer = Data(count: byteCount)
+        }
+        // memcpy into the existing storage. CoW may force one extra copy
+        // the first time MetalRenderer is reading our prior snapshot; on
+        // the next tick the buffer is unique again so churn settles to
+        // occasional ~545 KB blips instead of 33 MB/s of fresh allocs.
+        framebuffer.withUnsafeMutableBytes { dest in
+            if let base = dest.baseAddress {
+                memcpy(base, ptr, byteCount)
+            }
+        }
         fbWidth = w
         fbHeight = h2
         lastFrameID &+= 1
