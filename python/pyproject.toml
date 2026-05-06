@@ -20,6 +20,9 @@ classifiers = [
     "Topic :: System :: Emulators",
 ]
 
+ [project.optional-dependencies]
+  visual = ["numpy>=1.26", "numba>=0.59", "Pillow>=10"]
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
