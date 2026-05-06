@@ -973,13 +973,6 @@ final class Emulator: ObservableObject {
         fbWidth = w
         fbHeight = h2
         lastFrameID &+= 1
-        if lastFrameID % 60 == 0 {
-            let sample = framebuffer.prefix(32).map { String(format: "%02X", $0) }.joined(separator: " ")
-            let nonzero = framebuffer.contains { $0 != 0 }
-            var s = kintsuki_cpu_state_t()
-            kintsuki_get_state(h, &s)
-            NSLog("kintsuki: fb#\(lastFrameID) sample=\(sample) nz=\(nonzero) PC=$\(String(format: "%06X", s.pc)) A=\(String(format: "%04X", s.a))")
-        }
     }
 
     // ----- Input ------------------------------------------------------------
