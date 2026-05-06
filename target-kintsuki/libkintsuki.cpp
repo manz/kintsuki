@@ -568,6 +568,43 @@ auto tracerAppendBytes(const char* s, uint32_t n) -> void {
 }
 }  // namespace
 
+// Resolve the static branch/call target for control-flow opcodes. Returns
+// 0xFFFFFFFF for non-control-flow or operand-indirect ops we can't statically
+// resolve (e.g. JMP (addr,X), JSR (X)).
+auto resolveControlFlowTarget(uint32_t pc) -> uint32_t {
+  auto& cpu = ares::SuperFamicom::cpu;
+  auto rd = [&](uint32_t a) -> uint8_t { return cpu.readDisassembler(a & 0xFFFFFF); };
+  uint8_t op = rd(pc);
+  uint32_t bank = pc & 0xFF0000;
+  switch(op) {
+    case 0x20:   // JSR abs
+    case 0x4C: { // JMP abs
+      uint32_t lo = rd(pc + 1), hi = rd(pc + 2);
+      return bank | ((hi << 8) | lo);
+    }
+    case 0x22:   // JSL abs long
+    case 0x5C: { // JMP abs long ("jml")
+      uint32_t lo = rd(pc + 1), hi = rd(pc + 2), bk = rd(pc + 3);
+      return ((bk << 16) | (hi << 8) | lo) & 0xFFFFFF;
+    }
+    case 0x10: case 0x30: case 0x50: case 0x70:  // BPL/BMI/BVC/BVS
+    case 0x80: case 0x90: case 0xB0:             // BRA/BCC/BCS
+    case 0xD0: case 0xF0: {                      // BNE/BEQ
+      int8_t off = (int8_t)rd(pc + 1);
+      uint16_t after = (uint16_t)((pc + 2) & 0xFFFF);
+      return bank | (uint16_t)(after + off);
+    }
+    case 0x82: { // BRL (long branch)
+      uint32_t lo = rd(pc + 1), hi = rd(pc + 2);
+      int16_t off = (int16_t)((hi << 8) | lo);
+      uint16_t after = (uint16_t)((pc + 3) & 0xFFFF);
+      return bank | (uint16_t)(after + off);
+    }
+    default:
+      return 0xFFFFFFFFu;
+  }
+}
+
 void tracerOnExec(uint32_t pc) {
   if(!g_tracer.active) return;
   if(pc < g_tracer.lo || pc > g_tracer.hi) return;
@@ -599,7 +636,21 @@ void tracerOnExec(uint32_t pc) {
   char pcbuf[12];
   std::snprintf(pcbuf, sizeof(pcbuf), "%02X:%04X ",
                 (pc >> 16) & 0xFF, pc & 0xFFFF);
-  nall::string line = nall::string(pcbuf, ins, "  ; ", ctx, "\n");
+  // Operand symbolication for JSR/JSL/JMP/Bxx: when the opcode at PC is a
+  // control-flow op AND its static target resolves to a known label, append
+  // ` → <name>` so the trace reads as an annotated control-flow log without
+  // any post-processing. Indirect/indexed jumps are skipped — their target
+  // depends on register values we'd need a full simulator to track.
+  char arrow[96]; arrow[0] = 0;
+  if(g_labels.byAddr.size() > 0) {
+    uint32_t tgt = resolveControlFlowTarget(pc);
+    if(tgt != 0xFFFFFFFFu) {
+      if(const char* n = g_labels.lookup(tgt)) {
+        std::snprintf(arrow, sizeof(arrow), " -> %s", n);
+      }
+    }
+  }
+  nall::string line = nall::string(pcbuf, ins, "  ; ", ctx, arrow, "\n");
   tracerAppendBytes((const char*)line.data(), (uint32_t)line.size());
 }
 

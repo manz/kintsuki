@@ -112,6 +112,40 @@ def test_tracer_native_label_injection(assemble_rom, tmp_path):
     )
 
 
+def test_tracer_resolves_control_flow_operands(assemble_rom, tmp_path):
+    """Trace lines for JSR/JSL/JMP/Bxx with a known target label get a
+    `-> name` suffix so the log reads like an annotated control-flow
+    transcript without further processing."""
+    rom = assemble_rom("test_callstack.s")
+    adbg = Path(str(rom) + ".adbg")
+    if not adbg.exists():
+        pytest.skip(f"missing .adbg next to {rom.name}")
+    log = tmp_path / "trace.log"
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        emu.load_adbg(adbg)
+        emu.tracer_start(lo=0x008000, hi=0x008300, path=str(log))
+        # Boot through JSL outer + JSR inner before STP fires; one frame
+        # is enough since the chain runs in <30 instructions.
+        for _ in range(5):
+            emu.run_frames(1)
+            if emu.get_state().stp:
+                break
+        emu.tracer_stop()
+    text = log.read_text()
+    assert "jsr.l" in text or "jsl" in text or "jsr" in text, (
+        "expected a JSR/JSL line in the trace; got:\n" + text[:400])
+    # `jsr.l outer` should be tagged with the outer label
+    assert " -> outer" in text, (
+        "expected JSL target operand to resolve to `outer`; got:\n"
+        + "\n".join(line for line in text.splitlines() if "jsr" in line.lower())[:400]
+    )
+    assert " -> inner" in text, (
+        "expected JSR target operand to resolve to `inner`; got:\n"
+        + "\n".join(line for line in text.splitlines() if "jsr" in line.lower())[:400]
+    )
+
+
 def test_lookup_label_roundtrip(assemble_rom):
     """``Emu.load_adbg`` + ``Emu.lookup_label`` resolve assembled symbols."""
     rom = assemble_rom("test_ppu_state.s")
