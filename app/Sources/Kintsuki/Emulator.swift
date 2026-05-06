@@ -68,19 +68,14 @@ final class Emulator: ObservableObject {
     /// hot-reload). Topmost frame first (deepest call).
     @Published private(set) var crashBacktrace: [BacktraceFrame] = []
 
-    /// The most recent framebuffer copied out of libkintsuki (RGBA, 0x00RRGGBB
-    /// packed). Width/height refresh per frame. Surface is BGRA in memory
-    /// (little-endian) so MTLPixelFormat.bgra8Unorm uploads without swizzle.
-    /// Storage is preallocated to the SNES hires upper bound so the per-tick
-    /// snapshot mutates in place rather than allocating a fresh ~545 KB Data
-    /// every frame (Allocations called this out as ~33 MB/s of churn).
-    private(set) var framebuffer: Data = Data(count: 564 * 478 * 4)
+    /// Effective framebuffer dimensions reported by ares last frame.
+    /// The pixel data lives inside libkintsuki and is exposed via
+    /// `withFramebufferPointer` — no per-tick Data copy on the hot path
+    /// (Allocations called the previous `Data(bytes:count:)` out as
+    /// ~33 MB/s of churn). Cold-path consumers (thumbnails) materialize
+    /// a Data on demand via `framebufferData()`.
     private(set) var fbWidth: UInt32 = 0
     private(set) var fbHeight: UInt32 = 0
-    /// Reusable scratch for `kintsuki_save_state` to dodge per-frame Data
-    /// allocs while rewind capture is on. Resized only when ares' state
-    /// payload grows past what we've previously seen.
-    private var saveStateScratch = Data(count: 0)
 
     private var handle: OpaquePointer?
     private var runTimer: Timer?
@@ -702,9 +697,10 @@ final class Emulator: ObservableObject {
         guard size > 0 else { return nil }
         var blob = Data(count: Int(size))
         blob.withUnsafeMutableBytes { _ = kintsuki_save_state(h, $0.baseAddress, size) }
-        let thumb = SaveStateThumbnail.png(fromBGRA: framebuffer,
-                                           width: Int(fbWidth), height: Int(fbHeight))
-            ?? Data()
+        let thumb = (framebufferData().flatMap {
+            SaveStateThumbnail.png(fromBGRA: $0,
+                                   width: Int(fbWidth), height: Int(fbHeight))
+        }) ?? Data()
         let entry = SaveStateEntry(romPath: rom.path,
                                    name: name.isEmpty ? defaultStateName() : name,
                                    blob: blob, thumbnailPNG: thumb)
@@ -780,8 +776,10 @@ final class Emulator: ObservableObject {
         guard size > 0 else { return nil }
         var blob = Data(count: Int(size))
         blob.withUnsafeMutableBytes { _ = kintsuki_save_state(h, $0.baseAddress, size) }
-        let thumb = SaveStateThumbnail.png(fromBGRA: framebuffer,
-                                           width: Int(fbWidth), height: Int(fbHeight)) ?? Data()
+        let thumb = (framebufferData().flatMap {
+            SaveStateThumbnail.png(fromBGRA: $0,
+                                   width: Int(fbWidth), height: Int(fbHeight))
+        }) ?? Data()
         let romPath = rom.path
         let slot = Self.autosaveSlotName
         let predicate = #Predicate<SaveStateEntry> { $0.romPath == romPath && $0.name == slot }
@@ -974,26 +972,35 @@ final class Emulator: ObservableObject {
         guard let h = handle else { return }
         var w: UInt32 = 0
         var h2: UInt32 = 0
-        guard let ptr = kintsuki_framebuffer(h, &w, &h2), w > 0, h2 > 0 else { return }
-        let byteCount = Int(w) * Int(h2) * 4
-        // Grow only if we underprovisioned at init — typical SNES hires
-        // output (564×478) lands inside the preallocated buffer so this
-        // path is dead code in practice.
-        if framebuffer.count < byteCount {
-            framebuffer = Data(count: byteCount)
-        }
-        // memcpy into the existing storage. CoW may force one extra copy
-        // the first time MetalRenderer is reading our prior snapshot; on
-        // the next tick the buffer is unique again so churn settles to
-        // occasional ~545 KB blips instead of 33 MB/s of fresh allocs.
-        framebuffer.withUnsafeMutableBytes { dest in
-            if let base = dest.baseAddress {
-                memcpy(base, ptr, byteCount)
-            }
-        }
+        guard kintsuki_framebuffer(h, &w, &h2) != nil, w > 0, h2 > 0 else { return }
         fbWidth = w
         fbHeight = h2
         lastFrameID &+= 1
+    }
+
+    /// Borrow the live emulator framebuffer for the duration of `body`.
+    /// Pointer is owned by libkintsuki and remains valid until the next
+    /// scheduler step (we run on the main actor so the renderer always
+    /// sees a consistent frame). Returns false when no frame is ready.
+    @discardableResult
+    func withFramebufferPointer<R>(_ body: (UnsafePointer<UInt32>, Int, Int) -> R) -> R? {
+        guard let h = handle else { return nil }
+        var w: UInt32 = 0
+        var h2: UInt32 = 0
+        guard let ptr = kintsuki_framebuffer(h, &w, &h2), w > 0, h2 > 0 else {
+            return nil
+        }
+        return body(ptr, Int(w), Int(h2))
+    }
+
+    /// Cold-path materialization for thumbnail / save-state consumers
+    /// that want an owned `Data` blob. Allocates per call — fine for
+    /// the once-per-savestate frequency, never call this from the
+    /// 60 Hz render loop.
+    func framebufferData() -> Data? {
+        withFramebufferPointer { ptr, w, h in
+            Data(bytes: ptr, count: w * h * 4)
+        }
     }
 
     // ----- Input ------------------------------------------------------------
