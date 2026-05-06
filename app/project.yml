@@ -22,6 +22,12 @@ settings:
     # this app isn't there yet — disable for both Debug and Release so
     # `instruments` against a Release build just works.
     ENABLE_HARDENED_RUNTIME: NO
+    # Keep symbols + dSYMs in Release so Instruments call trees show
+    # function names instead of raw addresses. Optimizer stays at -O.
+    DEBUG_INFORMATION_FORMAT: dwarf-with-dsym
+    DEPLOYMENT_POSTPROCESSING: NO
+    STRIP_INSTALLED_PRODUCT: NO
+    COPY_PHASE_STRIP: NO
 
 targets:
   Kintsuki:
@@ -121,6 +127,13 @@ targets:
           # Re-sign with the same identity Xcode uses for the .app so
           # the launching process and the loaded dylib share a Team ID
           # (Debug = "-", Release = "Apple Development:..." etc).
+          # Generate a sibling .dSYM for the embedded dylib so Instruments
+          # can symbolicate the libkintsuki call tree alongside the Swift
+          # app's own dSYM. cmake produces DWARF in-binary (-g) but no
+          # bundle; dsymutil extracts it for the profiler.
+          /usr/bin/dsymutil \
+             "$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH/libkintsuki.dylib" \
+             -o "$BUILT_PRODUCTS_DIR/libkintsuki.dylib.dSYM" || true
           IDENTITY="${EXPANDED_CODE_SIGN_IDENTITY:-${CODE_SIGN_IDENTITY:--}}"
           /usr/bin/codesign --force --sign "$IDENTITY" \
              "$TARGET_BUILD_DIR/$FRAMEWORKS_FOLDER_PATH/libkintsuki.dylib"
