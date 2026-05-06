@@ -126,6 +126,15 @@ final class Emulator: ObservableObject {
     /// Single concurrent worker preserves push order.
     private let rewindQueue = DispatchQueue(label: "net.ringum.kintsuki.rewind",
                                             qos: .userInitiated)
+    /// Backpressure for `rewindQueue`. Each frame's save_state blob is
+    /// ~200 KB; without a cap the producer (60 Hz tick) outpaced the
+    /// XOR+LZ4 worker and Allocations watched the resident set climb
+    /// past a gigabyte as pending closures pinned their captured
+    /// `Data`. Atomic counter compares against `kRewindQueueMax` —
+    /// when full, the new frame is dropped on the floor.
+    private nonisolated(unsafe) var rewindQueueDepth: Int = 0
+    private let rewindQueueDepthLock = NSLock()
+    private static let kRewindQueueMax = 4
     /// True while the user is actively scrubbing backwards (a CMD+←
     /// fired in the last `rewindHoldTimeout` seconds). While held, the
     /// run loop suspends forward emulation so `tick()` doesn't re-push
@@ -393,18 +402,44 @@ final class Emulator: ObservableObject {
     /// pay it. push order is preserved by the queue's serial nature.
     private func captureRewindFrame() {
         guard !rewinding, let h = handle else { return }
+        // Backpressure: skip the snapshot entirely when the worker
+        // queue is full. The serializer allocates ~200 KB of payload
+        // per frame; without this cap a hiccup in the worker pins
+        // dozens of those in pending closures and the resident set
+        // walks straight past a gigabyte.
+        rewindQueueDepthLock.lock()
+        if rewindQueueDepth >= Self.kRewindQueueMax {
+            rewindQueueDepthLock.unlock()
+            return
+        }
+        rewindQueueDepth += 1
+        rewindQueueDepthLock.unlock()
+
         let needed = kintsuki_save_state(h, nil, 0)
-        guard needed > 0 else { return }
+        guard needed > 0 else {
+            rewindQueueDepthLock.lock()
+            rewindQueueDepth -= 1
+            rewindQueueDepthLock.unlock()
+            return
+        }
         var blob = Data(count: Int(needed))
         let written = blob.withUnsafeMutableBytes { raw -> UInt32 in
             kintsuki_save_state(h, raw.baseAddress, UInt32(needed))
         }
-        guard written > 0 else { return }
+        guard written > 0 else {
+            rewindQueueDepthLock.lock()
+            rewindQueueDepth -= 1
+            rewindQueueDepthLock.unlock()
+            return
+        }
         blob.count = Int(written)
         rewindQueue.async { [weak self, blob] in
             guard let self else { return }
             self.rewindBuffer.push(blob)
             let n = self.rewindBuffer.count
+            self.rewindQueueDepthLock.lock()
+            self.rewindQueueDepth -= 1
+            self.rewindQueueDepthLock.unlock()
             DispatchQueue.main.async {
                 if self.rewindFrames != n { self.rewindFrames = n }
             }
