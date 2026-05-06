@@ -121,20 +121,6 @@ final class Emulator: ObservableObject {
     /// savestate without fighting menu shortcuts.
     private let escKeyCode: UInt16 = 0x35
     private var pauseKeyMonitor: Any?
-    /// Serial queue for rewind buffer ops — XOR + LZ4 compress costs
-    /// 1-2 ms per frame which we don't want on the run-loop thread.
-    /// Single concurrent worker preserves push order.
-    private let rewindQueue = DispatchQueue(label: "net.ringum.kintsuki.rewind",
-                                            qos: .userInitiated)
-    /// Backpressure for `rewindQueue`. Each frame's save_state blob is
-    /// ~200 KB; without a cap the producer (60 Hz tick) outpaced the
-    /// XOR+LZ4 worker and Allocations watched the resident set climb
-    /// past a gigabyte as pending closures pinned their captured
-    /// `Data`. Atomic counter compares against `kRewindQueueMax` —
-    /// when full, the new frame is dropped on the floor.
-    private nonisolated(unsafe) var rewindQueueDepth: Int = 0
-    private let rewindQueueDepthLock = NSLock()
-    private static let kRewindQueueMax = 4
     /// True while the user is actively scrubbing backwards (a CMD+←
     /// fired in the last `rewindHoldTimeout` seconds). While held, the
     /// run loop suspends forward emulation so `tick()` doesn't re-push
@@ -402,48 +388,20 @@ final class Emulator: ObservableObject {
     /// pay it. push order is preserved by the queue's serial nature.
     private func captureRewindFrame() {
         guard !rewinding, let h = handle else { return }
-        // Backpressure: skip the snapshot entirely when the worker
-        // queue is full. The serializer allocates ~200 KB of payload
-        // per frame; without this cap a hiccup in the worker pins
-        // dozens of those in pending closures and the resident set
-        // walks straight past a gigabyte.
-        rewindQueueDepthLock.lock()
-        if rewindQueueDepth >= Self.kRewindQueueMax {
-            rewindQueueDepthLock.unlock()
-            return
-        }
-        rewindQueueDepth += 1
-        rewindQueueDepthLock.unlock()
-
         let needed = kintsuki_save_state(h, nil, 0)
-        guard needed > 0 else {
-            rewindQueueDepthLock.lock()
-            rewindQueueDepth -= 1
-            rewindQueueDepthLock.unlock()
-            return
+        guard needed > 0 else { return }
+        // Producer-style push: ares writes the savestate straight into
+        // the rewind buffer's pre-allocated keyframe slot (or shared
+        // scratch for delta frames). No per-tick Data allocation, no
+        // queue + closure capture pinning blobs in flight — the prior
+        // path was the source of the multi-GB transient churn.
+        rewindBuffer.push(count: Int(needed)) { [h] dst in
+            guard let base = dst.baseAddress else { return 0 }
+            let written = kintsuki_save_state(h, base, UInt32(dst.count))
+            return Int(written)
         }
-        var blob = Data(count: Int(needed))
-        let written = blob.withUnsafeMutableBytes { raw -> UInt32 in
-            kintsuki_save_state(h, raw.baseAddress, UInt32(needed))
-        }
-        guard written > 0 else {
-            rewindQueueDepthLock.lock()
-            rewindQueueDepth -= 1
-            rewindQueueDepthLock.unlock()
-            return
-        }
-        blob.count = Int(written)
-        rewindQueue.async { [weak self, blob] in
-            guard let self else { return }
-            self.rewindBuffer.push(blob)
-            let n = self.rewindBuffer.count
-            self.rewindQueueDepthLock.lock()
-            self.rewindQueueDepth -= 1
-            self.rewindQueueDepthLock.unlock()
-            DispatchQueue.main.async {
-                if self.rewindFrames != n { self.rewindFrames = n }
-            }
-        }
+        let n = rewindBuffer.count
+        if rewindFrames != n { rewindFrames = n }
     }
 
     /// Pop the most-recent retained frame and load it. Returns true if
@@ -477,15 +435,12 @@ final class Emulator: ObservableObject {
         // discards the current state (already live in the emulator),
         // the next n step backward by n frames. If the buffer is
         // shallower than that, we land on the oldest frame retained.
-        let blob: Data? = rewindQueue.sync {
-            var lastPopped: Data?
-            for _ in 0..<(n + 1) {
-                guard let b = rewindBuffer.popLast() else { return lastPopped }
-                lastPopped = b
-            }
-            return lastPopped
+        var lastPopped: Data?
+        for _ in 0..<(n + 1) {
+            guard let b = rewindBuffer.popLast() else { break }
+            lastPopped = b
         }
-        guard let blob else {
+        guard let blob = lastPopped else {
             rewindFrames = rewindBuffer.count
             return false
         }
@@ -513,7 +468,7 @@ final class Emulator: ObservableObject {
 
     /// Drop every retained rewind frame (e.g., on ROM unload).
     func clearRewindBuffer() {
-        rewindQueue.sync { rewindBuffer.clear() }
+        rewindBuffer.clear()
         rewindFrames = 0
     }
 
