@@ -43,6 +43,9 @@ struct KintsukiApp: App {
                 Button("Reload ROM From Disk") { emulator.reloadROMFromDisk() }
                     .keyboardShortcut("r", modifiers: [.command, .shift])
                     .disabled(emulator.loadedROM == nil)
+                Button("Hot-Reload ROM (Keep State)") { emulator.hotReloadKeepingState() }
+                    .keyboardShortcut("r", modifiers: [.command, .option])
+                    .disabled(emulator.loadedROM == nil)
                 Button(emulator.running ? "Pause" : "Resume") {
                     emulator.togglePause()
                 }

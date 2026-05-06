@@ -71,6 +71,10 @@ auto WDC65816::instructionCallShort() -> void {
   PC.w--;
   push(PC.h);
 L push(PC.l);
+  // PC.w now points to JSR's last fetched byte (return-1); the JSR
+  // opcode itself sat 3 bytes earlier — that's the callsite address
+  // we report. PC.b stays bound to the instruction's bank.
+  if(callHook) callHook((PC.b << 16) | u16(PC.w - 2), (PC.b << 16) | W.w, 0);
   PC.w = W.w;
   idleJump();
 }
@@ -84,6 +88,8 @@ auto WDC65816::instructionCallLong() -> void {
   PC.w--;
   pushN(PC.h);
 L pushN(PC.l);
+  // Callsite = JSL opcode address = current PC - 3 (still in old bank).
+  if(callHook) callHook((PC.b << 16) | u16(PC.w - 3), V.d, 1);
   PC.d = V.d;
 E S.h = 0x01;
   idleJump();
@@ -126,6 +132,7 @@ auto WDC65816::instructionReturnShort() -> void {
 L idle();
   PC.w = W.w;
   PC.w++;
+  if(returnHook) returnHook(0);
   idleJump();
 }
 
@@ -138,5 +145,6 @@ L V.b = pullN();
   PC.d = V.d;
   PC.w++;
 E S.h = 0x01;
+  if(returnHook) returnHook(1);
   idleJump();
 }

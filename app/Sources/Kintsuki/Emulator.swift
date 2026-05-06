@@ -44,19 +44,55 @@ final class Emulator: ObservableObject {
         var b: UInt8 = 0, p: UInt8 = 0
         var pc: UInt32 = 0
         var e: Bool = false
+        var stp: Bool = false
+        var wai: Bool = false
     }
 
-    /// The most recent framebuffer copied out of libkintsuki (RGBA, 0x00RRGGBB
-    /// packed). Width/height refresh per frame. Surface is BGRA in memory
-    /// (little-endian) so MTLPixelFormat.bgra8Unorm uploads without swizzle.
-    private(set) var framebuffer: Data = .init()
+    /// True when the CPU executed STP and is sitting in instructionStop's
+    /// idle loop — the game has effectively crashed (or hit a manual halt).
+    /// Drives the "Game stopped" overlay in ContentView.
+    @Published private(set) var halted: Bool = false
+
+    struct BacktraceFrame: Identifiable, Equatable {
+        let id = UUID()
+        var callsite: UInt32   // 24-bit
+        var target:   UInt32   // 24-bit
+        var kind:     UInt8    // 0=JSR, 1=JSL
+        var label:    String?  // resolved via .adbg labels, nil if no match
+        var file:     String?  // resolved via .adbg LINES, nil if no entry
+        var line:     UInt32?  // 1-based, nil if no entry
+    }
+
+    /// Captured shadow callstack at the moment the CPU first transitioned
+    /// to halted=true. Cleared when the CPU resumes (after rearm, reset,
+    /// hot-reload). Topmost frame first (deepest call).
+    @Published private(set) var crashBacktrace: [BacktraceFrame] = []
+
+    /// Effective framebuffer dimensions reported by ares last frame.
+    /// The pixel data lives inside libkintsuki and is exposed via
+    /// `withFramebufferPointer` — no per-tick Data copy on the hot path
+    /// (Allocations called the previous `Data(bytes:count:)` out as
+    /// ~33 MB/s of churn). Cold-path consumers (thumbnails) materialize
+    /// a Data on demand via `framebufferData()`.
     private(set) var fbWidth: UInt32 = 0
     private(set) var fbHeight: UInt32 = 0
 
     private var handle: OpaquePointer?
     private var runTimer: Timer?
     private var lastFpsTime: Date = .now
-    private var framesSinceFpsTick: Int = 0
+    /// Snapshot of `kintsuki_frame_count` at the last fps tick. Diffing
+    /// against the live count gives the *actual* emulator throughput
+    /// (frames produced per wall second), not 1/tick-interval — which
+    /// stays pinned to 60Hz regardless of whether ares is making progress
+    /// (e.g. CPU is in STP, or runFrames is stuck synchronizing).
+    private var lastFpsFrameCount: UInt64 = 0
+    /// Re-entrancy guard for the run-loop tick. `Task { @MainActor }`
+    /// queues every Timer fire even if the previous tick is still inside
+    /// runFrames (slow path under STP / heavy DMA), and the queue piles
+    /// up faster than we drain it — the main-actor backlog beach-balls
+    /// the UI. Setting this to true while a tick is in flight makes
+    /// subsequent enqueues no-op until the current one returns.
+    private var ticking: Bool = false
 
     // ----- Rewind ---------------------------------------------------------
     /// Per-frame delta-compressed savestate ring. Capped at ~60s of
@@ -85,11 +121,6 @@ final class Emulator: ObservableObject {
     /// savestate without fighting menu shortcuts.
     private let escKeyCode: UInt16 = 0x35
     private var pauseKeyMonitor: Any?
-    /// Serial queue for rewind buffer ops — XOR + LZ4 compress costs
-    /// 1-2 ms per frame which we don't want on the run-loop thread.
-    /// Single concurrent worker preserves push order.
-    private let rewindQueue = DispatchQueue(label: "net.ringum.kintsuki.rewind",
-                                            qos: .userInitiated)
     /// True while the user is actively scrubbing backwards (a CMD+←
     /// fired in the last `rewindHoldTimeout` seconds). While held, the
     /// run loop suspends forward emulation so `tick()` doesn't re-push
@@ -123,6 +154,15 @@ final class Emulator: ObservableObject {
         if let last = recentROMs.first {
             DispatchQueue.main.async { [weak self] in
                 self?.loadROM(last)
+            }
+        }
+        // Persist the autosave slot whenever the app is on its way out
+        // so the next launch (or a hot-reload) can restore exactly here.
+        NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification,
+            object: nil, queue: .main) { [weak self] _ in
+            MainActor.assumeIsolated {
+                _ = self?.saveAutosave()
             }
         }
     }
@@ -212,6 +252,17 @@ final class Emulator: ObservableObject {
         // previous session.
         clearRewindBuffer()
         rememberRecent(url)
+        // Auto-load `<rom>.adbg` if it sits next to the cart so the halt
+        // overlay can resolve crash callstacks without an explicit user
+        // action. Failure (missing / unreadable) is silent — most ROMs
+        // ship without one.
+        let adbg = URL(fileURLWithPath: url.path + ".adbg")
+        if FileManager.default.fileExists(atPath: adbg.path) {
+            let ok = adbg.path.withCString { kintsuki_load_adbg(h, $0) }
+            NSLog("kintsuki: load_adbg \(adbg.lastPathComponent) -> \(ok != 0 ? "ok" : "failed")")
+        } else {
+            kintsuki_clear_adbg(h)
+        }
         startRunLoop()
     }
 
@@ -266,6 +317,13 @@ final class Emulator: ObservableObject {
 
     private func startRunLoop() {
         guard runTimer == nil else { return }
+        // Reset the FPS window so the first sample uses the post-load
+        // frame count, not stale values from a previous session that
+        // would either inflate or zero the first reading.
+        if let h = handle {
+            lastFpsFrameCount = kintsuki_frame_count(h)
+        }
+        lastFpsTime = .now
         // 60 Hz Timer is simpler than CADisplayLink for emulation pacing.
         // The MTKView runs its own display sync, so we just need to advance
         // the emulator at roughly the source frame rate.
@@ -289,21 +347,33 @@ final class Emulator: ObservableObject {
 
     private func tick() {
         guard running, let h = handle else { return }
-        // While the user is actively rewinding (held CMD+←), suspend
-        // forward emulation. Otherwise tick re-captures a frame between
-        // each key-repeat event and rewindOneFrame's pop-pop pattern
-        // ends up oscillating around the same point in time.
+        // Re-entrancy guard: a slow runFrames (heavy DMA, halted CPU,
+        // host hiccup) lets the next Timer fire enqueue another Task on
+        // the main actor before this one returns. Without this skip the
+        // backlog beach-balls the UI.
+        if ticking { return }
+        ticking = true
+        defer { ticking = false }
         if rewindHolding { return }
+        // Read CPU state cheaply before runFrames so we can short-circuit
+        // when the CPU is already halted — runFrames would otherwise spin
+        // a full frame's worth of cycles on STP for no progress.
+        var rawCpu = kintsuki_cpu_state_t()
+        kintsuki_get_state(h, &rawCpu)
+        if rawCpu.stp != 0 {
+            snapshotCpuState()
+            return
+        }
         kintsuki_run_frames(h, 1)
         captureRewindFrame()
         snapshotFramebuffer()
         snapshotCpuState()
-        framesSinceFpsTick += 1
         let now = Date.now
         let elapsed = now.timeIntervalSince(lastFpsTime)
         if elapsed >= 0.5 {
-            fps = Double(framesSinceFpsTick) / elapsed
-            framesSinceFpsTick = 0
+            let count = kintsuki_frame_count(h)
+            fps = Double(count - lastFpsFrameCount) / elapsed
+            lastFpsFrameCount = count
             lastFpsTime = now
         }
     }
@@ -320,20 +390,18 @@ final class Emulator: ObservableObject {
         guard !rewinding, let h = handle else { return }
         let needed = kintsuki_save_state(h, nil, 0)
         guard needed > 0 else { return }
-        var blob = Data(count: Int(needed))
-        let written = blob.withUnsafeMutableBytes { raw -> UInt32 in
-            kintsuki_save_state(h, raw.baseAddress, UInt32(needed))
+        // Producer-style push: ares writes the savestate straight into
+        // the rewind buffer's pre-allocated keyframe slot (or shared
+        // scratch for delta frames). No per-tick Data allocation, no
+        // queue + closure capture pinning blobs in flight — the prior
+        // path was the source of the multi-GB transient churn.
+        rewindBuffer.push(count: Int(needed)) { [h] dst in
+            guard let base = dst.baseAddress else { return 0 }
+            let written = kintsuki_save_state(h, base, UInt32(dst.count))
+            return Int(written)
         }
-        guard written > 0 else { return }
-        blob.count = Int(written)
-        rewindQueue.async { [weak self, blob] in
-            guard let self else { return }
-            self.rewindBuffer.push(blob)
-            let n = self.rewindBuffer.count
-            DispatchQueue.main.async {
-                if self.rewindFrames != n { self.rewindFrames = n }
-            }
-        }
+        let n = rewindBuffer.count
+        if rewindFrames != n { rewindFrames = n }
     }
 
     /// Pop the most-recent retained frame and load it. Returns true if
@@ -367,15 +435,12 @@ final class Emulator: ObservableObject {
         // discards the current state (already live in the emulator),
         // the next n step backward by n frames. If the buffer is
         // shallower than that, we land on the oldest frame retained.
-        let blob: Data? = rewindQueue.sync {
-            var lastPopped: Data?
-            for _ in 0..<(n + 1) {
-                guard let b = rewindBuffer.popLast() else { return lastPopped }
-                lastPopped = b
-            }
-            return lastPopped
+        var lastPopped: Data?
+        for _ in 0..<(n + 1) {
+            guard let b = rewindBuffer.popLast() else { break }
+            lastPopped = b
         }
-        guard let blob else {
+        guard let blob = lastPopped else {
             rewindFrames = rewindBuffer.count
             return false
         }
@@ -384,6 +449,11 @@ final class Emulator: ObservableObject {
         }
         rewindFrames = rewindBuffer.count
         if ok != 0 {
+            // ares doesn't serialize the libco coroutine RIP, so the
+            // next run_frames would otherwise wake the coroutine inside
+            // whatever wait loop it suspended in — rearm gives us a
+            // fresh coroutine that picks up the restored register file.
+            kintsuki_rearm_cpu(h)
             // The savestate restores PPU registers but not the live
             // render output buffer. Advance one frame so the PPU
             // re-paints the restored scene; otherwise the MTKView
@@ -398,7 +468,7 @@ final class Emulator: ObservableObject {
 
     /// Drop every retained rewind frame (e.g., on ROM unload).
     func clearRewindBuffer() {
-        rewindQueue.sync { rewindBuffer.clear() }
+        rewindBuffer.clear()
         rewindFrames = 0
     }
 
@@ -408,8 +478,52 @@ final class Emulator: ObservableObject {
         kintsuki_get_state(h, &raw)
         // Only republish on change so SwiftUI doesn't redraw 60Hz for nothing.
         let s = CpuState(a: raw.a, x: raw.x, y: raw.y, s: raw.s, d: raw.d,
-                         b: raw.b, p: raw.p, pc: raw.pc, e: raw.e != 0)
+                         b: raw.b, p: raw.p, pc: raw.pc, e: raw.e != 0,
+                         stp: raw.stp != 0, wai: raw.wai != 0)
         if s != cpuState { cpuState = s }
+        if halted != s.stp {
+            halted = s.stp
+            // Capture once on the rising edge of the halt — calling the
+            // C ABI is cheap but doing it 60Hz while the CPU is idle in
+            // STP would churn @Published for nothing.
+            crashBacktrace = s.stp ? captureBacktrace() : []
+        }
+    }
+
+    /// Snapshot the native shadow callstack and resolve each frame's
+    /// callsite via the loaded `.adbg` (if any). Top-of-stack last so the
+    /// SwiftUI rendering can iterate frame[0] = deepest call.
+    private func captureBacktrace(maxFrames: Int = 32) -> [BacktraceFrame] {
+        guard let h = handle else { return [] }
+        var buf = [kintsuki_call_frame_t](repeating: kintsuki_call_frame_t(),
+                                           count: maxFrames)
+        let n = buf.withUnsafeMutableBufferPointer { ptr -> UInt32 in
+            kintsuki_callstack_snapshot(h, ptr.baseAddress, UInt32(maxFrames))
+        }
+        var out: [BacktraceFrame] = []
+        out.reserveCapacity(Int(n))
+        for i in 0..<Int(n) {
+            let f = buf[i]
+            let label = kintsuki_lookup_label(h, f.callsite_pc).map {
+                String(cString: $0)
+            }
+            // Source-line lookup: use unsafe pointers since the C ABI
+            // takes optional out-params we want to fill.
+            var filePtr: UnsafePointer<CChar>? = nil
+            var lineNum: UInt32 = 0
+            var colNum: UInt16 = 0
+            let hasSrc = kintsuki_lookup_source(h, f.callsite_pc,
+                                                &filePtr, &lineNum, &colNum) != 0
+            let file = (hasSrc && filePtr != nil) ? String(cString: filePtr!) : nil
+            let line: UInt32? = hasSrc ? lineNum : nil
+            out.append(BacktraceFrame(callsite: f.callsite_pc,
+                                      target:   f.target_pc,
+                                      kind:     f.kind,
+                                      label:    label,
+                                      file:     file,
+                                      line:     line))
+        }
+        return out
     }
 
     // ----- Memory snapshot for hex/palette/tile views ---------------------
@@ -573,9 +687,10 @@ final class Emulator: ObservableObject {
         guard size > 0 else { return nil }
         var blob = Data(count: Int(size))
         blob.withUnsafeMutableBytes { _ = kintsuki_save_state(h, $0.baseAddress, size) }
-        let thumb = SaveStateThumbnail.png(fromBGRA: framebuffer,
-                                           width: Int(fbWidth), height: Int(fbHeight))
-            ?? Data()
+        let thumb = (framebufferData().flatMap {
+            SaveStateThumbnail.png(fromBGRA: $0,
+                                   width: Int(fbWidth), height: Int(fbHeight))
+        }) ?? Data()
         let entry = SaveStateEntry(romPath: rom.path,
                                    name: name.isEmpty ? defaultStateName() : name,
                                    blob: blob, thumbnailPNG: thumb)
@@ -590,7 +705,14 @@ final class Emulator: ObservableObject {
         let ok = entry.blob.withUnsafeBytes { raw in
             kintsuki_load_state(h, raw.baseAddress, UInt32(entry.blob.count))
         }
-        if ok != 0 { NSLog("kintsuki: loaded state \"\(entry.name)\"") }
+        guard ok != 0 else { return }
+        // ares serializes r.stp/r.wai + register file but not the libco
+        // coroutine RIP. Without rearming, the next scheduler tick wakes
+        // the coroutine inside whatever wait loop it happened to suspend
+        // in (commonly STP/WAI), so PC sits frozen even though registers
+        // were restored cleanly.
+        kintsuki_rearm_cpu(h)
+        NSLog("kintsuki: loaded state \"\(entry.name)\"")
     }
 
     /// Read a `.srm` file and push it into the cart's in-memory SRAM.
@@ -630,6 +752,100 @@ final class Emulator: ObservableObject {
         loadROM(url)
     }
 
+    /// Reserved name for the per-ROM autosave slot. Hidden from the
+    /// state browser and overwritten in place by `saveAutosave()`.
+    static let autosaveSlotName = "__autosave__"
+
+    /// Snapshot the running emulator into the per-ROM autosave slot,
+    /// overwriting whatever was there. Used both by app-quit and by
+    /// hot-reload to ferry state across a `kintsuki_load_rom` call.
+    @discardableResult
+    func saveAutosave() -> SaveStateEntry? {
+        guard let h = handle, let rom = loadedROM, let ctx = modelContext else { return nil }
+        let size = kintsuki_save_state(h, nil, 0)
+        guard size > 0 else { return nil }
+        var blob = Data(count: Int(size))
+        blob.withUnsafeMutableBytes { _ = kintsuki_save_state(h, $0.baseAddress, size) }
+        let thumb = (framebufferData().flatMap {
+            SaveStateThumbnail.png(fromBGRA: $0,
+                                   width: Int(fbWidth), height: Int(fbHeight))
+        }) ?? Data()
+        let romPath = rom.path
+        let slot = Self.autosaveSlotName
+        let predicate = #Predicate<SaveStateEntry> { $0.romPath == romPath && $0.name == slot }
+        let descriptor = FetchDescriptor<SaveStateEntry>(predicate: predicate)
+        if let existing = (try? ctx.fetch(descriptor))?.first {
+            existing.blob = blob
+            existing.thumbnailPNG = thumb
+            existing.createdAt = .now
+            do { try ctx.save() } catch { NSLog("kintsuki: autosave update failed: \(error)") }
+            return existing
+        }
+        let entry = SaveStateEntry(romPath: romPath, name: slot,
+                                   blob: blob, thumbnailPNG: thumb)
+        ctx.insert(entry)
+        do { try ctx.save() } catch { NSLog("kintsuki: autosave insert failed: \(error)") }
+        return entry
+    }
+
+    /// Restore the per-ROM autosave slot. Returns false when no such
+    /// slot exists or the load fails — caller can fall back to a fresh
+    /// boot in that case.
+    @discardableResult
+    func loadAutosave() -> Bool {
+        guard let rom = loadedROM, let ctx = modelContext else { return false }
+        let romPath = rom.path
+        let slot = Self.autosaveSlotName
+        let predicate = #Predicate<SaveStateEntry> { $0.romPath == romPath && $0.name == slot }
+        let descriptor = FetchDescriptor<SaveStateEntry>(predicate: predicate)
+        guard let entry = (try? ctx.fetch(descriptor))?.first else { return false }
+        loadState(entry)
+        return true
+    }
+
+    /// Reload the ROM from disk while preserving live emulator state
+    /// across the swap. Captures state in-memory (skipping SwiftData so
+    /// the externalStorage write/flush cycle can't race with the load)
+    /// and applies it after the cart re-boots. Only sane when the new
+    /// ROM is layout-compatible (typical iterative dev rebuild).
+    func hotReloadKeepingState() {
+        guard let url = loadedROM, let h = handle else { return }
+        let needed = kintsuki_save_state(h, nil, 0)
+        guard needed > 0 else {
+            NSLog("kintsuki: hot-reload aborted — save_state size=0")
+            return
+        }
+        var blob = Data(count: Int(needed))
+        let written = blob.withUnsafeMutableBytes { raw -> UInt32 in
+            kintsuki_save_state(h, raw.baseAddress, needed)
+        }
+        guard written == needed else {
+            NSLog("kintsuki: hot-reload aborted — save_state short write")
+            return
+        }
+        stopRunLoop()
+        let path = url.path
+        let ok = path.withCString { kintsuki_load_rom(h, $0) }
+        guard ok != 0 else {
+            NSLog("kintsuki: hot-reload load_rom failed at \(path)")
+            return
+        }
+        clearRewindBuffer()
+        let loaded = blob.withUnsafeBytes { raw -> Int32 in
+            kintsuki_load_state(h, raw.baseAddress, UInt32(blob.count))
+        }
+        if loaded == 0 {
+            NSLog("kintsuki: hot-reload load_state rejected blob — booting cold")
+        } else {
+            kintsuki_rearm_cpu(h)
+        }
+        snapshotFramebuffer()
+        snapshotCpuState()
+        running = true
+        startRunLoop()
+        NSLog("kintsuki: hot-reload complete")
+    }
+
     /// Export the current emulator state to `url` as a kintsuki blob.
     func exportStateToFile(url: URL) -> Bool {
         guard let h = handle else { return false }
@@ -664,6 +880,7 @@ final class Emulator: ObservableObject {
             NSLog("kintsuki: importState rejected blob from \(url.path)")
             return false
         }
+        kintsuki_rearm_cpu(h)
         kintsuki_run_frames(h, 1)
         snapshotFramebuffer()
         snapshotCpuState()
@@ -745,18 +962,34 @@ final class Emulator: ObservableObject {
         guard let h = handle else { return }
         var w: UInt32 = 0
         var h2: UInt32 = 0
-        guard let ptr = kintsuki_framebuffer(h, &w, &h2), w > 0, h2 > 0 else { return }
-        let byteCount = Int(w) * Int(h2) * 4
-        framebuffer = Data(bytes: ptr, count: byteCount)
+        guard kintsuki_framebuffer(h, &w, &h2) != nil, w > 0, h2 > 0 else { return }
         fbWidth = w
         fbHeight = h2
         lastFrameID &+= 1
-        if lastFrameID % 60 == 0 {
-            let sample = framebuffer.prefix(32).map { String(format: "%02X", $0) }.joined(separator: " ")
-            let nonzero = framebuffer.contains { $0 != 0 }
-            var s = kintsuki_cpu_state_t()
-            kintsuki_get_state(h, &s)
-            NSLog("kintsuki: fb#\(lastFrameID) sample=\(sample) nz=\(nonzero) PC=$\(String(format: "%06X", s.pc)) A=\(String(format: "%04X", s.a))")
+    }
+
+    /// Borrow the live emulator framebuffer for the duration of `body`.
+    /// Pointer is owned by libkintsuki and remains valid until the next
+    /// scheduler step (we run on the main actor so the renderer always
+    /// sees a consistent frame). Returns false when no frame is ready.
+    @discardableResult
+    func withFramebufferPointer<R>(_ body: (UnsafePointer<UInt32>, Int, Int) -> R) -> R? {
+        guard let h = handle else { return nil }
+        var w: UInt32 = 0
+        var h2: UInt32 = 0
+        guard let ptr = kintsuki_framebuffer(h, &w, &h2), w > 0, h2 > 0 else {
+            return nil
+        }
+        return body(ptr, Int(w), Int(h2))
+    }
+
+    /// Cold-path materialization for thumbnail / save-state consumers
+    /// that want an owned `Data` blob. Allocates per call — fine for
+    /// the once-per-savestate frequency, never call this from the
+    /// 60 Hz render loop.
+    func framebufferData() -> Data? {
+        withFramebufferPointer { ptr, w, h in
+            Data(bytes: ptr, count: w * h * 4)
         }
     }
 

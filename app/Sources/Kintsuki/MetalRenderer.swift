@@ -85,9 +85,18 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
 
     func draw(in view: MTKView) {
         guard let emu = emulator else { return }
-        let w = Int(emu.fbWidth)
-        let h = Int(emu.fbHeight)
-        uploadIfNeeded(width: w, height: h, data: emu.framebuffer)
+        // Read straight from the live ares framebuffer pointer instead
+        // of the previous Data(bytes:count:) snapshot — main-actor
+        // serialization keeps us mutually exclusive with the emulator
+        // tick that produces it. Dimensions come back through the same
+        // call so a mid-resize doesn't desync w/h vs the bytes.
+        var w = 0, h = 0
+        emu.withFramebufferPointer { ptr, pw, ph in
+            w = pw
+            h = ph
+            uploadIfNeeded(width: pw, height: ph,
+                           bytes: UnsafeRawPointer(ptr), bytesPerRow: pw * 4)
+        }
         drawTickCount += 1
         let logThis = drawTickCount % 120 == 0
 
@@ -134,12 +143,13 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         cmd.commit()
 
         if logThis {
-            NSLog("kintsuki: draw committed tick=\(drawTickCount) fb=\(w)x\(h) bytes=\(emu.framebuffer.count) tex=\(texture != nil) drawableSize=\(view.drawableSize)")
+            NSLog("kintsuki: draw committed tick=\(drawTickCount) fb=\(w)x\(h) tex=\(texture != nil) drawableSize=\(view.drawableSize)")
         }
     }
 
-    private func uploadIfNeeded(width: Int, height: Int, data: Data) {
-        guard width > 0, height > 0, data.count == width * height * 4 else { return }
+    private func uploadIfNeeded(width: Int, height: Int,
+                                bytes: UnsafeRawPointer, bytesPerRow: Int) {
+        guard width > 0, height > 0 else { return }
         if texture == nil || texW != width || texH != height {
             let desc = MTLTextureDescriptor.texture2DDescriptor(
                 pixelFormat: .bgra8Unorm,
@@ -152,11 +162,7 @@ final class MetalRenderer: NSObject, MTKViewDelegate {
         }
         guard let tex = texture else { return }
         let region = MTLRegionMake2D(0, 0, width, height)
-        data.withUnsafeBytes { raw in
-            if let base = raw.baseAddress {
-                tex.replace(region: region, mipmapLevel: 0,
-                            withBytes: base, bytesPerRow: width * 4)
-            }
-        }
+        tex.replace(region: region, mipmapLevel: 0,
+                    withBytes: bytes, bytesPerRow: bytesPerRow)
     }
 }

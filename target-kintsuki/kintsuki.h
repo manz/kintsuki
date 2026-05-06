@@ -167,6 +167,45 @@ int         kintsuki_add_callback(kintsuki_t*, int kind, uint32_t lo, uint32_t h
                                   kintsuki_cb_t fn, void* userdata);
 void        kintsuki_remove_callback(kintsuki_t*, int kind, int id);
 
+// ---- Shadow callstack ----------------------------------------------------
+// Maintained transparently by the WDC65816 JSR/JSL/RTS/RTL hooks. Frames
+// stay live across `kintsuki_run_*` calls and are explicitly cleared by
+// `kintsuki_callstack_clear` (and implicitly by `kintsuki_load_state` /
+// `kintsuki_rearm_cpu`, since both invalidate the live call chain).
+typedef struct {
+  uint32_t callsite_pc;   // 24-bit; address of the JSR/JSL opcode itself
+  uint32_t target_pc;     // 24-bit; address jumped to
+  uint8_t  kind;          // 0=JSR, 1=JSL
+} kintsuki_call_frame_t;
+
+// Snapshot the shadow callstack into `out` (deepest frame first). Returns
+// number of frames actually written (min of `cap` and current depth).
+uint32_t kintsuki_callstack_snapshot(kintsuki_t*,
+                                     kintsuki_call_frame_t* out,
+                                     uint32_t cap);
+void     kintsuki_callstack_clear(kintsuki_t*);
+
+// ---- a816 .adbg label table ---------------------------------------------
+// LABEL-only loader (constants/aliases ignored). Returns 1 on success,
+// 0 on missing file / bad magic / unsupported version. Replaces the
+// previously-loaded table if any.
+int          kintsuki_load_adbg(kintsuki_t*, const char* path);
+void         kintsuki_clear_adbg(kintsuki_t*);
+// O(1) lookup. Returned pointer is valid until the next load_adbg /
+// clear_adbg / destroy. NULL if no label is bound at `addr` or no .adbg
+// is loaded. `addr` is masked to 24 bits.
+const char*  kintsuki_lookup_label(kintsuki_t*, uint32_t addr);
+
+// Source-line lookup. Returns 1 + fills out_* when the loaded .adbg has
+// a LINES entry covering `addr` (last instruction emitted up to that
+// address). Returns 0 + leaves outputs untouched otherwise. The
+// `out_file` pointer follows the same lifetime rules as
+// `kintsuki_lookup_label`. Pass NULL for any output you don't need.
+int          kintsuki_lookup_source(kintsuki_t*, uint32_t addr,
+                                    const char** out_file,
+                                    uint32_t* out_line,
+                                    uint16_t* out_column);
+
 // Formatted execution tracer. Wraps an exec callback that disassembles
 // the instruction at PC + dumps CPU registers, producing one Mesen-
 // style line per exec event in [lo,hi]. Single tracer per emulator —

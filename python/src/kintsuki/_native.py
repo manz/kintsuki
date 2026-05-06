@@ -145,6 +145,27 @@ _bind("kintsuki_get_state", None, [HANDLE, POINTER(CpuState)])
 _bind("kintsuki_set_state", None, [HANDLE, POINTER(CpuState)])
 
 
+# Shadow callstack — frames pushed/popped natively by the WDC65816 hooks.
+class CallFrame(Structure):
+    _fields_ = [
+        ("callsite_pc", c_uint32),
+        ("target_pc",   c_uint32),
+        ("kind",        c_uint8),
+    ]
+
+
+_bind("kintsuki_callstack_snapshot", c_uint32,
+      [HANDLE, POINTER(CallFrame), c_uint32])
+_bind("kintsuki_callstack_clear", None, [HANDLE])
+
+# .adbg label table.
+_bind("kintsuki_load_adbg",     c_int,    [HANDLE, c_char_p])
+_bind("kintsuki_clear_adbg",    None,     [HANDLE])
+_bind("kintsuki_lookup_label",  c_char_p, [HANDLE, c_uint32])
+_bind("kintsuki_lookup_source", c_int,
+      [HANDLE, c_uint32, POINTER(c_char_p), POINTER(c_uint32), POINTER(c_uint16)])
+
+
 # PPU/DMA snapshot. Layout must match `kintsuki_ppu_state_t` in
 # target-kintsuki/kintsuki.h. ctypes lays fields out in declaration order
 # with platform-default alignment; matches the C struct so a single read
