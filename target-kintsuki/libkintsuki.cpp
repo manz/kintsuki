@@ -6,6 +6,7 @@
 
 #include "program.hpp"
 #include "kintsuki.h"
+#include "adbg.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -13,6 +14,7 @@
 #include <memory>
 #include <string>
 #include <vector>
+#include <deque>
 
 // kintsuki test-harness bail flag: defined in ares/sfc/system/system.cpp,
 // read+cleared from cpu.cpp before each instruction. Declared here at
@@ -20,6 +22,33 @@
 namespace ares::SuperFamicom {
   extern volatile bool kintsukiBailRequested;
 }
+
+// ---- Shadow callstack + .adbg label table -------------------------------
+// File-scope (C++ linkage) so they can be referenced from both the C ABI
+// wrappers and the in-file anonymous-namespace tracer code below.
+namespace {
+constexpr size_t kCallstackCap = 256;
+std::deque<kintsuki_call_frame_t> g_callstack;
+kintsuki::AdbgLabels g_labels;
+// Last label string emitted by the tracer as a `; --- name ---\n` header.
+// Compared by pointer (AdbgLabels storage owns stable const char*). Reset
+// to nullptr on tracer_start, load_adbg, clear_adbg, destroy.
+const char* g_tracer_last_label = nullptr;
+
+void cOnCall(uint32_t callsite_pc, uint32_t target_pc, uint8_t kind) {
+  if(g_callstack.size() >= kCallstackCap) g_callstack.pop_front();
+  kintsuki_call_frame_t f{};
+  f.callsite_pc = callsite_pc & 0xFFFFFF;
+  f.target_pc   = target_pc   & 0xFFFFFF;
+  f.kind        = kind;
+  g_callstack.push_back(f);
+}
+
+void cOnReturn(uint8_t kind) {
+  (void)kind;
+  if(!g_callstack.empty()) g_callstack.pop_back();
+}
+}  // namespace
 
 extern "C" {
 
@@ -38,6 +67,12 @@ kintsuki_t* kintsuki_create(void) {
   h->program = std::make_unique<Program>();
   kintsukiProgram = h->program.get();
   g_handle = h;
+  // Wire the call/return hooks now and leave them on for the handle's
+  // lifetime — non-debug builds that never inspect the callstack pay a
+  // single null-check per JSR/RTS, identical to execHook's pattern.
+  ares::callHook   = &cOnCall;
+  ares::returnHook = &cOnReturn;
+  g_callstack.clear();
   return h;
 }
 
@@ -50,6 +85,11 @@ void kintsuki_destroy(kintsuki_t* h) {
   ares::SuperFamicom::execHook = nullptr;
   ares::SuperFamicom::memReadHook = nullptr;
   ares::SuperFamicom::memWriteHook = nullptr;
+  ares::callHook = nullptr;
+  ares::returnHook = nullptr;
+  g_callstack.clear();
+  g_labels.clear();
+  g_tracer_last_label = nullptr;
   delete h;
   g_handle = nullptr;
   kintsukiProgram = nullptr;
@@ -59,12 +99,17 @@ int kintsuki_load_rom(kintsuki_t* h, const char* path) {
   if(!h) return 0;
   if(!h->program->loadRom(path)) return 0;
   if(!h->program->bootRom()) return 0;
+  // Fresh cart = fresh call chain; previous run's frames are stale.
+  g_callstack.clear();
   return 1;
 }
 
 void kintsuki_reset(kintsuki_t* h) {
   if(!h) return;
   h->program->softReset();
+  // Reset wipes the live timeline; any retained frames describe a
+  // call chain that no longer exists in the just-rebooted CPU.
+  g_callstack.clear();
 }
 
 void kintsuki_set_srm_sidecar(kintsuki_t* h, int enable) {
@@ -329,7 +374,12 @@ uint32_t kintsuki_save_state(kintsuki_t* h, void* buf, uint32_t cap) {
 
 int kintsuki_load_state(kintsuki_t* h, const void* buf, uint32_t len) {
   if(!h || !buf) return 0;
-  return h->program->loadStateBlob((const uint8_t*)buf, len) ? 1 : 0;
+  if(!h->program->loadStateBlob((const uint8_t*)buf, len)) return 0;
+  // Live call chain belongs to the pre-load run; the new state is a
+  // different point in time, so any future RTS would otherwise pop the
+  // stale frame and report bogus callsites.
+  g_callstack.clear();
+  return 1;
 }
 
 const uint32_t* kintsuki_framebuffer(kintsuki_t* h, uint32_t* out_w, uint32_t* out_h) {
@@ -494,6 +544,7 @@ struct Tracer {
 };
 Tracer g_tracer;
 
+
 auto tracerAppendBytes(const char* s, uint32_t n) -> void {
   if(g_tracer.file_mode) {
     if(g_tracer.fp) std::fwrite(s, 1, n, g_tracer.fp);
@@ -522,9 +573,60 @@ auto tracerAppendBytes(const char* s, uint32_t n) -> void {
 }
 }  // namespace
 
+// Resolve the static branch/call target for control-flow opcodes. Returns
+// 0xFFFFFFFF for non-control-flow or operand-indirect ops we can't statically
+// resolve (e.g. JMP (addr,X), JSR (X)).
+auto resolveControlFlowTarget(uint32_t pc) -> uint32_t {
+  auto& cpu = ares::SuperFamicom::cpu;
+  auto rd = [&](uint32_t a) -> uint8_t { return cpu.readDisassembler(a & 0xFFFFFF); };
+  uint8_t op = rd(pc);
+  uint32_t bank = pc & 0xFF0000;
+  switch(op) {
+    case 0x20:   // JSR abs
+    case 0x4C: { // JMP abs
+      uint32_t lo = rd(pc + 1), hi = rd(pc + 2);
+      return bank | ((hi << 8) | lo);
+    }
+    case 0x22:   // JSL abs long
+    case 0x5C: { // JMP abs long ("jml")
+      uint32_t lo = rd(pc + 1), hi = rd(pc + 2), bk = rd(pc + 3);
+      return ((bk << 16) | (hi << 8) | lo) & 0xFFFFFF;
+    }
+    case 0x10: case 0x30: case 0x50: case 0x70:  // BPL/BMI/BVC/BVS
+    case 0x80: case 0x90: case 0xB0:             // BRA/BCC/BCS
+    case 0xD0: case 0xF0: {                      // BNE/BEQ
+      int8_t off = (int8_t)rd(pc + 1);
+      uint16_t after = (uint16_t)((pc + 2) & 0xFFFF);
+      return bank | (uint16_t)(after + off);
+    }
+    case 0x82: { // BRL (long branch)
+      uint32_t lo = rd(pc + 1), hi = rd(pc + 2);
+      int16_t off = (int16_t)((hi << 8) | lo);
+      uint16_t after = (uint16_t)((pc + 3) & 0xFFFF);
+      return bank | (uint16_t)(after + off);
+    }
+    default:
+      return 0xFFFFFFFFu;
+  }
+}
+
 void tracerOnExec(uint32_t pc) {
   if(!g_tracer.active) return;
   if(pc < g_tracer.lo || pc > g_tracer.hi) return;
+
+  // .adbg label header. Emitted only when the current PC sits at a known
+  // label and that label differs from the last one we annotated, so a
+  // tight loop at the same label doesn't drown the trace in headers.
+  if(const char* name = g_labels.lookup(pc)) {
+    if(name != g_tracer_last_label) {
+      char hdr[256];
+      int hn = std::snprintf(hdr, sizeof(hdr), "; --- %s ---\n", name);
+      if(hn > 0) tracerAppendBytes(hdr, (uint32_t)hn);
+      g_tracer_last_label = name;
+    }
+  } else {
+    g_tracer_last_label = nullptr;
+  }
 
   // ares::WDC65816 helpers: disassembleInstruction() returns the formatted
   // operand line for the current PC (already padded). disassembleContext()
@@ -533,15 +635,27 @@ void tracerOnExec(uint32_t pc) {
   auto& cpu = ares::SuperFamicom::cpu;
   nall::string ins = cpu.disassembleInstruction();
   nall::string ctx = cpu.disassembleContext({});
-  // Prefix the line with the executing PC so post-processors (e.g. .adbg
-  // label annotation) can recover it without parsing nall's varied bracket
-  // formatting (operand brackets only appear for memory-touching opcodes).
-  // Format BB:AAAA so PB jumps stand out — when PC goes wild we land in
-  // bank $05/etc and the bank is the only signal we left expected territory.
+  // Prefix the line with the executing PC so the bank stands out — when
+  // PC goes wild we land in bank $05/etc and PB is the only signal we
+  // left expected territory.
   char pcbuf[12];
   std::snprintf(pcbuf, sizeof(pcbuf), "%02X:%04X ",
                 (pc >> 16) & 0xFF, pc & 0xFFFF);
-  nall::string line = nall::string(pcbuf, ins, "  ; ", ctx, "\n");
+  // Operand symbolication for JSR/JSL/JMP/Bxx: when the opcode at PC is a
+  // control-flow op AND its static target resolves to a known label, append
+  // ` → <name>` so the trace reads as an annotated control-flow log without
+  // any post-processing. Indirect/indexed jumps are skipped — their target
+  // depends on register values we'd need a full simulator to track.
+  char arrow[96]; arrow[0] = 0;
+  if(g_labels.byAddr.size() > 0) {
+    uint32_t tgt = resolveControlFlowTarget(pc);
+    if(tgt != 0xFFFFFFFFu) {
+      if(const char* n = g_labels.lookup(tgt)) {
+        std::snprintf(arrow, sizeof(arrow), " -> %s", n);
+      }
+    }
+  }
+  nall::string line = nall::string(pcbuf, ins, "  ; ", ctx, arrow, "\n");
   tracerAppendBytes((const char*)line.data(), (uint32_t)line.size());
 }
 
@@ -650,6 +764,10 @@ void kintsuki_rearm_cpu(kintsuki_t* h) {
   ares::SuperFamicom::cpu.r.stp = false;
   ares::SuperFamicom::cpu.r.wai = false;
   ares::SuperFamicom::cpu.clearPendingInterrupts();
+  // Same reasoning as load_state: the rebuilt coroutine starts from
+  // scratch; any frames left over describe a call chain that no longer
+  // exists in the now-discarded host stack.
+  g_callstack.clear();
 }
 
 int kintsuki_run_until(kintsuki_t* h, uint32_t target_pc, uint32_t max_frames) {
@@ -667,6 +785,44 @@ int kintsuki_run_until(kintsuki_t* h, uint32_t target_pc, uint32_t max_frames) {
   g_savedHook = nullptr;
   ares::SuperFamicom::kintsukiBailRequested = false;
   return g_runUntilHit ? 1 : 0;
+}
+
+// ---- Shadow callstack + .adbg C ABI -------------------------------------
+
+uint32_t kintsuki_callstack_snapshot(kintsuki_t* h,
+                                     kintsuki_call_frame_t* out,
+                                     uint32_t cap) {
+  if(!h || !out || cap == 0) return 0;
+  uint32_t depth = (uint32_t)g_callstack.size();
+  uint32_t n = depth < cap ? depth : cap;
+  // Caller wants deepest frame first → last pushed = top of `out`.
+  // g_callstack is FIFO with newest at back, so emit from front.
+  for(uint32_t i = 0; i < n; i++) out[i] = g_callstack[i];
+  return n;
+}
+
+void kintsuki_callstack_clear(kintsuki_t* h) {
+  if(!h) return;
+  g_callstack.clear();
+}
+
+int kintsuki_load_adbg(kintsuki_t* h, const char* path) {
+  if(!h || !path) return 0;
+  // Reset the tracer's last-emitted-label memo since string pointers are
+  // about to be invalidated by the AdbgLabels::clear() inside load().
+  g_tracer_last_label = nullptr;
+  return g_labels.load(path) ? 1 : 0;
+}
+
+void kintsuki_clear_adbg(kintsuki_t* h) {
+  if(!h) return;
+  g_labels.clear();
+  g_tracer_last_label = nullptr;
+}
+
+const char* kintsuki_lookup_label(kintsuki_t* h, uint32_t addr) {
+  if(!h) return nullptr;
+  return g_labels.lookup(addr);
 }
 
 }  // extern "C"

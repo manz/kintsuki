@@ -3,6 +3,9 @@
 
 namespace ares {
 
+CallHook   callHook   = nullptr;
+ReturnHook returnHook = nullptr;
+
 #include "registers.hpp"
 #include "memory.cpp"
 #include "algorithms.cpp"

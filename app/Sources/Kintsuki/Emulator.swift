@@ -53,6 +53,19 @@ final class Emulator: ObservableObject {
     /// Drives the "Game stopped" overlay in ContentView.
     @Published private(set) var halted: Bool = false
 
+    struct BacktraceFrame: Identifiable, Equatable {
+        let id = UUID()
+        var callsite: UInt32   // 24-bit
+        var target:   UInt32   // 24-bit
+        var kind:     UInt8    // 0=JSR, 1=JSL
+        var label:    String?  // resolved via .adbg, nil if no match
+    }
+
+    /// Captured shadow callstack at the moment the CPU first transitioned
+    /// to halted=true. Cleared when the CPU resumes (after rearm, reset,
+    /// hot-reload). Topmost frame first (deepest call).
+    @Published private(set) var crashBacktrace: [BacktraceFrame] = []
+
     /// The most recent framebuffer copied out of libkintsuki (RGBA, 0x00RRGGBB
     /// packed). Width/height refresh per frame. Surface is BGRA in memory
     /// (little-endian) so MTLPixelFormat.bgra8Unorm uploads without swizzle.
@@ -63,7 +76,19 @@ final class Emulator: ObservableObject {
     private var handle: OpaquePointer?
     private var runTimer: Timer?
     private var lastFpsTime: Date = .now
-    private var framesSinceFpsTick: Int = 0
+    /// Snapshot of `kintsuki_frame_count` at the last fps tick. Diffing
+    /// against the live count gives the *actual* emulator throughput
+    /// (frames produced per wall second), not 1/tick-interval — which
+    /// stays pinned to 60Hz regardless of whether ares is making progress
+    /// (e.g. CPU is in STP, or runFrames is stuck synchronizing).
+    private var lastFpsFrameCount: UInt64 = 0
+    /// Re-entrancy guard for the run-loop tick. `Task { @MainActor }`
+    /// queues every Timer fire even if the previous tick is still inside
+    /// runFrames (slow path under STP / heavy DMA), and the queue piles
+    /// up faster than we drain it — the main-actor backlog beach-balls
+    /// the UI. Setting this to true while a tick is in flight makes
+    /// subsequent enqueues no-op until the current one returns.
+    private var ticking: Bool = false
 
     // ----- Rewind ---------------------------------------------------------
     /// Per-frame delta-compressed savestate ring. Capped at ~60s of
@@ -228,6 +253,17 @@ final class Emulator: ObservableObject {
         // previous session.
         clearRewindBuffer()
         rememberRecent(url)
+        // Auto-load `<rom>.adbg` if it sits next to the cart so the halt
+        // overlay can resolve crash callstacks without an explicit user
+        // action. Failure (missing / unreadable) is silent — most ROMs
+        // ship without one.
+        let adbg = URL(fileURLWithPath: url.path + ".adbg")
+        if FileManager.default.fileExists(atPath: adbg.path) {
+            let ok = adbg.path.withCString { kintsuki_load_adbg(h, $0) }
+            NSLog("kintsuki: load_adbg \(adbg.lastPathComponent) -> \(ok != 0 ? "ok" : "failed")")
+        } else {
+            kintsuki_clear_adbg(h)
+        }
         startRunLoop()
     }
 
@@ -282,6 +318,13 @@ final class Emulator: ObservableObject {
 
     private func startRunLoop() {
         guard runTimer == nil else { return }
+        // Reset the FPS window so the first sample uses the post-load
+        // frame count, not stale values from a previous session that
+        // would either inflate or zero the first reading.
+        if let h = handle {
+            lastFpsFrameCount = kintsuki_frame_count(h)
+        }
+        lastFpsTime = .now
         // 60 Hz Timer is simpler than CADisplayLink for emulation pacing.
         // The MTKView runs its own display sync, so we just need to advance
         // the emulator at roughly the source frame rate.
@@ -305,21 +348,33 @@ final class Emulator: ObservableObject {
 
     private func tick() {
         guard running, let h = handle else { return }
-        // While the user is actively rewinding (held CMD+←), suspend
-        // forward emulation. Otherwise tick re-captures a frame between
-        // each key-repeat event and rewindOneFrame's pop-pop pattern
-        // ends up oscillating around the same point in time.
+        // Re-entrancy guard: a slow runFrames (heavy DMA, halted CPU,
+        // host hiccup) lets the next Timer fire enqueue another Task on
+        // the main actor before this one returns. Without this skip the
+        // backlog beach-balls the UI.
+        if ticking { return }
+        ticking = true
+        defer { ticking = false }
         if rewindHolding { return }
+        // Read CPU state cheaply before runFrames so we can short-circuit
+        // when the CPU is already halted — runFrames would otherwise spin
+        // a full frame's worth of cycles on STP for no progress.
+        var rawCpu = kintsuki_cpu_state_t()
+        kintsuki_get_state(h, &rawCpu)
+        if rawCpu.stp != 0 {
+            snapshotCpuState()
+            return
+        }
         kintsuki_run_frames(h, 1)
         captureRewindFrame()
         snapshotFramebuffer()
         snapshotCpuState()
-        framesSinceFpsTick += 1
         let now = Date.now
         let elapsed = now.timeIntervalSince(lastFpsTime)
         if elapsed >= 0.5 {
-            fps = Double(framesSinceFpsTick) / elapsed
-            framesSinceFpsTick = 0
+            let count = kintsuki_frame_count(h)
+            fps = Double(count - lastFpsFrameCount) / elapsed
+            lastFpsFrameCount = count
             lastFpsTime = now
         }
     }
@@ -432,7 +487,38 @@ final class Emulator: ObservableObject {
                          b: raw.b, p: raw.p, pc: raw.pc, e: raw.e != 0,
                          stp: raw.stp != 0, wai: raw.wai != 0)
         if s != cpuState { cpuState = s }
-        if halted != s.stp { halted = s.stp }
+        if halted != s.stp {
+            halted = s.stp
+            // Capture once on the rising edge of the halt — calling the
+            // C ABI is cheap but doing it 60Hz while the CPU is idle in
+            // STP would churn @Published for nothing.
+            crashBacktrace = s.stp ? captureBacktrace() : []
+        }
+    }
+
+    /// Snapshot the native shadow callstack and resolve each frame's
+    /// callsite via the loaded `.adbg` (if any). Top-of-stack last so the
+    /// SwiftUI rendering can iterate frame[0] = deepest call.
+    private func captureBacktrace(maxFrames: Int = 32) -> [BacktraceFrame] {
+        guard let h = handle else { return [] }
+        var buf = [kintsuki_call_frame_t](repeating: kintsuki_call_frame_t(),
+                                           count: maxFrames)
+        let n = buf.withUnsafeMutableBufferPointer { ptr -> UInt32 in
+            kintsuki_callstack_snapshot(h, ptr.baseAddress, UInt32(maxFrames))
+        }
+        var out: [BacktraceFrame] = []
+        out.reserveCapacity(Int(n))
+        for i in 0..<Int(n) {
+            let f = buf[i]
+            let label = kintsuki_lookup_label(h, f.callsite_pc).map {
+                String(cString: $0)
+            }
+            out.append(BacktraceFrame(callsite: f.callsite_pc,
+                                      target:   f.target_pc,
+                                      kind:     f.kind,
+                                      label:    label))
+        }
+        return out
     }
 
     // ----- Memory snapshot for hex/palette/tile views ---------------------

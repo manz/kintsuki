@@ -147,50 +147,6 @@ class PpuState:
 from pathlib import Path
 
 
-def _load_adbg_labels(path: str | os.PathLike[str]) -> dict[int, str]:
-    """Parse an a816 .adbg debug-info file and return ``{addr: name}`` for
-    every label-kind symbol. Imports a816 lazily so kintsuki stays usable
-    without a816 installed when ``adbg=...`` isn't passed."""
-    from a816 import debug_info  # type: ignore[import-not-found]
-
-    info = debug_info.read(Path(path))
-    out: dict[int, str] = {}
-    for sym in info.symbols:
-        # Only labels resolve to a meaningful PC; constants/aliases do not.
-        if int(sym.kind) != int(debug_info.SymbolKind.LABEL):
-            continue
-        # First writer wins on collision — duplicate labels at the same
-        # address are merged silently rather than overwriting arbitrarily.
-        out.setdefault(sym.address & 0xFFFFFF, sym.name)
-    return out
-
-
-_TRACE_PC_RE = re.compile(r"^([0-9A-Fa-f]{2}):([0-9A-Fa-f]{4}) ")
-
-
-def annotate_trace(text: str, labels: dict[int, str]) -> str:
-    """Insert ``; --- name ---`` headers above every line whose leading
-    PC matches a label in ``labels``. Consecutive lines at the same PC
-    only emit the header once. Safe on FILE-mode trace logs too — feed
-    in the file contents and write the result back."""
-    if not labels:
-        return text
-    out: list[str] = []
-    last_label_pc: int | None = None
-    for line in text.splitlines(keepends=True):
-        m = _TRACE_PC_RE.match(line)
-        if m:
-            pc = (int(m.group(1), 16) << 16) | int(m.group(2), 16)
-            name = labels.get(pc)
-            if name is not None and pc != last_label_pc:
-                out.append(f"; --- {name} ---\n")
-                last_label_pc = pc
-            elif name is None:
-                last_label_pc = None
-        out.append(line)
-    return "".join(out)
-
-
 class SymbolTable:
     """Parse a ca65 / Mesen .sym file ('BB:OOOO name' lines).
 
@@ -285,18 +241,48 @@ class Emu:
         self._registered: list[_Registered] = []
         on = Emu.default_load_srm_sidecar if load_srm_sidecar is None else load_srm_sidecar
         _native.lib.kintsuki_set_srm_sidecar(self._handle, 1 if on else 0)
-        self._labels: dict[int, str] = {}
 
     # ------------------------------------------------------------------ ROM
     def load_rom(self, path: str, *, adbg: str | os.PathLike[str] | None = None) -> None:
-        """Load `path` (sfc/smc). Pass `adbg=...` to also pull labels from an
-        a816 .adbg file — used by `tracer_drain(annotate=True)` to inject
-        symbol headers above matching PC lines."""
+        """Load `path` (sfc/smc). Pass `adbg=...` to also load LABEL symbols
+        from an a816 ``.adbg`` debug-info file — the native tracer then
+        injects ``; --- name ---`` headers above matching PC lines and
+        callers can resolve addresses via :meth:`lookup_label`."""
         ok = _native.lib.kintsuki_load_rom(self._handle, path.encode("utf-8"))
         if not ok:
             raise RuntimeError(f"failed to load ROM: {path}")
         if adbg is not None:
-            self._labels = _load_adbg_labels(adbg)
+            self.load_adbg(adbg)
+
+    def load_adbg(self, path: str | os.PathLike[str]) -> None:
+        """Load an ``.adbg`` debug-info file (LABEL symbols only). Replaces
+        any previously-loaded table. Raises ``RuntimeError`` on bad magic /
+        unsupported version / I/O failure."""
+        encoded = os.fsencode(path)
+        if not _native.lib.kintsuki_load_adbg(self._handle, encoded):
+            raise RuntimeError(f"failed to load .adbg: {os.fspath(path)}")
+
+    def clear_adbg(self) -> None:
+        _native.lib.kintsuki_clear_adbg(self._handle)
+
+    def lookup_label(self, addr: int) -> str | None:
+        """Return the label bound to ``addr`` (24-bit) or ``None``."""
+        raw = _native.lib.kintsuki_lookup_label(self._handle, addr & 0xFFFFFF)
+        return raw.decode("utf-8") if raw else None
+
+    def callstack(self, max_frames: int = 256) -> list[tuple[int, int, int]]:
+        """Snapshot the shadow callstack (deepest frame first). Each entry
+        is ``(callsite_pc, target_pc, kind)`` where kind is 0=JSR / 1=JSL.
+        Empty when nothing has been called yet (or after ``load_state``)."""
+        if max_frames <= 0:
+            return []
+        buf = (_native.CallFrame * max_frames)()
+        n = _native.lib.kintsuki_callstack_snapshot(self._handle, buf, max_frames)
+        return [(buf[i].callsite_pc, buf[i].target_pc, buf[i].kind)
+                for i in range(n)]
+
+    def callstack_clear(self) -> None:
+        _native.lib.kintsuki_callstack_clear(self._handle)
 
     # -------------------------------------------------------------- Run/step
     def run_frames(self, n: int) -> None:
@@ -319,10 +305,14 @@ class Emu:
     def read16(self, addr: int) -> int:
         return self.read(addr) | (self.read(addr + 1) << 8)
 
-    def read_range(self, addr: int, length: int) -> bytes:
+    def read_range(self, addr: int, length: int) -> memoryview:
+        """Bulk CPU-bus read. Returns a ``memoryview`` over a freshly-
+        allocated ctypes buffer — zero-copy on the Python side, callers
+        can ``bytes(mv)`` if they need an owned buffer. The underlying
+        storage stays alive for the memoryview's lifetime."""
         buf = (ctypes.c_uint8 * length)()
         n = _native.lib.kintsuki_read_range(self._handle, addr, length, buf)
-        return bytes(buf[:n])
+        return memoryview(buf)[:n]
 
     def write_range(self, addr: int, data: bytes | bytearray) -> None:
         """Bulk write `data` starting at `addr` (CPU bus, 24-bit). Useful
@@ -337,13 +327,14 @@ class Emu:
     def vram_write(self, addr: int, value: int) -> None:
         _native.lib.kintsuki_vram_write(self._handle, addr, value & 0xFF)
 
-    def vram_read_range(self, addr: int = 0, length: int | None = None) -> bytes:
-        """Default: full 64 KB VRAM dump from `addr`."""
+    def vram_read_range(self, addr: int = 0, length: int | None = None) -> memoryview:
+        """Default: full 64 KB VRAM dump from `addr`. Returns a memoryview
+        over the underlying ctypes buffer (zero-copy)."""
         if length is None:
             length = VRAM_BYTES - addr
         buf = (ctypes.c_uint8 * length)()
         n = _native.lib.kintsuki_vram_read_range(self._handle, addr, length, buf)
-        return bytes(buf[:n])
+        return memoryview(buf)[:n]
 
     def vram_write_range(self, addr: int, data: bytes | bytearray) -> None:
         buf = (ctypes.c_uint8 * len(data))(*data)
@@ -355,13 +346,14 @@ class Emu:
     def cgram_write(self, addr: int, value: int) -> None:
         _native.lib.kintsuki_cgram_write(self._handle, addr, value & 0xFF)
 
-    def cgram_read_range(self, addr: int = 0, length: int | None = None) -> bytes:
-        """Default: full 512 B CGRAM dump from `addr`."""
+    def cgram_read_range(self, addr: int = 0, length: int | None = None) -> memoryview:
+        """Default: full 512 B CGRAM dump from `addr`. Returns a memoryview
+        over the underlying ctypes buffer (zero-copy)."""
         if length is None:
             length = CGRAM_BYTES - addr
         buf = (ctypes.c_uint8 * length)()
         n = _native.lib.kintsuki_cgram_read_range(self._handle, addr, length, buf)
-        return bytes(buf[:n])
+        return memoryview(buf)[:n]
 
     def cgram_write_range(self, addr: int, data: bytes | bytearray) -> None:
         buf = (ctypes.c_uint8 * len(data))(*data)
@@ -373,13 +365,14 @@ class Emu:
     def oam_write(self, addr: int, value: int) -> None:
         _native.lib.kintsuki_oam_write(self._handle, addr, value & 0xFF)
 
-    def oam_read_range(self, addr: int = 0, length: int | None = None) -> bytes:
-        """Default: full 544 B OAM dump (512 sprite table + 32 high) from `addr`."""
+    def oam_read_range(self, addr: int = 0, length: int | None = None) -> memoryview:
+        """Default: full 544 B OAM dump (512 sprite + 32 high) from `addr`.
+        Returns a memoryview over the underlying ctypes buffer (zero-copy)."""
         if length is None:
             length = OAM_BYTES - addr
         buf = (ctypes.c_uint8 * length)()
         n = _native.lib.kintsuki_oam_read_range(self._handle, addr, length, buf)
-        return bytes(buf[:n])
+        return memoryview(buf)[:n]
 
     def oam_write_range(self, addr: int, data: bytes | bytearray) -> None:
         buf = (ctypes.c_uint8 * len(data))(*data)
@@ -412,21 +405,18 @@ class Emu:
     def tracer_stop(self) -> None:
         _native.lib.kintsuki_tracer_stop(self._handle)
 
-    def tracer_drain(self, *, annotate: bool = False) -> str:
+    def tracer_drain(self) -> str:
         """Pull and clear the ring buffer's accumulated lines. FILE mode
-        always returns ''. Caller gets a UTF-8 decoded string. Pass
-        ``annotate=True`` to splice in label headers from the .adbg file
-        passed to ``load_rom(adbg=...)``; no-op if no labels are loaded."""
+        always returns ``''``. Lines are already annotated with
+        ``; --- name ---`` headers natively when an ``.adbg`` is loaded
+        (see :meth:`load_adbg`)."""
         # First call: query required size with cap=0.
         size = _native.lib.kintsuki_tracer_drain(self._handle, None, 0)
         if size == 0:
             return ""
         buf = ctypes.create_string_buffer(size)
         n = _native.lib.kintsuki_tracer_drain(self._handle, buf, size)
-        text = bytes(buf.raw[:n]).decode("utf-8", errors="replace")
-        if annotate and self._labels:
-            text = annotate_trace(text, self._labels)
-        return text
+        return bytes(buf.raw[:n]).decode("utf-8", errors="replace")
 
     def tracer(self, lo: int, hi: int, *, ring_capacity: int = 4096,
                path: str | None = None) -> "_TracerSession":
