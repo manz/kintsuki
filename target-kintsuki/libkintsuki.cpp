@@ -99,12 +99,17 @@ int kintsuki_load_rom(kintsuki_t* h, const char* path) {
   if(!h) return 0;
   if(!h->program->loadRom(path)) return 0;
   if(!h->program->bootRom()) return 0;
+  // Fresh cart = fresh call chain; previous run's frames are stale.
+  g_callstack.clear();
   return 1;
 }
 
 void kintsuki_reset(kintsuki_t* h) {
   if(!h) return;
   h->program->softReset();
+  // Reset wipes the live timeline; any retained frames describe a
+  // call chain that no longer exists in the just-rebooted CPU.
+  g_callstack.clear();
 }
 
 void kintsuki_set_srm_sidecar(kintsuki_t* h, int enable) {
