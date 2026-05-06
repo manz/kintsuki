@@ -196,6 +196,16 @@ void         kintsuki_clear_adbg(kintsuki_t*);
 // is loaded. `addr` is masked to 24 bits.
 const char*  kintsuki_lookup_label(kintsuki_t*, uint32_t addr);
 
+// Source-line lookup. Returns 1 + fills out_* when the loaded .adbg has
+// a LINES entry covering `addr` (last instruction emitted up to that
+// address). Returns 0 + leaves outputs untouched otherwise. The
+// `out_file` pointer follows the same lifetime rules as
+// `kintsuki_lookup_label`. Pass NULL for any output you don't need.
+int          kintsuki_lookup_source(kintsuki_t*, uint32_t addr,
+                                    const char** out_file,
+                                    uint32_t* out_line,
+                                    uint16_t* out_column);
+
 // Formatted execution tracer. Wraps an exec callback that disassembles
 // the instruction at PC + dumps CPU registers, producing one Mesen-
 // style line per exec event in [lo,hi]. Single tracer per emulator —

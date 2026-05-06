@@ -825,4 +825,19 @@ const char* kintsuki_lookup_label(kintsuki_t* h, uint32_t addr) {
   return g_labels.lookup(addr);
 }
 
+int kintsuki_lookup_source(kintsuki_t* h, uint32_t addr,
+                           const char** out_file,
+                           uint32_t* out_line,
+                           uint16_t* out_column) {
+  if(!h) return 0;
+  const char* file = nullptr;
+  uint32_t line = 0;
+  uint16_t column = 0;
+  if(!g_labels.lookupSource(addr, file, line, column)) return 0;
+  if(out_file)   *out_file   = file;
+  if(out_line)   *out_line   = line;
+  if(out_column) *out_column = column;
+  return 1;
+}
+
 }  // extern "C"

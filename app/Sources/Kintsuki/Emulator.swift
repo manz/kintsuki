@@ -58,7 +58,9 @@ final class Emulator: ObservableObject {
         var callsite: UInt32   // 24-bit
         var target:   UInt32   // 24-bit
         var kind:     UInt8    // 0=JSR, 1=JSL
-        var label:    String?  // resolved via .adbg, nil if no match
+        var label:    String?  // resolved via .adbg labels, nil if no match
+        var file:     String?  // resolved via .adbg LINES, nil if no entry
+        var line:     UInt32?  // 1-based, nil if no entry
     }
 
     /// Captured shadow callstack at the moment the CPU first transitioned
@@ -513,10 +515,21 @@ final class Emulator: ObservableObject {
             let label = kintsuki_lookup_label(h, f.callsite_pc).map {
                 String(cString: $0)
             }
+            // Source-line lookup: use unsafe pointers since the C ABI
+            // takes optional out-params we want to fill.
+            var filePtr: UnsafePointer<CChar>? = nil
+            var lineNum: UInt32 = 0
+            var colNum: UInt16 = 0
+            let hasSrc = kintsuki_lookup_source(h, f.callsite_pc,
+                                                &filePtr, &lineNum, &colNum) != 0
+            let file = (hasSrc && filePtr != nil) ? String(cString: filePtr!) : nil
+            let line: UInt32? = hasSrc ? lineNum : nil
             out.append(BacktraceFrame(callsite: f.callsite_pc,
                                       target:   f.target_pc,
                                       kind:     f.kind,
-                                      label:    label))
+                                      label:    label,
+                                      file:     file,
+                                      line:     line))
         }
         return out
     }

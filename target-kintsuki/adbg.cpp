@@ -5,6 +5,7 @@
 
 #include "adbg.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <cstring>
 #include <vector>
@@ -13,7 +14,9 @@ namespace kintsuki {
 
 namespace {
 
+constexpr uint32_t SECTION_FILES   = 1;
 constexpr uint32_t SECTION_SYMBOLS = 3;
+constexpr uint32_t SECTION_LINES   = 4;
 constexpr uint32_t SECTION_STRINGS = 5;
 constexpr uint8_t  SYMBOL_KIND_LABEL = 0;
 
@@ -65,6 +68,27 @@ auto AdbgLabels::lookup(uint32_t addr) const -> const char* {
   return it == byAddr.end() ? nullptr : it->second.c_str();
 }
 
+auto AdbgLabels::lookupSource(uint32_t addr, const char*& out_file,
+                              uint32_t& out_line,
+                              uint16_t& out_column) const -> bool {
+  if(lines.empty()) return false;
+  uint32_t needle = addr & 0xFFFFFF;
+  // upper_bound returns the first entry strictly greater than `needle`;
+  // step back by one to land on the largest entry whose address <= needle
+  // (i.e. the LINES record covering this PC). If `needle` is below the
+  // first entry, there's no covering record — return false.
+  auto it = std::upper_bound(
+      lines.begin(), lines.end(), needle,
+      [](uint32_t v, const LineEntry& e) { return v < e.address; });
+  if(it == lines.begin()) return false;
+  --it;
+  if(it->file_idx >= files.size()) return false;
+  out_file = files[it->file_idx].c_str();
+  out_line = it->line;
+  out_column = it->column;
+  return true;
+}
+
 auto AdbgLabels::load(const char* path) -> bool {
   byAddr.clear();
   if(!path) return false;
@@ -99,6 +123,10 @@ auto AdbgLabels::load(const char* path) -> bool {
   size_t strings_size = 0;
   const uint8_t* symbols_ptr = nullptr;
   size_t symbols_size = 0;
+  const uint8_t* files_ptr = nullptr;
+  size_t files_size = 0;
+  const uint8_t* lines_ptr = nullptr;
+  size_t lines_size = 0;
 
   for(uint32_t i = 0; i < section_count; i++) {
     uint32_t kind = 0, length = 0;
@@ -117,9 +145,58 @@ auto AdbgLabels::load(const char* path) -> bool {
       symbols_ptr = c.data + c.off;
       symbols_size = length;
       c.skip(length);
+    } else if(kind == SECTION_FILES) {
+      files_ptr = c.data + c.off;
+      files_size = length;
+      c.skip(length);
+    } else if(kind == SECTION_LINES) {
+      lines_ptr = c.data + c.off;
+      lines_size = length;
+      c.skip(length);
     } else {
       c.skip(length);
     }
+  }
+
+  // FILES: count(u32) + entries[ str_len(u16) + bytes[str_len] ].
+  if(files_ptr) {
+    Cursor fc{files_ptr, files_size};
+    uint32_t fcount = 0;
+    if(!fc.read(fcount)) return false;
+    files.reserve(fcount);
+    for(uint32_t i = 0; i < fcount; i++) {
+      uint16_t str_len = 0;
+      if(!fc.read(str_len)) return false;
+      const uint8_t* sp = nullptr;
+      if(!fc.slice(str_len, sp)) return false;
+      files.emplace_back(reinterpret_cast<const char*>(sp), str_len);
+    }
+  }
+
+  // LINES: count(u32) + entries (sorted by addr) of:
+  //   address(u32) file_idx(u32) line(u32) column(u16) module_idx(u32) flags(u8).
+  if(lines_ptr) {
+    Cursor lc{lines_ptr, lines_size};
+    uint32_t lcount = 0;
+    if(!lc.read(lcount)) return false;
+    lines.reserve(lcount);
+    for(uint32_t i = 0; i < lcount; i++) {
+      uint32_t address = 0, file_idx = 0, line = 0, module_idx = 0;
+      uint16_t column = 0;
+      uint8_t flags = 0;
+      if(!lc.read(address) || !lc.read(file_idx) || !lc.read(line)
+         || !lc.read(column) || !lc.read(module_idx) || !lc.read(flags)) {
+        return false;
+      }
+      (void)module_idx; (void)flags;
+      lines.push_back({address & 0xFFFFFFu, file_idx, line, column});
+    }
+    // Spec says producer emits sorted, but defensively sort here so the
+    // binary search in lookupSource never hands back a wrong neighbor.
+    std::sort(lines.begin(), lines.end(),
+              [](const LineEntry& a, const LineEntry& b) {
+                return a.address < b.address;
+              });
   }
 
   if(!symbols_ptr) return true;  // no labels; valid file but nothing to load

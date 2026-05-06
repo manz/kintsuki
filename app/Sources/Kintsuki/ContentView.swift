@@ -134,8 +134,16 @@ private struct CrashOverlay: View {
             let pc = String(format: "%02X:%04X",
                             (frame.callsite >> 16) & 0xFF,
                             frame.callsite & 0xFFFF)
-            let suffix = frame.label.map { " in \($0)" } ?? ""
-            return String(format: "#%-2d %@%@", idx, pc, suffix)
+            let labelPart = frame.label.map { " in \($0)" } ?? ""
+            // Trim verbose absolute paths to just the file's basename so
+            // the overlay stays readable; user can grep/IDE-jump on the
+            // copied report which has the full path embedded too.
+            var srcPart = ""
+            if let file = frame.file, let line = frame.line {
+                let base = (file as NSString).lastPathComponent
+                srcPart = "  (\(base):\(line))"
+            }
+            return String(format: "#%-2d %@%@%@", idx, pc, labelPart, srcPart)
         }.joined(separator: "\n")
     }
 

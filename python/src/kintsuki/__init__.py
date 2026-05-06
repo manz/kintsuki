@@ -270,6 +270,21 @@ class Emu:
         raw = _native.lib.kintsuki_lookup_label(self._handle, addr & 0xFFFFFF)
         return raw.decode("utf-8") if raw else None
 
+    def lookup_source(self, addr: int) -> tuple[str, int, int] | None:
+        """Resolve ``addr`` to ``(file, line, column)`` via the loaded
+        ``.adbg`` LINES section. Returns ``None`` when no covering
+        record exists (no ``.adbg`` loaded, address below the first
+        emitted line, or LINES section absent)."""
+        cfile = ctypes.c_char_p()
+        cline = ctypes.c_uint32(0)
+        ccol = ctypes.c_uint16(0)
+        ok = _native.lib.kintsuki_lookup_source(
+            self._handle, addr & 0xFFFFFF,
+            ctypes.byref(cfile), ctypes.byref(cline), ctypes.byref(ccol))
+        if not ok or cfile.value is None:
+            return None
+        return cfile.value.decode("utf-8"), int(cline.value), int(ccol.value)
+
     def callstack(self, max_frames: int = 256) -> list[tuple[int, int, int]]:
         """Snapshot the shadow callstack (deepest frame first). Each entry
         is ``(callsite_pc, target_pc, kind)`` where kind is 0=JSR / 1=JSL.

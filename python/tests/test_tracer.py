@@ -146,6 +146,27 @@ def test_tracer_resolves_control_flow_operands(assemble_rom, tmp_path):
     )
 
 
+def test_lookup_source_resolves_file_line(assemble_rom):
+    """``Emu.lookup_source`` returns ``(file, line, column)`` for any
+    address covered by the ``.adbg`` LINES section. Reset is the most
+    reliable target — the assembler always emits a line entry for it."""
+    rom = assemble_rom("test_callstack.s")
+    adbg = Path(str(rom) + ".adbg")
+    if not adbg.exists():
+        pytest.skip(f"missing .adbg next to {rom.name}")
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        emu.load_adbg(adbg)
+        src = emu.lookup_source(0x008000)
+        assert src is not None, "no source mapping for reset"
+        file, line, col = src
+        assert file.endswith("test_callstack.s"), f"unexpected file: {file!r}"
+        assert line >= 1
+        assert col >= 1
+        # Address below first emit should not resolve.
+        assert emu.lookup_source(0x000000) is None
+
+
 def test_lookup_label_roundtrip(assemble_rom):
     """``Emu.load_adbg`` + ``Emu.lookup_label`` resolve assembled symbols."""
     rom = assemble_rom("test_ppu_state.s")
