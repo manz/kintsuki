@@ -25,7 +25,7 @@ import Compression
 import Foundation
 
 
-// ===== SaveStatePool =======================================================
+// MARK: - SaveStatePool
 // Fixed pool of preallocated byte slots. Callers `acquire()` a slot, hand
 // the caller-supplied closure a writable buffer to fill, get a `Handle`
 // back referencing the slot index + the bytes actually written, then later
@@ -155,7 +155,7 @@ final class SaveStatePool {
 }
 
 
-// ===== RewindBuffer ========================================================
+// MARK: - RewindBuffer
 
 private enum FrameEntry {
     /// Full uncompressed state stored in `SaveStatePool`.
@@ -420,7 +420,7 @@ final class RewindBuffer {
 }
 
 
-// ===== Free helpers ========================================================
+// MARK: - Free helpers
 
 private func decompress(_ blob: Data) -> Data {
     let header = blob.prefix(4).withUnsafeBytes { raw -> UInt32 in
