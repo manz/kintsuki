@@ -110,6 +110,28 @@ struct RewindBufferTest {
                   + "raw would be \(60 * s0.count))")
         }
 
+        // ---- post-cap memory stays bounded (regression for keyframe leak)
+        do {
+            // capacity 100, keyframe every 20 → expect ~5 keyframes once
+            // the ring is full. Pushing 10× the capacity must not snowball
+            // into 1000 keyframes (the bug: an `frames.count %
+            // keyframeInterval` schedule made every post-cap push a fresh
+            // keyframe, growing the buffer linearly with push count).
+            let buf = RewindBuffer(capacity: 100, keyframeInterval: 20)
+            let s0 = fakeState(seed: 0)
+            for i in 0..<1000 {
+                buf.push(fakeState(seed: UInt8(i & 0xFF)))
+            }
+            check(buf.count == 100, "ring stays at capacity past saturation")
+            // Steady-state budget: 5 keyframes × 256 KB + 95 deltas, well
+            // under 6× a single keyframe. The leak version was ~30× since
+            // every retained frame became a 256 KB keyframe.
+            let limit = 6 * s0.count
+            check(buf.byteSize < limit,
+                  "post-cap byteSize stays bounded: got \(buf.byteSize), "
+                  + "want < \(limit)")
+        }
+
         // ---- clear --------------------------------------------------------
         do {
             let buf = RewindBuffer(capacity: 5, keyframeInterval: 2)

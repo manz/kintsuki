@@ -44,6 +44,13 @@ final class RewindBuffer {
     /// Cached aggregate byte count for `byteSize`.
     private var bytes: Int = 0
 
+    /// Absolute count of `push` calls since the buffer was created or
+    /// `clear()`ed. Drives the keyframe schedule independently of
+    /// `frames.count` — once the ring saturates, `frames.count` stays
+    /// pinned at `capacity` and a `frames.count % keyframeInterval`
+    /// formula would mark every push as a keyframe (30 MB/s of leak).
+    private var pushedSoFar: Int = 0
+
     init(capacity: Int, keyframeInterval: Int = 60) {
         precondition(capacity > 0, "capacity must be > 0")
         precondition(keyframeInterval > 0, "keyframeInterval must be > 0")
@@ -60,7 +67,10 @@ final class RewindBuffer {
     /// Append a frame. The first frame is always a keyframe; thereafter
     /// every `keyframeInterval`-th frame is a keyframe.
     func push(_ state: Data) {
-        let isKeyframe = (frames.count % keyframeInterval) == 0
+        // Schedule by *absolute* push count so eviction can't trick the
+        // ring into an all-keyframe configuration once it saturates.
+        let isKeyframe = (pushedSoFar % keyframeInterval) == 0
+        pushedSoFar += 1
         let entry: FrameEntry
         if isKeyframe {
             entry = .keyframe(state)
@@ -109,6 +119,7 @@ final class RewindBuffer {
     func clear() {
         frames.removeAll(keepingCapacity: true)
         bytes = 0
+        pushedSoFar = 0
     }
 
     // ----- internals ---------------------------------------------------
