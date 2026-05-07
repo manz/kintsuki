@@ -519,7 +519,19 @@ final class Emulator: ObservableObject {
                 // stack from C is already shallowest-first, so we just
                 // append the resolved halt site at the end and let the
                 // overlay walk top-to-bottom.
-                var site = resolveFrame(at: s.pc, kind: 0xFF, target: 0)
+                //
+                // Decrement the lookup PC by 1: STP advances PC past
+                // its own opcode before halting, so `s.pc` lands one
+                // byte beyond the instruction and `lookup_label_
+                // containing` would resolve against the *next* routine
+                // instead of the brk_handler the STP actually lives in.
+                // Wrap inside the 16-bit page so a halt at the start
+                // of a bank stays in the same bank.
+                let pcLow = s.pc & 0xFFFF
+                let prev = (pcLow == 0)
+                    ? (s.pc & 0xFF0000) | 0xFFFF
+                    : s.pc - 1
+                var site = resolveFrame(at: prev, kind: 0xFF, target: 0)
                 site.cpu = s
                 let stack = captureBacktrace()  // shallowest → newest
                 crashBacktrace = stack + [site]
