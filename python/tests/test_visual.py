@@ -22,13 +22,18 @@ from kintsuki.visual import assert_pixel_match, golden, pixel_diff
 
 
 class _FrameEmu:
-    """Stub Emu returning a fixed RGBA framebuffer."""
+    """Stub Emu that mimics the C-side ``screenshot()`` path: writes the
+    in-memory RGBA buffer to a PNG via the same encoder real Emu uses.
+    Visual goes through ``screenshot()`` (rather than raw
+    ``framebuffer()`` bytes) so record + compare share one pixel
+    pipeline; this stub follows suit."""
 
     def __init__(self, rgba: bytes, w: int, h: int) -> None:
         self._rgba, self._w, self._h = rgba, w, h
 
-    def framebuffer(self) -> tuple[bytes, int, int]:
-        return self._rgba, self._w, self._h
+    def screenshot(self, path: str) -> bool:
+        Path(path).write_bytes(_encode_png_rgba(self._rgba, self._w, self._h))
+        return True
 
 
 def _solid(w: int, h: int, r: int, g: int, b: int) -> bytes:

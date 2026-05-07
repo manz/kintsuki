@@ -473,8 +473,18 @@ class Emu:
 
     # ----------------------------------------------------------- Framebuffer
     def framebuffer(self) -> tuple[bytes, int, int]:
-        """Returns (rgba_bytes, width, height). Caller copies; pointer is valid
-        only until the next emulator->run() call."""
+        """Returns (raw_bytes, width, height). The bytes are the native
+        framebuffer copied straight out of libkintsuki — each pixel is a
+        little-endian ``uint32`` packed ``0x00RRGGBB``, so on disk they
+        read as ``B G R 0`` per pixel, not RGBA.
+
+        Use :meth:`screenshot` to write a properly-encoded RGB PNG (the
+        C path unpacks correctly), or :func:`kintsuki.visual.golden` for
+        record-or-compare assertions — both share that path so their
+        pixels are bit-identical.
+
+        The buffer is valid only until the next ``run_*`` call; the
+        returned ``bytes`` is an owned copy."""
         w = ctypes.c_uint32(0)
         h = ctypes.c_uint32(0)
         ptr = _native.lib.kintsuki_framebuffer(
@@ -483,7 +493,6 @@ class Emu:
         if not ptr or not w.value or not h.value:
             return (b"", 0, 0)
         n = w.value * h.value
-        # Each pixel is uint32 packed 0x00RRGGBB.
         raw = ctypes.string_at(ptr, n * 4)
         return (raw, int(w.value), int(h.value))
 
