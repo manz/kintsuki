@@ -215,10 +215,24 @@ auto AdbgLabels::load(const char* path) -> bool {
     if(sym_kind != SYMBOL_KIND_LABEL) continue;
     auto name = stringAt(strings_ptr, strings_size, name_idx);
     if(name.empty()) continue;
+    uint32_t addr24 = address & 0xFFFFFF;
     // First writer wins on collisions — duplicate labels at the same
     // address get merged silently rather than the last entry stomping.
-    byAddr.emplace(address & 0xFFFFFF, std::move(name));
+    byAddr.emplace(addr24, name);
+    // Reverse map: last writer wins. Duplicate label *names* are an
+    // assembler bug we'd rather not paper over silently — but if it
+    // ever happens, taking the last definition matches xdds' behavior.
+    byName[name] = addr24;
   }
+  return true;
+}
+
+auto AdbgLabels::lookupAddress(const char* name,
+                               uint32_t& out_addr) const -> bool {
+  if(!name) return false;
+  auto it = byName.find(name);
+  if(it == byName.end()) return false;
+  out_addr = it->second;
   return true;
 }
 
