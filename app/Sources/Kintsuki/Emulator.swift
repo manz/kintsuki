@@ -69,6 +69,12 @@ final class Emulator: ObservableObject {
     /// hot-reload). Topmost frame first (deepest call).
     @Published private(set) var crashBacktrace: [BacktraceFrame] = []
 
+    /// Resolved metadata for the PC the CPU executed STP at — populated
+    /// at the same time as `crashBacktrace`. The shadow stack only
+    /// reports JSR/JSL callsites (= where the caller WAS), so without
+    /// this the routine the BRK / STP actually fired in goes unnamed.
+    @Published private(set) var crashSite: BacktraceFrame? = nil
+
     /// Effective framebuffer dimensions reported by ares last frame.
     /// The pixel data lives inside libkintsuki and is exposed via
     /// `withFramebufferPointer` — no per-tick Data copy on the hot path
@@ -253,16 +259,31 @@ final class Emulator: ObservableObject {
         // previous session.
         clearRewindBuffer()
         rememberRecent(url)
-        // Auto-load `<rom>.adbg` if it sits next to the cart so the halt
-        // overlay can resolve crash callstacks without an explicit user
-        // action. Failure (missing / unreadable) is silent — most ROMs
-        // ship without one.
-        let adbg = URL(fileURLWithPath: url.path + ".adbg")
-        if FileManager.default.fileExists(atPath: adbg.path) {
-            let ok = adbg.path.withCString { kintsuki_load_adbg(h, $0) }
-            NSLog("kintsuki: load_adbg \(adbg.lastPathComponent) -> \(ok != 0 ? "ok" : "failed")")
-        } else {
+        // Auto-load a sibling `.adbg` so the halt overlay can resolve
+        // crash callstacks without an explicit user action. a816 emits
+        // the debug-info file next to whichever build artifact it just
+        // wrote — `.sfc.adbg` for direct SFC builds, `.ips.adbg` when
+        // the user assembles a patch and applies it to a base ROM.
+        // Probe a few candidates: same path with `.adbg` appended, then
+        // the same stem with `.adbg` swapped for the extension, then
+        // `.ips.adbg` against the stem.
+        let stem = (url.path as NSString).deletingPathExtension
+        let candidates = [
+            url.path + ".adbg",
+            stem + ".adbg",
+            stem + ".ips.adbg",
+        ]
+        var loaded = false
+        for c in candidates {
+            guard FileManager.default.fileExists(atPath: c) else { continue }
+            let ok = c.withCString { kintsuki_load_adbg(h, $0) }
+            NSLog("kintsuki: load_adbg \((c as NSString).lastPathComponent) -> \(ok != 0 ? "ok" : "failed")")
+            if ok != 0 { loaded = true; break }
+        }
+        if !loaded {
             kintsuki_clear_adbg(h)
+            NSLog("kintsuki: no .adbg found next to \(url.lastPathComponent) "
+                  + "(tried .sfc.adbg, .adbg, .ips.adbg)")
         }
         startRunLoop()
     }
@@ -488,6 +509,7 @@ final class Emulator: ObservableObject {
             // C ABI is cheap but doing it 60Hz while the CPU is idle in
             // STP would churn @Published for nothing.
             crashBacktrace = s.stp ? captureBacktrace() : []
+            crashSite = s.stp ? resolveFrame(at: s.pc, kind: 0xFF, target: 0) : nil
         }
     }
 
@@ -505,30 +527,37 @@ final class Emulator: ObservableObject {
         out.reserveCapacity(Int(n))
         for i in 0..<Int(n) {
             let f = buf[i]
-            // Containing-label lookup: callsites land mid-routine far
-            // more often than at a symbol's start address, so a strict
-            // exact match would leave most backtrace frames unsymbolicated.
-            var labelOffset: UInt32 = 0
-            let label = kintsuki_lookup_label_containing(h, f.callsite_pc,
-                                                         &labelOffset).map {
-                String(cString: $0)
-            }
-            var filePtr: UnsafePointer<CChar>? = nil
-            var lineNum: UInt32 = 0
-            var colNum: UInt16 = 0
-            let hasSrc = kintsuki_lookup_source(h, f.callsite_pc,
-                                                &filePtr, &lineNum, &colNum) != 0
-            let file = (hasSrc && filePtr != nil) ? String(cString: filePtr!) : nil
-            let line: UInt32? = hasSrc ? lineNum : nil
-            out.append(BacktraceFrame(callsite: f.callsite_pc,
-                                      target:   f.target_pc,
-                                      kind:     f.kind,
-                                      label:    label,
-                                      offset:   label != nil ? labelOffset : 0,
-                                      file:     file,
-                                      line:     line))
+            out.append(resolveFrame(at: f.callsite_pc, kind: f.kind,
+                                    target: f.target_pc))
         }
         return out
+    }
+
+    /// Resolve a 24-bit PC into a `BacktraceFrame` with `.adbg`-backed
+    /// containing-label, offset, and source location. Used both for
+    /// shadow-stack frames (callsite PC) and the BRK / STP halt site
+    /// (current PC at the moment of halt).
+    private func resolveFrame(at pc: UInt32, kind: UInt8,
+                              target: UInt32) -> BacktraceFrame {
+        guard let h = handle else {
+            return BacktraceFrame(callsite: pc, target: target, kind: kind,
+                                  label: nil, offset: 0, file: nil, line: nil)
+        }
+        var labelOffset: UInt32 = 0
+        let label = kintsuki_lookup_label_containing(h, pc, &labelOffset).map {
+            String(cString: $0)
+        }
+        var filePtr: UnsafePointer<CChar>? = nil
+        var lineNum: UInt32 = 0
+        var colNum: UInt16 = 0
+        let hasSrc = kintsuki_lookup_source(h, pc, &filePtr,
+                                            &lineNum, &colNum) != 0
+        let file = (hasSrc && filePtr != nil) ? String(cString: filePtr!) : nil
+        let line: UInt32? = hasSrc ? lineNum : nil
+        return BacktraceFrame(callsite: pc, target: target, kind: kind,
+                              label: label,
+                              offset: label != nil ? labelOffset : 0,
+                              file: file, line: line)
     }
 
     // ----- Memory snapshot for hex/palette/tile views ---------------------

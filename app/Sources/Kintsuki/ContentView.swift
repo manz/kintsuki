@@ -124,9 +124,24 @@ private struct CrashOverlay: View {
     }
 
     private var crashHeaderText: String {
-        String(format: "CPU STP @ %02X:%04X",
-               (emulator.cpuState.pc >> 16) & 0xFF,
-               emulator.cpuState.pc & 0xFFFF)
+        let pc = String(format: "CPU STP @ %02X:%04X",
+                        (emulator.cpuState.pc >> 16) & 0xFF,
+                        emulator.cpuState.pc & 0xFFFF)
+        guard let site = emulator.crashSite else { return pc }
+        // Site label resolves the BRK/STP-firing routine — the shadow
+        // stack only carries callsites of pending JSR/JSLs, so without
+        // this the function the CPU was actually inside goes unnamed.
+        var line = pc
+        if let name = site.label {
+            line += site.offset > 0
+                ? String(format: " in %@+0x%X", name, site.offset)
+                : " in \(name)"
+        }
+        if let file = site.file, let lineNum = site.line {
+            let base = (file as NSString).lastPathComponent
+            line += "  (\(base):\(lineNum))"
+        }
+        return line
     }
 
     private var backtraceText: String {
