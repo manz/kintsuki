@@ -195,10 +195,18 @@ void     kintsuki_callstack_clear(kintsuki_t*);
 // previously-loaded table if any.
 int          kintsuki_load_adbg(kintsuki_t*, const char* path);
 void         kintsuki_clear_adbg(kintsuki_t*);
-// O(1) lookup. Returned pointer is valid until the next load_adbg /
-// clear_adbg / destroy. NULL if no label is bound at `addr` or no .adbg
-// is loaded. `addr` is masked to 24 bits.
+// O(1) lookup at the *exact* address. NULL if no label is bound there
+// or no .adbg is loaded. `addr` is masked to 24 bits.
 const char*  kintsuki_lookup_label(kintsuki_t*, uint32_t addr);
+
+// Containing-label lookup: returns the label whose address is the
+// largest ≤ `addr` (i.e. the routine `addr` lives inside). When
+// `out_offset` is non-NULL it receives `addr - labelAddr`. NULL when
+// no label precedes `addr`. O(log N), backed by a sorted vector
+// computed once at .adbg load time. Use this for crash-backtrace
+// symbolication where the callsite is rarely on a symbol boundary.
+const char*  kintsuki_lookup_label_containing(kintsuki_t*, uint32_t addr,
+                                              uint32_t* out_offset);
 
 // Source-line lookup. Returns 1 + fills out_* when the loaded .adbg has
 // a LINES entry covering `addr` (last instruction emitted up to that

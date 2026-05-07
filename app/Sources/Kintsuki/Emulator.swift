@@ -58,7 +58,8 @@ final class Emulator: ObservableObject {
         var callsite: UInt32   // 24-bit
         var target:   UInt32   // 24-bit
         var kind:     UInt8    // 0=JSR, 1=JSL
-        var label:    String?  // resolved via .adbg labels, nil if no match
+        var label:    String?  // containing routine name from .adbg, nil if none
+        var offset:   UInt32   // bytes into `label` (0 when no label)
         var file:     String?  // resolved via .adbg LINES, nil if no entry
         var line:     UInt32?  // 1-based, nil if no entry
     }
@@ -504,11 +505,14 @@ final class Emulator: ObservableObject {
         out.reserveCapacity(Int(n))
         for i in 0..<Int(n) {
             let f = buf[i]
-            let label = kintsuki_lookup_label(h, f.callsite_pc).map {
+            // Containing-label lookup: callsites land mid-routine far
+            // more often than at a symbol's start address, so a strict
+            // exact match would leave most backtrace frames unsymbolicated.
+            var labelOffset: UInt32 = 0
+            let label = kintsuki_lookup_label_containing(h, f.callsite_pc,
+                                                         &labelOffset).map {
                 String(cString: $0)
             }
-            // Source-line lookup: use unsafe pointers since the C ABI
-            // takes optional out-params we want to fill.
             var filePtr: UnsafePointer<CChar>? = nil
             var lineNum: UInt32 = 0
             var colNum: UInt16 = 0
@@ -520,6 +524,7 @@ final class Emulator: ObservableObject {
                                       target:   f.target_pc,
                                       kind:     f.kind,
                                       label:    label,
+                                      offset:   label != nil ? labelOffset : 0,
                                       file:     file,
                                       line:     line))
         }

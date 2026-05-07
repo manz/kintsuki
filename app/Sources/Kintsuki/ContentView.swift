@@ -134,7 +134,16 @@ private struct CrashOverlay: View {
             let pc = String(format: "%02X:%04X",
                             (frame.callsite >> 16) & 0xFF,
                             frame.callsite & 0xFFFF)
-            let labelPart = frame.label.map { " in \($0)" } ?? ""
+            // `+offset` suffix only when non-zero — exact-start hits
+            // read cleaner without a "+0x0".
+            let labelPart: String
+            if let name = frame.label {
+                labelPart = frame.offset > 0
+                    ? String(format: " in %@+0x%X", name, frame.offset)
+                    : " in \(name)"
+            } else {
+                labelPart = ""
+            }
             // Trim verbose absolute paths to just the file's basename so
             // the overlay stays readable; user can grep/IDE-jump on the
             // copied report which has the full path embedded too.

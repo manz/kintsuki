@@ -266,9 +266,22 @@ class Emu:
         _native.lib.kintsuki_clear_adbg(self._handle)
 
     def lookup_label(self, addr: int) -> str | None:
-        """Return the label bound to ``addr`` (24-bit) or ``None``."""
+        """Return the label bound to *exactly* ``addr`` (24-bit), or
+        ``None``. Use :meth:`lookup_label_containing` for "which routine
+        is this PC inside" — exact match is rarely what you want for a
+        runtime PC."""
         raw = _native.lib.kintsuki_lookup_label(self._handle, addr & 0xFFFFFF)
         return raw.decode("utf-8") if raw else None
+
+    def lookup_label_containing(self, addr: int) -> tuple[str, int] | None:
+        """Return ``(name, offset)`` for the label whose address is the
+        largest ≤ ``addr`` (i.e. the routine ``addr`` lives inside).
+        ``offset`` is bytes past the label start. ``None`` when no
+        label precedes ``addr``."""
+        offset = ctypes.c_uint32(0)
+        raw = _native.lib.kintsuki_lookup_label_containing(
+            self._handle, addr & 0xFFFFFF, ctypes.byref(offset))
+        return (raw.decode("utf-8"), int(offset.value)) if raw else None
 
     def lookup_symbol_addr(self, name: str) -> int | None:
         """Reverse symbol lookup: return the 24-bit address bound to

@@ -157,6 +157,10 @@ int         kintsuki_load_state(kintsuki_t*, const void* buf, uint32_t len);
 // in uint32) valid until next frame. Width and height filled out.
 const uint32_t* kintsuki_framebuffer(kintsuki_t*, uint32_t* out_w, uint32_t* out_h);
 int         kintsuki_screenshot(kintsuki_t*, const char* path);
+// 1 if the PPU is in hires (BGMODE 5/6) or pseudo-hires; 0 otherwise.
+// Python `framebuffer()` uses this to collapse ares' always-doubled
+// 564-wide output back to single columns in normal mode.
+int         kintsuki_ppu_hires(kintsuki_t*);
 
 // Input. mask bits: Up=0 Down=1 Left=2 Right=3 B=4 A=5 Y=6 X=7 L=8 R=9 Select=10 Start=11
 void        kintsuki_set_input(kintsuki_t*, int port, uint16_t mask);
@@ -191,10 +195,18 @@ void     kintsuki_callstack_clear(kintsuki_t*);
 // previously-loaded table if any.
 int          kintsuki_load_adbg(kintsuki_t*, const char* path);
 void         kintsuki_clear_adbg(kintsuki_t*);
-// O(1) lookup. Returned pointer is valid until the next load_adbg /
-// clear_adbg / destroy. NULL if no label is bound at `addr` or no .adbg
-// is loaded. `addr` is masked to 24 bits.
+// O(1) lookup at the *exact* address. NULL if no label is bound there
+// or no .adbg is loaded. `addr` is masked to 24 bits.
 const char*  kintsuki_lookup_label(kintsuki_t*, uint32_t addr);
+
+// Containing-label lookup: returns the label whose address is the
+// largest ≤ `addr` (i.e. the routine `addr` lives inside). When
+// `out_offset` is non-NULL it receives `addr - labelAddr`. NULL when
+// no label precedes `addr`. O(log N), backed by a sorted vector
+// computed once at .adbg load time. Use this for crash-backtrace
+// symbolication where the callsite is rarely on a symbol boundary.
+const char*  kintsuki_lookup_label_containing(kintsuki_t*, uint32_t addr,
+                                              uint32_t* out_offset);
 
 // Source-line lookup. Returns 1 + fills out_* when the loaded .adbg has
 // a LINES entry covering `addr` (last instruction emitted up to that
@@ -205,6 +217,13 @@ int          kintsuki_lookup_source(kintsuki_t*, uint32_t addr,
                                     const char** out_file,
                                     uint32_t* out_line,
                                     uint16_t* out_column);
+
+// Reverse symbol lookup: name → 24-bit address. Returns 1 + fills
+// `out_addr` on hit, 0 if no label by that name is loaded. Used by
+// the tracer-mask API to translate `(symbol_name, size)` ranges into
+// PC ranges client-side.
+int          kintsuki_lookup_symbol_addr(kintsuki_t*, const char* name,
+                                         uint32_t* out_addr);
 
 // Formatted execution tracer. Wraps an exec callback that disassembles
 // the instruction at PC + dumps CPU registers, producing one Mesen-
@@ -226,6 +245,20 @@ void        kintsuki_tracer_stop(kintsuki_t*);
 // Copy ring contents to `out` (max `cap` bytes), return bytes written.
 // Drain clears the ring. In FILE mode returns 0.
 uint32_t    kintsuki_tracer_drain(kintsuki_t*, char* out, uint32_t cap);
+
+// Optional fine-grained PC mask. Each `(start, size)` describes a
+// half-open `[start, start+size)` 24-bit address range; tracer lines
+// only fire when PC falls inside *any* range in the list. Pass `count
+// == 0` (or `ranges == NULL`) to clear the mask and fall back to the
+// `[lo, hi]` range that `kintsuki_tracer_start` set. Sticky across
+// stop/start so callers can configure once and run multiple traces.
+typedef struct {
+  uint32_t start;   // 24-bit, masked at apply time
+  uint32_t size;    // bytes; entries with size == 0 are dropped
+} kintsuki_trace_range_t;
+void        kintsuki_tracer_set_ranges(kintsuki_t*,
+                                       const kintsuki_trace_range_t* ranges,
+                                       uint32_t count);
 
 #ifdef __cplusplus
 }
