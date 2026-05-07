@@ -120,7 +120,10 @@ def read_bg_tilemap(emu: _EmuLike, layer: int) -> Tilemap:
     for sub in range(sub_planes):
         sub_base = base_byte + sub * 0x800
         plane_bytes = emu.vram_read_range(sub_base, 32 * 32 * 2)
-        # memoryview supports indexed byte access; decode word-by-word.
+        # ctypes-backed memoryviews carry format `<B` which refuses
+        # subscripting on some Python versions; recast to plain `B` so
+        # `plane_bytes[i]` returns an int regardless of platform.
+        plane_bytes = memoryview(plane_bytes).cast("B")
         for i in range(32 * 32):
             lo = plane_bytes[i * 2]
             hi = plane_bytes[i * 2 + 1]

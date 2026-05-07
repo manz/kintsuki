@@ -854,6 +854,15 @@ const char* kintsuki_lookup_label(kintsuki_t* h, uint32_t addr) {
   return g_labels.lookup(addr);
 }
 
+const char* kintsuki_lookup_label_containing(kintsuki_t* h, uint32_t addr,
+                                             uint32_t* out_offset) {
+  if(!h) return nullptr;
+  uint32_t offset = 0;
+  const char* name = g_labels.lookupContaining(addr, offset);
+  if(name && out_offset) *out_offset = offset;
+  return name;
+}
+
 int kintsuki_lookup_symbol_addr(kintsuki_t* h, const char* name,
                                 uint32_t* out_addr) {
   if(!h || !name) return 0;

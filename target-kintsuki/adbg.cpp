@@ -224,7 +224,32 @@ auto AdbgLabels::load(const char* path) -> bool {
     // ever happens, taking the last definition matches xdds' behavior.
     byName[name] = addr24;
   }
+  // Build the sorted-by-address index used by lookupContaining. Source
+  // it from `byAddr` so the "first writer wins" collision behavior is
+  // preserved (the map already deduped). One-time O(N log N).
+  sortedLabels.reserve(byAddr.size());
+  for(const auto& kv : byAddr) sortedLabels.emplace_back(kv.first, kv.second);
+  std::sort(sortedLabels.begin(), sortedLabels.end(),
+            [](const auto& a, const auto& b) { return a.first < b.first; });
   return true;
+}
+
+auto AdbgLabels::lookupContaining(uint32_t addr,
+                                  uint32_t& out_offset) const -> const char* {
+  if(sortedLabels.empty()) return nullptr;
+  uint32_t needle = addr & 0xFFFFFF;
+  // upper_bound returns the first entry strictly greater than `needle`;
+  // step back by one to land on the largest entry ≤ needle. Returns
+  // nullptr when `needle` lies before the first labeled address.
+  auto it = std::upper_bound(
+      sortedLabels.begin(), sortedLabels.end(), needle,
+      [](uint32_t v, const std::pair<uint32_t, std::string>& e) {
+        return v < e.first;
+      });
+  if(it == sortedLabels.begin()) return nullptr;
+  --it;
+  out_offset = needle - it->first;
+  return it->second.c_str();
 }
 
 auto AdbgLabels::lookupAddress(const char* name,

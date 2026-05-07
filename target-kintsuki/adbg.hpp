@@ -30,6 +30,11 @@ struct AdbgLabels {
   // Sorted by `address` ascending so lookup_source can lower_bound the
   // nearest entry whose address <= the query.
   std::vector<LineEntry> lines;
+  // Sorted-by-address copy of `byAddr` so `lookupContaining` can binary
+  // search for the largest label ≤ a query PC. Built after parse.
+  // Pair ordering matches the parse order; on collisions the first
+  // emit wins (same as `byAddr`).
+  std::vector<std::pair<uint32_t, std::string>> sortedLabels;
 
   // Parse the .adbg file at `path`. Returns true on success; false on
   // missing file, bad magic, unsupported version, or truncated payload.
@@ -40,10 +45,19 @@ struct AdbgLabels {
     byName.clear();
     files.clear();
     lines.clear();
+    sortedLabels.clear();
   }
 
-  // O(1) label lookup. Returns nullptr when no label is bound at `addr`.
+  // O(1) label lookup at the *exact* address. Returns nullptr when no
+  // label is bound at `addr`.
   auto lookup(uint32_t addr) const -> const char*;
+
+  // Containing-label lookup: returns the label whose address is the
+  // largest ≤ `addr` (i.e. the routine `addr` lives inside). Fills
+  // `out_offset` with `addr - labelAddr`. Returns nullptr when no
+  // label precedes `addr`. Backed by a sorted vector + lower_bound,
+  // O(log N).
+  auto lookupContaining(uint32_t addr, uint32_t& out_offset) const -> const char*;
 
   // Reverse lookup: returns true and fills `out_addr` when a label
   // named `name` exists; false otherwise.

@@ -162,6 +162,8 @@ _bind("kintsuki_callstack_clear", None, [HANDLE])
 _bind("kintsuki_load_adbg",     c_int,    [HANDLE, c_char_p])
 _bind("kintsuki_clear_adbg",    None,     [HANDLE])
 _bind("kintsuki_lookup_label",  c_char_p, [HANDLE, c_uint32])
+_bind("kintsuki_lookup_label_containing", c_char_p,
+      [HANDLE, c_uint32, POINTER(c_uint32)])
 _bind("kintsuki_lookup_source", c_int,
       [HANDLE, c_uint32, POINTER(c_char_p), POINTER(c_uint32), POINTER(c_uint16)])
 _bind("kintsuki_lookup_symbol_addr", c_int,
