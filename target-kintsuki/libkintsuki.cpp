@@ -393,6 +393,15 @@ int kintsuki_screenshot(kintsuki_t* h, const char* path) {
   return (h && h->program->writeScreenshot(path)) ? 1 : 0;
 }
 
+// 1 when the PPU is in BGMODE 5/6 or pseudo-hires (each emitted column
+// is a real pixel), 0 in normal mode (every other column is a dupe).
+// Lets Python `framebuffer()` collapse the doubled output the same way
+// `kintsuki_screenshot` does so canonical bytes match the canonical PNG.
+int kintsuki_ppu_hires(kintsuki_t* h) {
+  if(!h) return 0;
+  return ares::SuperFamicom::ppuPerformanceImpl.hires() ? 1 : 0;
+}
+
 void kintsuki_set_input(kintsuki_t* h, int port, uint16_t mask) {
   if(!h || port < 0 || port > 1) return;
   h->program->inputState[port] = mask;

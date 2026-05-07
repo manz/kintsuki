@@ -473,18 +473,22 @@ class Emu:
 
     # ----------------------------------------------------------- Framebuffer
     def framebuffer(self) -> tuple[bytes, int, int]:
-        """Returns (raw_bytes, width, height). The bytes are the native
-        framebuffer copied straight out of libkintsuki — each pixel is a
-        little-endian ``uint32`` packed ``0x00RRGGBB``, so on disk they
-        read as ``B G R 0`` per pixel, not RGBA.
+        """Returns ``(raw_bytes, width, height)``. Each pixel is a
+        little-endian ``uint32`` packed ``0x00RRGGBB``, so on disk the
+        bytes read as ``B G R 0`` per pixel — not canonical RGBA. Use
+        :meth:`screenshot` to write a properly-encoded RGB PNG, or
+        :func:`kintsuki.visual.golden` for record-or-compare assertions
+        (both share the same hires-aware C path).
 
-        Use :meth:`screenshot` to write a properly-encoded RGB PNG (the
-        C path unpacks correctly), or :func:`kintsuki.visual.golden` for
-        record-or-compare assertions — both share that path so their
-        pixels are bit-identical.
+        Hires-aware: ares' performance PPU always emits a 564-pixel-wide
+        framebuffer to keep the renderer letterbox math simple. In normal
+        mode every other column is just a duplicate of the previous one,
+        so we collapse to single columns (yielding ~282 width). In
+        hires (BGMODE 5/6) or pseudo-hires mode the doubled columns
+        carry distinct data and we keep them.
 
-        The buffer is valid only until the next ``run_*`` call; the
-        returned ``bytes`` is an owned copy."""
+        Returned bytes are an owned copy; the underlying buffer is valid
+        only until the next ``run_*`` call."""
         w = ctypes.c_uint32(0)
         h = ctypes.c_uint32(0)
         ptr = _native.lib.kintsuki_framebuffer(
@@ -492,9 +496,21 @@ class Emu:
         )
         if not ptr or not w.value or not h.value:
             return (b"", 0, 0)
-        n = w.value * h.value
-        raw = ctypes.string_at(ptr, n * 4)
-        return (raw, int(w.value), int(h.value))
+        raw = ctypes.string_at(ptr, w.value * h.value * 4)
+        if _native.lib.kintsuki_ppu_hires(self._handle):
+            return (raw, int(w.value), int(h.value))
+        # Normal-mode collapse: keep every even column. ares' width is
+        # always even (564), and ``array`` gives us a fast pure-stdlib
+        # strided-take per row without falling into a per-pixel Python
+        # loop.
+        import array
+        src = array.array("I")
+        src.frombytes(raw)
+        out_w = w.value // 2
+        kept = array.array("I")
+        for y in range(h.value):
+            kept.extend(src[y * w.value : (y + 1) * w.value : 2])
+        return (kept.tobytes(), int(out_w), int(h.value))
 
     def screenshot(self, path: str) -> bool:
         return bool(_native.lib.kintsuki_screenshot(self._handle, path.encode("utf-8")))

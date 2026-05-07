@@ -398,31 +398,52 @@ auto Program::loadStateFile(const char* path) -> bool {
   return loadStateBlob(blob.data(), blob.size());
 }
 
+// ares' performance PPU always emits a 564-pixel-wide framebuffer so the
+// host renderer (e.g. Swift's MetalRenderer) can letterbox without caring
+// about hires. For canonical PNG/PPM output we don't want that doubling
+// when the PPU is in normal-mode — every other column is just a duplicate
+// of the one before it. In hires (BGMODE 5/6) or pseudo-hires the columns
+// carry distinct data, so the doubled width is real and we keep it.
+auto Program::frameOutputWidth() const -> u32 {
+  return ares::SuperFamicom::ppuPerformanceImpl.hires() ? fbWidth : fbWidth / 2;
+}
+
 auto Program::writePNG(const char* path) -> bool {
   if(!fbWidth || !fbHeight) return false;
-  std::vector<uint8_t> rgb(size_t(fbWidth) * fbHeight * 3);
-  for(u32 i = 0; i < fbWidth * fbHeight; i++) {
-    u32 px = fb[i];
-    rgb[i*3 + 0] = (uint8_t)((px >> 16) & 0xff);
-    rgb[i*3 + 1] = (uint8_t)((px >>  8) & 0xff);
-    rgb[i*3 + 2] = (uint8_t)((px >>  0) & 0xff);
+  bool hires = ares::SuperFamicom::ppuPerformanceImpl.hires();
+  u32 outW = hires ? fbWidth : fbWidth / 2;
+  std::vector<uint8_t> rgb(size_t(outW) * fbHeight * 3);
+  for(u32 y = 0; y < fbHeight; y++) {
+    for(u32 x = 0; x < outW; x++) {
+      u32 srcX = hires ? x : x * 2;
+      u32 px = fb[y * fbWidth + srcX];
+      uint8_t* dst = rgb.data() + (y * outW + x) * 3;
+      dst[0] = (uint8_t)((px >> 16) & 0xff);
+      dst[1] = (uint8_t)((px >>  8) & 0xff);
+      dst[2] = (uint8_t)((px >>  0) & 0xff);
+    }
   }
-  return stbi_write_png(path, fbWidth, fbHeight, 3, rgb.data(), fbWidth * 3) != 0;
+  return stbi_write_png(path, outW, fbHeight, 3, rgb.data(), outW * 3) != 0;
 }
 
 auto Program::writePPM(const char* path) -> bool {
   if(!fbWidth || !fbHeight) return false;
+  bool hires = ares::SuperFamicom::ppuPerformanceImpl.hires();
+  u32 outW = hires ? fbWidth : fbWidth / 2;
   std::ofstream f(path, std::ios::binary);
   if(!f) return false;
-  f << "P6\n" << fbWidth << " " << fbHeight << "\n255\n";
-  for(u32 i = 0; i < fbWidth * fbHeight; i++) {
-    u32 px = fb[i];
-    uint8_t rgb[3] = {
-      (uint8_t)((px >> 16) & 0xff),
-      (uint8_t)((px >>  8) & 0xff),
-      (uint8_t)((px >>  0) & 0xff),
-    };
-    f.write((const char*)rgb, 3);
+  f << "P6\n" << outW << " " << fbHeight << "\n255\n";
+  for(u32 y = 0; y < fbHeight; y++) {
+    for(u32 x = 0; x < outW; x++) {
+      u32 srcX = hires ? x : x * 2;
+      u32 px = fb[y * fbWidth + srcX];
+      uint8_t rgb[3] = {
+        (uint8_t)((px >> 16) & 0xff),
+        (uint8_t)((px >>  8) & 0xff),
+        (uint8_t)((px >>  0) & 0xff),
+      };
+      f.write((const char*)rgb, 3);
+    }
   }
   return f.good();
 }

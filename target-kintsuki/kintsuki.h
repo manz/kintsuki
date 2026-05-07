@@ -157,6 +157,10 @@ int         kintsuki_load_state(kintsuki_t*, const void* buf, uint32_t len);
 // in uint32) valid until next frame. Width and height filled out.
 const uint32_t* kintsuki_framebuffer(kintsuki_t*, uint32_t* out_w, uint32_t* out_h);
 int         kintsuki_screenshot(kintsuki_t*, const char* path);
+// 1 if the PPU is in hires (BGMODE 5/6) or pseudo-hires; 0 otherwise.
+// Python `framebuffer()` uses this to collapse ares' always-doubled
+// 564-wide output back to single columns in normal mode.
+int         kintsuki_ppu_hires(kintsuki_t*);
 
 // Input. mask bits: Up=0 Down=1 Left=2 Right=3 B=4 A=5 Y=6 X=7 L=8 R=9 Select=10 Start=11
 void        kintsuki_set_input(kintsuki_t*, int port, uint16_t mask);
