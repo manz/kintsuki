@@ -178,7 +178,15 @@ final class RewindBuffer {
     /// less memory.
     let keyframeInterval: Int
 
-    private var frames: [FrameEntry] = []
+    /// Fixed-size circular slot array. Indexed via `slotIndex(at:)` which
+    /// adds the public 0..<count cursor to the wrapping `ringHead`. Push
+    /// and eviction are O(1): we only mutate the head/tail tracking
+    /// integers, never shift array elements (Swift `Array.removeFirst()`
+    /// would element-shift the whole 3600-slot buffer per push at cap,
+    /// which used to drop fps by ~40 once the ring saturated).
+    private var ring: [FrameEntry?]
+    private var ringHead: Int = 0
+    private var ringSize: Int = 0
     private var bytes: Int = 0
 
     /// Absolute count of `push` calls since the buffer was created or
@@ -216,12 +224,27 @@ final class RewindBuffer {
         self.scratch = Data(count: initialSlotBytes)
         self.xorWorkspace = Data(count: initialSlotBytes)
         self.compressedWorkspace = Data(count: initialSlotBytes + 64)
-        frames.reserveCapacity(capacity)
+        // Pre-allocate every ring slot so push/evict mutate in place.
+        self.ring = Array(repeating: nil, count: capacity)
     }
 
-    var count: Int { frames.count }
+    var count: Int { ringSize }
     /// Approximate retained byte size (keyframe lengths + deltas).
     var byteSize: Int { bytes }
+
+    /// Underlying array index for a public 0..<count cursor.
+    private func slotIndex(at i: Int) -> Int {
+        return (ringHead + i) % capacity
+    }
+
+    /// Read access shim so the rest of the buffer keeps reading
+    /// "frames[i]" through the public cursor without caring about wrap.
+    private func entry(at i: Int) -> FrameEntry {
+        return ring[slotIndex(at: i)]!
+    }
+    private func setEntry(at i: Int, _ value: FrameEntry) {
+        ring[slotIndex(at: i)] = value
+    }
 
     // MARK: Pushing
 
@@ -235,34 +258,42 @@ final class RewindBuffer {
         ensureWorkspaceCapacity(forBytes: requestedCount)
         let isKeyframe = (pushedSoFar % keyframeInterval) == 0
         pushedSoFar += 1
+        // Make room before writing — eviction happens before the new
+        // entry overwrites a slot so the byte accounting / pool release
+        // for the dropped entry runs against its current state.
+        if ringSize == capacity {
+            evictHead()
+        }
+        let nextCursor = ringSize  // index in 0..<size for the new entry
 
         if isKeyframe {
             let h = keyframePool.acquire(requested: requestedCount,
                                          producer: producer)
-            frames.append(.keyframe(h))
+            ring[slotIndex(at: nextCursor)] = .keyframe(h)
             bytes += h.length
         } else {
             let written = scratch.withUnsafeMutableBytes { raw in
                 producer(UnsafeMutableRawBufferPointer(start: raw.baseAddress,
                                                        count: requestedCount))
             }
-            let kfIndex = nearestKeyframeIndex(forFrameIndex: frames.count)
+            let kfIndex = nearestKeyframeIndex(forFrameIndex: nextCursor)
             // No frame to delta against → promote to keyframe instead.
             guard kfIndex >= 0,
-                  case .keyframe(let kh) = frames[kfIndex] else {
+                  case .keyframe(let kh) = entry(at: kfIndex) else {
                 let h = keyframePool.acquire(copyingFrom: scratch.prefix(written))
-                frames.append(.keyframe(h))
+                ring[slotIndex(at: nextCursor)] = .keyframe(h)
                 bytes += h.length
+                ringSize += 1
                 return
             }
             xorIntoWorkspace(scratchLen: written, keyframeHandle: kh)
             let compressed = compressFromWorkspace(length: written)
             let kfLogical = kfIndex + firstLogicalIdx
-            frames.append(.delta(keyframeLogical: kfLogical,
-                                 compressed: compressed))
+            ring[slotIndex(at: nextCursor)] = .delta(keyframeLogical: kfLogical,
+                                                     compressed: compressed)
             bytes += compressed.count
         }
-        evictExcess()
+        ringSize += 1
     }
 
     /// Convenience for callers with a Data already in hand.
@@ -280,14 +311,14 @@ final class RewindBuffer {
     // MARK: Reconstruction
 
     func materialize(at i: Int) -> Data? {
-        guard i >= 0, i < frames.count else { return nil }
-        switch frames[i] {
+        guard i >= 0, i < ringSize else { return nil }
+        switch entry(at: i) {
         case .keyframe(let h):
             return keyframePool.bytes(for: h)
         case .delta(let kfLogical, let compressed):
             let kfArrayIdx = kfLogical - firstLogicalIdx
-            guard kfArrayIdx >= 0, kfArrayIdx < frames.count,
-                  case .keyframe(let kh) = frames[kfArrayIdx] else {
+            guard kfArrayIdx >= 0, kfArrayIdx < ringSize,
+                  case .keyframe(let kh) = entry(at: kfArrayIdx) else {
                 return nil
             }
             let base = keyframePool.bytes(for: kh)
@@ -298,21 +329,33 @@ final class RewindBuffer {
 
     @discardableResult
     func popLast() -> Data? {
-        guard !frames.isEmpty else { return nil }
-        let lastPopped = materialize(at: frames.count - 1)
-        switch frames.removeLast() {
+        guard ringSize > 0 else { return nil }
+        let lastIdx = ringSize - 1
+        let lastPopped = materialize(at: lastIdx)
+        let lastSlot = slotIndex(at: lastIdx)
+        switch ring[lastSlot]! {
         case .keyframe(let h):
             bytes -= h.length
             keyframePool.release(h)
         case .delta(_, let compressed):
             bytes -= compressed.count
         }
+        ring[lastSlot] = nil
+        ringSize -= 1
         return lastPopped
     }
 
     func clear() {
-        keyframePool.releaseAll()
-        frames.removeAll(keepingCapacity: true)
+        // Release any keyframe pool slots still held, then zero the
+        // ring without touching the underlying allocation.
+        for i in 0..<ringSize {
+            if case .keyframe(let h) = entry(at: i) {
+                keyframePool.release(h)
+            }
+            ring[slotIndex(at: i)] = nil
+        }
+        ringHead = 0
+        ringSize = 0
         bytes = 0
         pushedSoFar = 0
         firstLogicalIdx = 0
@@ -328,45 +371,47 @@ final class RewindBuffer {
         }
     }
 
-    private func evictExcess() {
-        guard frames.count > capacity else { return }
-        var toDrop = frames.count - capacity
-        while toDrop > 0 {
-            switch frames[0] {
-            case .keyframe(let h):
-                // Promote frames[1] BEFORE releasing this keyframe —
-                // materialize(at:1) needs to XOR the delta against the
-                // about-to-be-evicted keyframe, and bytes(for:) trips
-                // the precondition if its slot has already been freed.
-                // The promoted entry inherits its own logical id, so
-                // chained deltas at frames[2..] keep referencing the
-                // OLD evicted keyframe's logical id — they'll fail to
-                // resolve on materialize, which is the same behavior
-                // the old "renumber" path papered over.
-                if frames.count > 1, case .delta = frames[1],
-                   let materialized = materialize(at: 1),
-                   case .delta(_, let oldComp) = frames[1] {
-                    bytes -= oldComp.count
-                    let promoted = keyframePool.acquire(copyingFrom: materialized)
-                    frames[1] = .keyframe(promoted)
-                    bytes += promoted.length
-                }
-                bytes -= h.length
-                keyframePool.release(h)
-            case .delta(_, let compressed):
-                bytes -= compressed.count
+    /// Drop the oldest entry: O(1). Promotion of the next-oldest delta
+    /// to a keyframe still happens here when the dropped entry was a
+    /// keyframe, so chained deltas can XOR against fresh bytes.
+    private func evictHead() {
+        guard ringSize > 0 else { return }
+        switch entry(at: 0) {
+        case .keyframe(let h):
+            // Promote ring[1] BEFORE releasing this keyframe —
+            // materialize(at:1) needs to XOR the delta against the
+            // about-to-be-evicted keyframe, and bytes(for:) trips the
+            // precondition if its slot has already been freed.
+            //
+            // Caveat (pre-existing): the promoted entry inherits its
+            // own logical id, so chained deltas at ring[2..] still
+            // reference the evicted keyframe's logical id and will
+            // fail to resolve on materialize. The old "renumber" path
+            // papered over the index, but the bytes were equally
+            // wrong. Documented but not fixed here.
+            if ringSize > 1, case .delta = entry(at: 1),
+               let materialized = materialize(at: 1),
+               case .delta(_, let oldComp) = entry(at: 1) {
+                bytes -= oldComp.count
+                let promoted = keyframePool.acquire(copyingFrom: materialized)
+                setEntry(at: 1, .keyframe(promoted))
+                bytes += promoted.length
             }
-            frames.removeFirst()
-            firstLogicalIdx += 1
-            toDrop -= 1
+            bytes -= h.length
+            keyframePool.release(h)
+        case .delta(_, let compressed):
+            bytes -= compressed.count
         }
-        // No renumber: deltas reference keyframes by stable logical id.
+        ring[ringHead] = nil
+        ringHead = (ringHead + 1) % capacity
+        ringSize -= 1
+        firstLogicalIdx += 1
     }
 
     private func nearestKeyframeIndex(forFrameIndex i: Int) -> Int {
         var j = i - 1
         while j >= 0 {
-            if case .keyframe = frames[j] { return j }
+            if case .keyframe = entry(at: j) { return j }
             j -= 1
         }
         return -1
