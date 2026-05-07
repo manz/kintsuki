@@ -57,11 +57,16 @@ final class Emulator: ObservableObject {
         let id = UUID()
         var callsite: UInt32   // 24-bit
         var target:   UInt32   // 24-bit
-        var kind:     UInt8    // 0=JSR, 1=JSL
+        var kind:     UInt8    // 0=JSR, 1=JSL, 0xFF=halt site
         var label:    String?  // containing routine name from .adbg, nil if none
         var offset:   UInt32   // bytes into `label` (0 when no label)
         var file:     String?  // resolved via .adbg LINES, nil if no entry
         var line:     UInt32?  // 1-based, nil if no entry
+        // CPU register snapshot. Populated only for the halt-site frame
+        // (`kind == 0xFF`); older callsite frames would need per-JSR
+        // snapshotting in the call hook to recover, which doubles the
+        // hook's cost — defer until somebody asks for it.
+        var cpu:      CpuState? = nil
     }
 
     /// Captured shadow callstack at the moment the CPU first transitioned
@@ -514,7 +519,8 @@ final class Emulator: ObservableObject {
                 // pending JSR/JSL callsites in deepest→shallowest order.
                 // Storing them this way lets the overlay just iterate
                 // and print without juggling a separate "site" header.
-                let site = resolveFrame(at: s.pc, kind: 0xFF, target: 0)
+                var site = resolveFrame(at: s.pc, kind: 0xFF, target: 0)
+                site.cpu = s
                 let stack = captureBacktrace().reversed()
                 crashBacktrace = [site] + stack
                 crashSite = site

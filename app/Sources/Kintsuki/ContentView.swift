@@ -131,7 +131,8 @@ private struct CrashOverlay: View {
     }
 
     private var backtraceText: String {
-        emulator.crashBacktrace.enumerated().map { idx, frame in
+        var lines: [String] = []
+        for (idx, frame) in emulator.crashBacktrace.enumerated() {
             let pc = String(format: "%02X:%04X",
                             (frame.callsite >> 16) & 0xFF,
                             frame.callsite & 0xFFFF)
@@ -153,8 +154,25 @@ private struct CrashOverlay: View {
                 let base = (file as NSString).lastPathComponent
                 srcPart = "  (\(base):\(line))"
             }
-            return String(format: "#%-2d %@%@%@", idx, pc, labelPart, srcPart)
-        }.joined(separator: "\n")
+            lines.append(String(format: "#%-2d %@%@%@",
+                                idx, pc, labelPart, srcPart))
+            // CPU registers ride with the halt-site frame (#0). Keep
+            // them indented under their frame so a copy-paste of the
+            // whole report stays readable.
+            if let cpu = frame.cpu {
+                lines.append(formatRegisters(cpu))
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func formatRegisters(_ cpu: Emulator.CpuState) -> String {
+        // Mesen-style register dump. P / E / STP / WAI on one line so
+        // the dropdown isn't taller than the rest of the overlay.
+        let regs = String(format:
+            "    A:%04X X:%04X Y:%04X S:%04X D:%04X B:%02X P:%02X E:%d",
+            cpu.a, cpu.x, cpu.y, cpu.s, cpu.d, cpu.b, cpu.p, cpu.e ? 1 : 0)
+        return regs
     }
 
     private func copyToPasteboard() {
