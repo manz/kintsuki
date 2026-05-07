@@ -270,6 +270,47 @@ class Emu:
         raw = _native.lib.kintsuki_lookup_label(self._handle, addr & 0xFFFFFF)
         return raw.decode("utf-8") if raw else None
 
+    def lookup_symbol_addr(self, name: str) -> int | None:
+        """Reverse symbol lookup: return the 24-bit address bound to
+        ``name`` in the loaded ``.adbg`` table, or ``None`` if no label
+        by that name exists."""
+        out = ctypes.c_uint32(0)
+        ok = _native.lib.kintsuki_lookup_symbol_addr(
+            self._handle, name.encode("utf-8"), ctypes.byref(out))
+        return int(out.value) if ok else None
+
+    def tracer_set_ranges(self, ranges: list[tuple[int, int]] | None) -> None:
+        """Mask tracer emission to PC ranges. Each ``(start, size)``
+        describes a half-open ``[start, start+size)`` range; a line
+        fires only when PC falls in any range. Pass ``None`` or an
+        empty list to clear the mask and fall back to the
+        ``tracer_start(lo, hi)`` window. Sticky across stop/start."""
+        if not ranges:
+            _native.lib.kintsuki_tracer_set_ranges(self._handle, None, 0)
+            return
+        buf = (_native.TraceRange * len(ranges))()
+        for i, (start, size) in enumerate(ranges):
+            buf[i].start = start & 0xFFFFFF
+            buf[i].size = size
+        _native.lib.kintsuki_tracer_set_ranges(self._handle, buf, len(ranges))
+
+    def tracer_mask_symbols(self, symbols: list[tuple[str, int]]) -> list[str]:
+        """Convenience: resolve each ``(symbol_name, size)`` against the
+        loaded ``.adbg``, then apply :meth:`tracer_set_ranges`. Returns
+        the list of names that *failed* to resolve (caller can warn /
+        bail). Symbols with no match are silently skipped — the trace
+        is still scoped to the symbols that did resolve."""
+        ranges: list[tuple[int, int]] = []
+        unresolved: list[str] = []
+        for name, size in symbols:
+            addr = self.lookup_symbol_addr(name)
+            if addr is None:
+                unresolved.append(name)
+                continue
+            ranges.append((addr, size))
+        self.tracer_set_ranges(ranges)
+        return unresolved
+
     def lookup_source(self, addr: int) -> tuple[str, int, int] | None:
         """Resolve ``addr`` to ``(file, line, column)`` via the loaded
         ``.adbg`` LINES section. Returns ``None`` when no covering

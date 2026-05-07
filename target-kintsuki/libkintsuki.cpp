@@ -540,11 +540,20 @@ void kintsuki_remove_callback(kintsuki_t* h, int kind, int id) {
 // ---- Formatted execution tracer ------------------------------------------
 // Single tracer per emulator instance. Hooked from cOnExec via tracerOnExec.
 namespace {
+struct TraceRange {
+  uint32_t start;  // 24-bit
+  uint32_t size;   // bytes; PC ∈ [start, start + size)
+};
 struct Tracer {
   bool      active = false;
   uint32_t  lo = 0, hi = 0;
   bool      file_mode = false;
   FILE*     fp = nullptr;
+  // Optional fine-grained PC mask. When non-empty, takes precedence
+  // over [lo,hi]: a PC must fall inside one of the ranges for the line
+  // to fire. Caller-side resolution (typically symbol_name + size via
+  // .adbg) is the easy way to scope a trace to one routine.
+  std::vector<TraceRange> ranges;
   // Ring buffer (RING mode): bounded byte buffer, oldest evicted on append.
   std::vector<char> ring;
   uint32_t  ring_cap = 0;
@@ -621,7 +630,18 @@ auto resolveControlFlowTarget(uint32_t pc) -> uint32_t {
 
 void tracerOnExec(uint32_t pc) {
   if(!g_tracer.active) return;
-  if(pc < g_tracer.lo || pc > g_tracer.hi) return;
+  // Range-list mask takes precedence over [lo,hi] when populated. Linear
+  // scan is fine: typical workloads pass <10 ranges, and short-circuit
+  // exits as soon as a hit is found.
+  if(!g_tracer.ranges.empty()) {
+    bool inside = false;
+    for(const auto& r : g_tracer.ranges) {
+      if(pc >= r.start && pc < r.start + r.size) { inside = true; break; }
+    }
+    if(!inside) return;
+  } else if(pc < g_tracer.lo || pc > g_tracer.hi) {
+    return;
+  }
 
   // .adbg label header. Emitted only when the current PC sits at a known
   // label and that label differs from the last one we annotated, so a
@@ -832,6 +852,28 @@ void kintsuki_clear_adbg(kintsuki_t* h) {
 const char* kintsuki_lookup_label(kintsuki_t* h, uint32_t addr) {
   if(!h) return nullptr;
   return g_labels.lookup(addr);
+}
+
+int kintsuki_lookup_symbol_addr(kintsuki_t* h, const char* name,
+                                uint32_t* out_addr) {
+  if(!h || !name) return 0;
+  uint32_t addr = 0;
+  if(!g_labels.lookupAddress(name, addr)) return 0;
+  if(out_addr) *out_addr = addr;
+  return 1;
+}
+
+void kintsuki_tracer_set_ranges(kintsuki_t* h,
+                                const kintsuki_trace_range_t* ranges,
+                                uint32_t count) {
+  if(!h) return;
+  g_tracer.ranges.clear();
+  if(!ranges || count == 0) return;
+  g_tracer.ranges.reserve(count);
+  for(uint32_t i = 0; i < count; i++) {
+    if(ranges[i].size == 0) continue;
+    g_tracer.ranges.push_back({ranges[i].start & 0xFFFFFFu, ranges[i].size});
+  }
 }
 
 int kintsuki_lookup_source(kintsuki_t* h, uint32_t addr,

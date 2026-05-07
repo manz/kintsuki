@@ -164,6 +164,17 @@ _bind("kintsuki_clear_adbg",    None,     [HANDLE])
 _bind("kintsuki_lookup_label",  c_char_p, [HANDLE, c_uint32])
 _bind("kintsuki_lookup_source", c_int,
       [HANDLE, c_uint32, POINTER(c_char_p), POINTER(c_uint32), POINTER(c_uint16)])
+_bind("kintsuki_lookup_symbol_addr", c_int,
+      [HANDLE, c_char_p, POINTER(c_uint32)])
+
+
+# Tracer range mask. Mirrors `kintsuki_trace_range_t`.
+class TraceRange(Structure):
+    _fields_ = [("start", c_uint32), ("size", c_uint32)]
+
+
+_bind("kintsuki_tracer_set_ranges", None,
+      [HANDLE, POINTER(TraceRange), c_uint32])
 
 
 # PPU/DMA snapshot. Layout must match `kintsuki_ppu_state_t` in

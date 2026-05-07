@@ -167,6 +167,46 @@ def test_lookup_source_resolves_file_line(assemble_rom):
         assert emu.lookup_source(0x000000) is None
 
 
+def test_tracer_mask_symbols_scopes_emission(assemble_rom, tmp_path):
+    """``tracer_mask_symbols`` should scope trace lines to PCs inside
+    the declared symbol+size ranges. Pick `outer` with size 4 (covers
+    the `nop` + 3-byte `jsr inner`) and verify only that range fires."""
+    rom = assemble_rom("test_callstack.s")
+    adbg = Path(str(rom) + ".adbg")
+    if not adbg.exists():
+        pytest.skip(f"missing .adbg next to {rom.name}")
+    log = tmp_path / "trace.log"
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        emu.load_adbg(adbg)
+        outer = emu.lookup_symbol_addr("outer")
+        assert outer is not None, "outer label should resolve from .adbg"
+        unresolved = emu.tracer_mask_symbols([("outer", 4)])
+        assert unresolved == []
+        # [lo,hi] is wide-open; only the symbol mask should constrain.
+        emu.tracer_start(lo=0x000000, hi=0xFFFFFF, path=str(log))
+        for _ in range(5):
+            emu.run_frames(1)
+            if emu.get_state().stp:
+                break
+        emu.tracer_stop()
+        emu.tracer_set_ranges(None)
+    text = log.read_text()
+    assert text, "tracer emitted no lines despite covering `outer`"
+    for line in text.splitlines():
+        if not line.strip():
+            continue
+        # Skip native `; --- name ---` headers — only PC-prefixed lines
+        # need to fall inside the mask.
+        if line.startswith(";"):
+            continue
+        bb, aaaa = line[:7].split(":")
+        pc = (int(bb, 16) << 16) | int(aaaa, 16)
+        assert outer <= pc < outer + 4, (
+            f"line outside masked range: pc={pc:06X}, "
+            f"range={outer:06X}+4 line={line!r}")
+
+
 def test_lookup_label_roundtrip(assemble_rom):
     """``Emu.load_adbg`` + ``Emu.lookup_label`` resolve assembled symbols."""
     rom = assemble_rom("test_ppu_state.s")
