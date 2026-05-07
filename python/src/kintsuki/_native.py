@@ -249,6 +249,7 @@ _bind("kintsuki_load_state", c_int, [HANDLE, c_void_p, c_uint32])
 # Framebuffer / screenshot
 _bind("kintsuki_framebuffer", POINTER(c_uint32), [HANDLE, POINTER(c_uint32), POINTER(c_uint32)])
 _bind("kintsuki_screenshot", c_int, [HANDLE, c_char_p])
+_bind("kintsuki_ppu_hires", c_int, [HANDLE])
 
 # Input
 _bind("kintsuki_set_input", None, [HANDLE, c_int, c_uint16])

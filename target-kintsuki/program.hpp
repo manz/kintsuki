@@ -67,6 +67,11 @@ struct Program : ares::Platform {
   auto writePNG(const char* path) -> bool;
   auto writePPM(const char* path) -> bool;
   auto writeScreenshot(const char* path) -> bool;
+  // Width of the corrected (hires-aware) screenshot output: full native
+  // width in hires / pseudo-hires mode, half of it (single column per
+  // pixel) in normal mode where ares duplicates columns to keep the
+  // renderer happy.
+  auto frameOutputWidth() const -> u32;
 
   // Input. Bits indexed by Gamepad enum
   // (Up=0, Down=1, Left=2, Right=3, B=4, A=5, Y=6, X=7, L=8, R=9, Select=10, Start=11).
