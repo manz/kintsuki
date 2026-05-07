@@ -160,8 +160,13 @@ final class SaveStatePool {
 private enum FrameEntry {
     /// Full uncompressed state stored in `SaveStatePool`.
     case keyframe(SaveStatePool.Handle)
-    /// XOR delta vs the keyframe at `keyframeIndex`, compressed.
-    case delta(keyframeIndex: Int, compressed: Data)
+    /// XOR delta vs the keyframe at logical index `keyframeLogical`,
+    /// compressed via LZ4. The logical index is monotonic across the
+    /// buffer's lifetime — eviction shifts the array but not these
+    /// stored references, so we don't need to walk the whole ring on
+    /// every push to rewrite `keyframeIndex`. Resolve to a current
+    /// array index via `keyframeLogical - firstLogicalIdx`.
+    case delta(keyframeLogical: Int, compressed: Data)
 }
 
 final class RewindBuffer {
@@ -182,6 +187,13 @@ final class RewindBuffer {
     /// pinned at `capacity` and a `frames.count % keyframeInterval`
     /// formula would mark every push as a keyframe (30 MB/s of leak).
     private var pushedSoFar: Int = 0
+
+    /// Logical index of `frames[0]`. Increments by 1 every time a frame
+    /// is evicted from the front so deltas can reference their keyframe
+    /// by a stable monotonic id instead of an array index that shifts
+    /// on every eviction. Lets us skip the O(N) renumber walk that used
+    /// to fire on every push at cap (=> -40 fps once the ring saturated).
+    private var firstLogicalIdx: Int = 0
 
     /// Pre-allocated keyframe storage. Sized to host every concurrent
     /// keyframe a saturated ring can reference, plus one for the
@@ -245,7 +257,9 @@ final class RewindBuffer {
             }
             xorIntoWorkspace(scratchLen: written, keyframeHandle: kh)
             let compressed = compressFromWorkspace(length: written)
-            frames.append(.delta(keyframeIndex: kfIndex, compressed: compressed))
+            let kfLogical = kfIndex + firstLogicalIdx
+            frames.append(.delta(keyframeLogical: kfLogical,
+                                 compressed: compressed))
             bytes += compressed.count
         }
         evictExcess()
@@ -270,8 +284,12 @@ final class RewindBuffer {
         switch frames[i] {
         case .keyframe(let h):
             return keyframePool.bytes(for: h)
-        case .delta(let kfIndex, let compressed):
-            guard case .keyframe(let kh) = frames[kfIndex] else { return nil }
+        case .delta(let kfLogical, let compressed):
+            let kfArrayIdx = kfLogical - firstLogicalIdx
+            guard kfArrayIdx >= 0, kfArrayIdx < frames.count,
+                  case .keyframe(let kh) = frames[kfArrayIdx] else {
+                return nil
+            }
             let base = keyframePool.bytes(for: kh)
             let diff = decompress(compressed)
             return xor(base, diff)
@@ -297,6 +315,7 @@ final class RewindBuffer {
         frames.removeAll(keepingCapacity: true)
         bytes = 0
         pushedSoFar = 0
+        firstLogicalIdx = 0
     }
 
     // MARK: Internals
@@ -319,6 +338,11 @@ final class RewindBuffer {
                 // materialize(at:1) needs to XOR the delta against the
                 // about-to-be-evicted keyframe, and bytes(for:) trips
                 // the precondition if its slot has already been freed.
+                // The promoted entry inherits its own logical id, so
+                // chained deltas at frames[2..] keep referencing the
+                // OLD evicted keyframe's logical id — they'll fail to
+                // resolve on materialize, which is the same behavior
+                // the old "renumber" path papered over.
                 if frames.count > 1, case .delta = frames[1],
                    let materialized = materialize(at: 1),
                    case .delta(_, let oldComp) = frames[1] {
@@ -333,24 +357,10 @@ final class RewindBuffer {
                 bytes -= compressed.count
             }
             frames.removeFirst()
+            firstLogicalIdx += 1
             toDrop -= 1
         }
-        renumberKeyframeIndices()
-    }
-
-    private func renumberKeyframeIndices() {
-        var lastKeyframe = -1
-        for idx in 0..<frames.count {
-            switch frames[idx] {
-            case .keyframe:
-                lastKeyframe = idx
-            case .delta(_, let comp):
-                precondition(lastKeyframe >= 0,
-                             "delta at index \(idx) with no preceding keyframe")
-                frames[idx] = .delta(keyframeIndex: lastKeyframe,
-                                     compressed: comp)
-            }
-        }
+        // No renumber: deltas reference keyframes by stable logical id.
     }
 
     private func nearestKeyframeIndex(forFrameIndex i: Int) -> Int {
