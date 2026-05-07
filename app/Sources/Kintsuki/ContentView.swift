@@ -167,12 +167,28 @@ private struct CrashOverlay: View {
     }
 
     private func formatRegisters(_ cpu: Emulator.CpuState) -> String {
-        // Mesen-style register dump. P / E / STP / WAI on one line so
-        // the dropdown isn't taller than the rest of the overlay.
-        let regs = String(format:
-            "    A:%04X X:%04X Y:%04X S:%04X D:%04X B:%02X P:%02X E:%d",
-            cpu.a, cpu.x, cpu.y, cpu.s, cpu.d, cpu.b, cpu.p, cpu.e ? 1 : 0)
-        return regs
+        // Mesen-style register dump. Flags get the NVMXDIZC mnemonic
+        // (uppercase = set, lowercase = clear) so users can read the
+        // status without unpacking the hex byte. STP/WAI tagged when
+        // set so the halt cause is unambiguous.
+        let p = cpu.p
+        let flagOrder: [(UInt8, Character, Character)] = [
+            (0x80, "N", "n"),
+            (0x40, "V", "v"),
+            (0x20, "M", "m"),
+            (0x10, "X", "x"),
+            (0x08, "D", "d"),
+            (0x04, "I", "i"),
+            (0x02, "Z", "z"),
+            (0x01, "C", "c"),
+        ]
+        let flags = String(flagOrder.map { (p & $0.0) != 0 ? $0.1 : $0.2 })
+        // STP/WAI are noise here — the overlay only renders when the
+        // CPU is STP'd, so they'd always read the same value.
+        let emuFlag = cpu.e ? " E" : ""
+        return String(format:
+            "    A:%04X X:%04X Y:%04X S:%04X D:%04X B:%02X P:%02X[%@]%@",
+            cpu.a, cpu.x, cpu.y, cpu.s, cpu.d, cpu.b, p, flags, emuFlag)
     }
 
     private func copyToPasteboard() {
