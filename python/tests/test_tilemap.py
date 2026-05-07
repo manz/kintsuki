@@ -64,15 +64,22 @@ def test_decode_cell_blank_helper():
 
 class _FakeEmu:
     """Stub Emu exposing the minimum surface read_bg_tilemap needs:
-    a `vram_read(addr)` byte read + `get_ppu_state()` returning a
-    PpuState-like object with bgXsc fields."""
+    `vram_read_range(addr, length)` for bulk reads and `get_ppu_state()`
+    returning a PpuState-like object with bgXsc fields."""
 
     def __init__(self, *, bg3sc: int, vram: bytes) -> None:
         self._bg3sc = bg3sc
         self._vram = vram
 
-    def vram_read(self, addr: int) -> int:
-        return self._vram[addr] if 0 <= addr < len(self._vram) else 0
+    def vram_read_range(self, addr: int = 0,
+                        length: int | None = None) -> memoryview:
+        end = len(self._vram) if length is None else addr + length
+        chunk = self._vram[addr:end]
+        # Pad with zeros if the slice runs past the end so callers that
+        # expect `length` bytes see the same shape as the C ABI does.
+        if length is not None and len(chunk) < length:
+            chunk = chunk + bytes(length - len(chunk))
+        return memoryview(chunk)
 
     def get_ppu_state(self):
         # Object-with-attributes is enough; we don't need a real PpuState.
