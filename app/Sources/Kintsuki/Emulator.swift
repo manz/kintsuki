@@ -62,6 +62,12 @@ final class Emulator: ObservableObject {
         var offset:   UInt32   // bytes into `label` (0 when no label)
         var file:     String?  // resolved via .adbg LINES, nil if no entry
         var line:     UInt32?  // 1-based, nil if no entry
+        // Containing label for `target` — i.e. the routine the JSR/JSL
+        // actually dispatched into. Lets the overlay print a "what was
+        // called" line between frames so the chain reads top-to-bottom
+        // without the user juggling addresses. Nil for the halt-site
+        // frame (no target) or when the target lands in unlabeled code.
+        var targetLabel: String? = nil
         // CPU register snapshot. Populated only for the halt-site frame
         // (`kind == 0xFF`); older callsite frames would need per-JSR
         // snapshotting in the call hook to recover, which doubles the
@@ -557,8 +563,17 @@ final class Emulator: ObservableObject {
         out.reserveCapacity(Int(n))
         for i in 0..<Int(n) {
             let f = buf[i]
-            out.append(resolveFrame(at: f.callsite_pc, kind: f.kind,
-                                    target: f.target_pc))
+            var frame = resolveFrame(at: f.callsite_pc, kind: f.kind,
+                                     target: f.target_pc)
+            // Resolve the called routine's name so the overlay can
+            // print a "→ JSR/JSL <name>" line between frames. Use exact
+            // lookup here — JSR/JSL targets are routine entry points,
+            // not mid-routine addresses.
+            if let h = handle,
+               let raw = kintsuki_lookup_label(h, f.target_pc) {
+                frame.targetLabel = String(cString: raw)
+            }
+            out.append(frame)
         }
         return out
     }

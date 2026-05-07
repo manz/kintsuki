@@ -136,8 +136,6 @@ private struct CrashOverlay: View {
                             (frame.callsite >> 16) & 0xFF,
                             frame.callsite & 0xFFFF)
             // Python-style header line:  `  PC, in <name+offset>`.
-            // `+offset` suffix dropped when zero so exact-start hits
-            // read cleaner.
             let labelPart: String
             if let name = frame.label {
                 labelPart = frame.offset > 0
@@ -146,17 +144,25 @@ private struct CrashOverlay: View {
             } else {
                 labelPart = ", in <unknown>"
             }
-            // File path trimmed to its basename — full path goes in
-            // copy-pasted reports anyway.
             var srcPart = ""
             if let file = frame.file, let line = frame.line {
                 let base = (file as NSString).lastPathComponent
                 srcPart = "  (\(base):\(line))"
             }
             lines.append("  \(pc)\(labelPart)\(srcPart)")
+            // Call frames carry a target label — print the dispatched
+            // call as the next indented line so the chain reads as a
+            // sequence of "we were here, then we did this jump".
+            if frame.kind != 0xFF {
+                let mnem = frame.kind == 1 ? "JSL" : "JSR"
+                let target = String(format: "%02X:%04X",
+                                    (frame.target >> 16) & 0xFF,
+                                    frame.target & 0xFFFF)
+                let targetName = frame.targetLabel ?? target
+                lines.append("    → \(mnem) \(targetName)")
+            }
             // Registers ride with the halt-site frame (the deepest /
-            // last entry); keep them indented one extra step so the
-            // visual nesting reads like Python's source-line indent.
+            // last entry).
             if let cpu = frame.cpu {
                 lines.append(formatRegisters(cpu))
             }
