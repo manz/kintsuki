@@ -29,7 +29,8 @@ from typing import Protocol
 
 
 class _EmuLike(Protocol):
-    def vram_read(self, addr: int) -> int: ...
+    def vram_read_range(self, addr: int = 0,
+                        length: int | None = None) -> memoryview: ...
     def get_ppu_state(self): ...  # noqa: ANN201
 
 
@@ -112,12 +113,17 @@ def read_bg_tilemap(emu: _EmuLike, layer: int) -> Tilemap:
 
     cells: list[TilemapCell] = []
     sub_planes = (width // 32) * (height // 32)
+    # Each 32×32 sub-plane is 1024 words = 2048 bytes contiguous in VRAM.
+    # Bulk-read the whole sub-plane in one FFI hop instead of 2048 single
+    # vram_read calls — same 65816-side semantics, ~1000× fewer FFI hops
+    # per layer at 60 Hz inspector refresh.
     for sub in range(sub_planes):
         sub_base = base_byte + sub * 0x800
+        plane_bytes = emu.vram_read_range(sub_base, 32 * 32 * 2)
+        # memoryview supports indexed byte access; decode word-by-word.
         for i in range(32 * 32):
-            off = sub_base + i * 2
-            lo = emu.vram_read(off)
-            hi = emu.vram_read(off + 1)
+            lo = plane_bytes[i * 2]
+            hi = plane_bytes[i * 2 + 1]
             cells.append(decode_cell(lo | (hi << 8)))
     return Tilemap(width=width, height=height,
                    cells=tuple(cells), base_word=base_word)
