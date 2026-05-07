@@ -124,41 +124,39 @@ private struct CrashOverlay: View {
     }
 
     private var crashHeaderText: String {
-        // Bare "CPU STP" — the BRK / STP site is rendered as `#0` of
-        // the backtrace below so it follows gdb conventions and lines
-        // up vertically with the rest of the frames.
-        "CPU STP"
+        // Python-traceback header. Frames are listed shallowest-first
+        // below, deepest-call (the STP site) at the bottom.
+        "Traceback (CPU STP, most recent call last):"
     }
 
     private var backtraceText: String {
         var lines: [String] = []
-        for (idx, frame) in emulator.crashBacktrace.enumerated() {
+        for frame in emulator.crashBacktrace {
             let pc = String(format: "%02X:%04X",
                             (frame.callsite >> 16) & 0xFF,
                             frame.callsite & 0xFFFF)
-            // `+offset` suffix only when non-zero — exact-start hits
-            // read cleaner without a "+0x0".
+            // Python-style header line:  `  PC, in <name+offset>`.
+            // `+offset` suffix dropped when zero so exact-start hits
+            // read cleaner.
             let labelPart: String
             if let name = frame.label {
                 labelPart = frame.offset > 0
-                    ? String(format: " in %@+0x%X", name, frame.offset)
-                    : " in \(name)"
+                    ? String(format: ", in %@+0x%X", name, frame.offset)
+                    : ", in \(name)"
             } else {
-                labelPart = ""
+                labelPart = ", in <unknown>"
             }
-            // Trim verbose absolute paths to just the file's basename so
-            // the overlay stays readable; user can grep/IDE-jump on the
-            // copied report which has the full path embedded too.
+            // File path trimmed to its basename — full path goes in
+            // copy-pasted reports anyway.
             var srcPart = ""
             if let file = frame.file, let line = frame.line {
                 let base = (file as NSString).lastPathComponent
                 srcPart = "  (\(base):\(line))"
             }
-            lines.append(String(format: "#%-2d %@%@%@",
-                                idx, pc, labelPart, srcPart))
-            // CPU registers ride with the halt-site frame (#0). Keep
-            // them indented under their frame so a copy-paste of the
-            // whole report stays readable.
+            lines.append("  \(pc)\(labelPart)\(srcPart)")
+            // Registers ride with the halt-site frame (the deepest /
+            // last entry); keep them indented one extra step so the
+            // visual nesting reads like Python's source-line indent.
             if let cpu = frame.cpu {
                 lines.append(formatRegisters(cpu))
             }

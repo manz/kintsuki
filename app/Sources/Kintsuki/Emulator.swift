@@ -514,15 +514,15 @@ final class Emulator: ObservableObject {
             // C ABI is cheap but doing it 60Hz while the CPU is idle in
             // STP would churn @Published for nothing.
             if s.stp {
-                // Build a gdb-style backtrace: #0 = deepest = where the
-                // CPU is sitting right now (BRK / STP site), then the
-                // pending JSR/JSL callsites in deepest→shallowest order.
-                // Storing them this way lets the overlay just iterate
-                // and print without juggling a separate "site" header.
+                // Python-traceback ordering: shallowest call first,
+                // deepest call (the BRK/STP site) last. The shadow
+                // stack from C is already shallowest-first, so we just
+                // append the resolved halt site at the end and let the
+                // overlay walk top-to-bottom.
                 var site = resolveFrame(at: s.pc, kind: 0xFF, target: 0)
                 site.cpu = s
-                let stack = captureBacktrace().reversed()
-                crashBacktrace = [site] + stack
+                let stack = captureBacktrace()  // shallowest → newest
+                crashBacktrace = stack + [site]
                 crashSite = site
             } else {
                 crashBacktrace = []
