@@ -26,6 +26,8 @@
 	</array>
 	<key>CFBundleExecutable</key>
 	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIconName</key>
+	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
 	<string>net.ringum.kintsuki</string>
 	<key>CFBundleInfoDictionaryVersion</key>
