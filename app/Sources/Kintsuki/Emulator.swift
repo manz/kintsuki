@@ -508,8 +508,20 @@ final class Emulator: ObservableObject {
             // Capture once on the rising edge of the halt — calling the
             // C ABI is cheap but doing it 60Hz while the CPU is idle in
             // STP would churn @Published for nothing.
-            crashBacktrace = s.stp ? captureBacktrace() : []
-            crashSite = s.stp ? resolveFrame(at: s.pc, kind: 0xFF, target: 0) : nil
+            if s.stp {
+                // Build a gdb-style backtrace: #0 = deepest = where the
+                // CPU is sitting right now (BRK / STP site), then the
+                // pending JSR/JSL callsites in deepest→shallowest order.
+                // Storing them this way lets the overlay just iterate
+                // and print without juggling a separate "site" header.
+                let site = resolveFrame(at: s.pc, kind: 0xFF, target: 0)
+                let stack = captureBacktrace().reversed()
+                crashBacktrace = [site] + stack
+                crashSite = site
+            } else {
+                crashBacktrace = []
+                crashSite = nil
+            }
         }
     }
 
