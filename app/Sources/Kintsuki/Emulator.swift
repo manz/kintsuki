@@ -975,6 +975,35 @@ final class Emulator {
         return Data(buf)
     }
 
+    /// Write one byte into `region` at `offset`. Mirrors the bus
+    /// mapping used by `readRegion`. Returns true when the write goes
+    /// through, false if the region is read-only-from-host (currently
+    /// none) or no handle is bound. ROM writes hit the cart RAM/RW
+    /// portion of the bus — most LoROM banks ignore writes silently,
+    /// which mirrors hardware.
+    @discardableResult
+    func writeRegion(_ region: MemRegion, offset: UInt32, byte: UInt8) -> Bool {
+        guard let h = handle else { return false }
+        switch region {
+        case .wram:
+            kintsuki_write_u8(h, 0x7E0000 + offset, byte)
+        case .rom:
+            let bank = offset / 0x8000
+            let addr = (bank << 16) | 0x8000 | (offset & 0x7FFF)
+            kintsuki_write_u8(h, addr, byte)
+        case .sram:
+            let addr = (UInt32(0x70) << 16) | (offset & 0xFFFF)
+            kintsuki_write_u8(h, addr, byte)
+        case .vram:
+            kintsuki_vram_write(h, offset, byte)
+        case .cgram:
+            kintsuki_cgram_write(h, offset, byte)
+        case .oam:
+            kintsuki_oam_write(h, offset, byte)
+        }
+        return true
+    }
+
     // ----- Cached PPU dumps (rebuilt at most ~6 Hz) -----------------------
     private var vramCache = Data(count: 0x10000)
     private var cgramCache = Data(count: 0x200)

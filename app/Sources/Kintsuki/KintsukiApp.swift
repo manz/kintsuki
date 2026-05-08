@@ -36,6 +36,10 @@ struct KintsukiApp: App {
         Window("VRAM Viewer", id: "vram") {
             VRAMViewerView(emulator: emulator)
         }
+
+        Window("Memory Viewer", id: "memory") {
+            MemoryViewerView(emulator: emulator)
+        }
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Open ROM…") {
@@ -89,6 +93,8 @@ struct KintsukiApp: App {
                     .keyboardShortcut("t", modifiers: [.command, .shift])
                 Button("VRAM Viewer") { openWindow(id: "vram") }
                     .keyboardShortcut("v", modifiers: [.command, .shift])
+                Button("Memory Viewer") { openWindow(id: "memory") }
+                    .keyboardShortcut("m", modifiers: [.command, .shift])
                 Button("Debugger") { openWindow(id: "debugger") }
                     .keyboardShortcut("d", modifiers: [.command, .shift])
             }
