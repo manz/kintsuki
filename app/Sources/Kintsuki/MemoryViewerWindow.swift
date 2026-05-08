@@ -26,6 +26,7 @@ struct MemoryViewerView: View {
     @State private var lastHandledNavNonce: Int = 0
     @State private var bytesPerRow: Int = 16
     @State private var bytesPerRowInput: String = "16"
+    @State private var jumpNonce: Int = 0
 
     private static let bytesPerPage: Int = 256
 
@@ -40,12 +41,12 @@ struct MemoryViewerView: View {
                     selection: selection,
                     markers: markers,
                     jumpTarget: jumpTarget,
+                    jumpNonce: jumpNonce,
                     generation: generation,
                     addrLabel: { addrLabel(forOffset: $0) },
                     byteAt: { byteAt($0) },
                     onSelectionChanged: { sel in selection = sel },
-                    onWrite: { range, byte in commitWrite(range: range, byte: byte) },
-                    onJumpHandled: { jumpTarget = nil }
+                    onWrite: { range, byte in commitWrite(range: range, byte: byte) }
                 )
                 if !markers.isEmpty {
                     Divider()
@@ -91,7 +92,7 @@ struct MemoryViewerView: View {
         }
         let target = max(0, min(Int(region.size) - 1, req.offset))
         selection = .single(target)
-        jumpTarget = target
+        jumpTarget = target; jumpNonce &+= 1
         invalidate()
     }
 
@@ -134,7 +135,7 @@ struct MemoryViewerView: View {
                 Button(tgt.label) {
                     region = tgt.region
                     selection = .single(tgt.offset)
-                    jumpTarget = tgt.offset
+                    jumpTarget = tgt.offset; jumpNonce &+= 1
                 }
             }
             Divider()
@@ -175,7 +176,7 @@ struct MemoryViewerView: View {
                     Button {
                         let lo = m.range.lowerBound
                         selection = .single(lo)
-                        jumpTarget = lo
+                        jumpTarget = lo; jumpNonce &+= 1
                     } label: {
                         HStack(spacing: 4) {
                             Rectangle()
@@ -374,7 +375,7 @@ struct MemoryViewerView: View {
         let target = Int(min(v, regionSize > 0 ? regionSize - 1 : 0))
         addrInput = ""
         selection = .single(target)
-        jumpTarget = target
+        jumpTarget = target; jumpNonce &+= 1
     }
 }
 
@@ -423,12 +424,22 @@ struct HexCanvasRepresentable: NSViewRepresentable {
     let selection: HexSelection?
     let markers: [HexMarker]
     let jumpTarget: Int?
+    /// Bumped by the parent for each new `jumpTarget`. Used by the
+    /// representable's coordinator to scroll exactly once per jump
+    /// even if `jumpTarget` happens to alias a previous value (e.g.
+    /// the user clicks the same legend chip twice or something on
+    /// the parent re-emits the same offset).
+    let jumpNonce: Int
     let generation: Int
     let addrLabel: (Int) -> String
     let byteAt: (Int) -> UInt8?
     let onSelectionChanged: (HexSelection) -> Void
     let onWrite: (ClosedRange<Int>, UInt8) -> Void
-    let onJumpHandled: () -> Void
+
+    final class Coordinator {
+        var lastJumpNonce: Int = 0
+    }
+    func makeCoordinator() -> Coordinator { Coordinator() }
 
     func makeNSView(context: Context) -> NSScrollView {
         let scroll = NSScrollView()
@@ -474,9 +485,15 @@ struct HexCanvasRepresentable: NSViewRepresentable {
             canvas.markers = markers
         }
         canvas.needsDisplay = true
-        if let t = jumpTarget {
+        // Coordinator-gated scroll: only honour a jumpTarget when its
+        // nonce is fresh. Without this, every body re-eval (cache
+        // invalidation, marker rebuild, BG @State pulse) saw the
+        // same jumpTarget value and re-scrolled the canvas back to
+        // the marker — the user could never wander away from the
+        // initial focus point.
+        if let t = jumpTarget, jumpNonce != context.coordinator.lastJumpNonce {
+            context.coordinator.lastJumpNonce = jumpNonce
             canvas.scrollToOffset(t)
-            onJumpHandled()
         }
     }
 
