@@ -7,6 +7,24 @@ struct KintsukiApp: App {
     @State private var emulator = Emulator()
     @State private var showStateBrowser = false
     @Environment(\.openWindow) private var openWindow
+    @Environment(\.dismissWindow) private var dismissWindow
+
+    /// True when SwiftUI's window with `id` is currently visible.
+    /// Used to flip the tool-window menu shortcuts into toggles
+    /// (open ↔ close) instead of "open another instance".
+    private func toolWindowOpen(_ id: String) -> Bool {
+        NSApp.windows.contains { $0.identifier?.rawValue == id && $0.isVisible }
+    }
+
+    /// Open `id` if it's not already, otherwise dismiss it. Bound to
+    /// each viewer's ⌘⇧X shortcut so a second press hides the panel.
+    private func toggleToolWindow(_ id: String) {
+        if toolWindowOpen(id) {
+            dismissWindow(id: id)
+        } else {
+            openWindow(id: id)
+        }
+    }
 
     private let modelContainer: ModelContainer = Self.makeContainer()
 
@@ -89,13 +107,13 @@ struct KintsukiApp: App {
                     .keyboardShortcut(.leftArrow, modifiers: [.command, .shift])
                     .disabled(emulator.rewindFrames < 2)
                 Divider()
-                Button("Tilemap Viewer") { openWindow(id: "tilemap") }
+                Button("Tilemap Viewer") { toggleToolWindow("tilemap") }
                     .keyboardShortcut("t", modifiers: [.command, .shift])
-                Button("VRAM Viewer") { openWindow(id: "vram") }
+                Button("VRAM Viewer") { toggleToolWindow("vram") }
                     .keyboardShortcut("v", modifiers: [.command, .shift])
-                Button("Memory Viewer") { openWindow(id: "memory") }
+                Button("Memory Viewer") { toggleToolWindow("memory") }
                     .keyboardShortcut("m", modifiers: [.command, .shift])
-                Button("Debugger") { openWindow(id: "debugger") }
+                Button("Debugger") { toggleToolWindow("debugger") }
                     .keyboardShortcut("d", modifiers: [.command, .shift])
             }
             CommandMenu("State") {
