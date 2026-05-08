@@ -98,7 +98,10 @@ struct DebuggerView: View {
         }
         .onReceive(emulator.$breakpoints) { _ in rebuildLines() }
         .onReceive(emulator.$crashBacktrace) { _ in rebuildLines() }
-        .onChange(of: refreshTick) { _, _ in rebuildLines() }
+        // (refreshTick is bumped *by* rebuildLines to force the LazyVStack
+        // to re-anchor; calling rebuildLines from its own onChange would
+        // recurse, so the scroll-side handlers below depend on
+        // displayedPC / displayedActivePC instead.)
         .onChange(of: emulator.loadedROM) { _, _ in
             labelCache = emulator.allLabels()
         }
@@ -469,6 +472,12 @@ struct DebuggerView: View {
         displayedPC = displayPC ?? s.pc
         displayedLines = currentLines()
         displayedBreakpoints = emulator.breakpoints
+        // Bump the LazyVStack's `.id` so SwiftUI rebuilds it, the
+        // scroll position resets, and the .onAppear-style scrollTo on
+        // the inner ScrollViewReader re-anchors on the (possibly new)
+        // active PC. Without this the lazy stack reuses old offsets
+        // after a step and the highlight scrolls out of view.
+        refreshTick &+= 1
     }
 
     private func currentLines() -> [Emulator.DisasmLine] {
