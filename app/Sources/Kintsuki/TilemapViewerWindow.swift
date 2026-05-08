@@ -97,6 +97,8 @@ struct TilemapViewerView: View {
                 if let snap = cachedSnapshot {
                     metaSection(snap)
                     Divider()
+                    dmaSourcesSection
+                    Divider()
                     selectedTileSection(snap)
                 } else {
                     Text("No data").foregroundStyle(.secondary)
@@ -191,6 +193,57 @@ struct TilemapViewerView: View {
             Text(v).font(.system(.caption, design: .monospaced))
             Spacer()
         }
+    }
+
+    /// Recent CPU→VRAM DMA sources surfaced from the libkintsuki ring.
+    /// Each row is clickable: jumps the Memory Viewer to the
+    /// corresponding WRAM/ROM source with a marker covering the
+    /// transfer length. Helps the user trace "what fed this region".
+    @ViewBuilder
+    private var dmaSourcesSection: some View {
+        let xfers = emulator.dmaTransfers().filter { $0.isVRAMWrite }
+        VStack(alignment: .leading, spacing: 6) {
+            Text("VRAM DMA sources").font(.headline)
+            if xfers.isEmpty {
+                Text("(no transfers logged yet — pause/play to capture)")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                ForEach(xfers.prefix(8)) { x in
+                    Button {
+                        let region: Emulator.MemRegion =
+                            (0x7E0000...0x7FFFFF).contains(x.srcAddr)
+                                ? .wram : .rom
+                        let off = region == .wram
+                            ? Int(x.srcAddr & 0x1FFFF)
+                            : romOffsetFor(busAddr: x.srcAddr)
+                        emulator.requestMemoryView(region: region, offset: off)
+                        openWindow(id: "memory")
+                    } label: {
+                        HStack {
+                            Text(String(format: "%06X", x.srcAddr))
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(Color.accentColor)
+                                .underline()
+                            Text(String(format: "→ $21%02X  %d B  ×%d",
+                                        x.dstReg, x.size, x.hits))
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    /// Translate a 24-bit bus address into the LoROM region offset
+    /// used by MemoryViewerView (bank * 0x8000 + (addr & 0x7FFF)).
+    private func romOffsetFor(busAddr: UInt32) -> Int {
+        let bank = Int(busAddr >> 16) & 0x7F
+        let lo = Int(busAddr & 0xFFFF)
+        if lo < 0x8000 { return 0 }                  // not in ROM mapping
+        return bank * 0x8000 + (lo - 0x8000)
     }
 
     /// Address row that doubles as a link to the Memory Viewer's VRAM

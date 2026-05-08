@@ -111,6 +111,52 @@ final class Emulator {
         memoryNavRequest = nil
     }
 
+    /// Decoded DMA transfer event surfaced from the libkintsuki ring.
+    /// Most-recent first. Deduplicated on the C side by (src+dst+size)
+    /// so a per-frame buffer push collapses to one entry whose
+    /// `hits` increments.
+    struct DMATransfer: Identifiable, Hashable {
+        let srcAddr: UInt32      // 24-bit
+        let size: UInt16
+        let channel: UInt8
+        let direction: UInt8     // 0 = CPU->PPU
+        let mode: UInt8
+        let dstReg: UInt8        // PPU $21XX low byte
+        let hits: UInt32
+        let lastFrame: UInt64
+        var id: UInt64 {
+            (UInt64(srcAddr) << 24) | (UInt64(size) << 8) | UInt64(dstReg)
+        }
+        var isVRAMWrite: Bool { direction == 0 && (dstReg == 0x18 || dstReg == 0x19) }
+        var isCGRAMWrite: Bool { direction == 0 && dstReg == 0x22 }
+        var isOAMWrite: Bool { direction == 0 && dstReg == 0x04 }
+    }
+
+    func dmaTransfers() -> [DMATransfer] {
+        guard let h = handle else { return [] }
+        let cap = Int(kintsuki_dma_log_count(h))
+        if cap == 0 { return [] }
+        var raw = [kintsuki_dma_event_t](repeating: kintsuki_dma_event_t(),
+                                          count: cap)
+        let n = raw.withUnsafeMutableBufferPointer { buf -> UInt32 in
+            kintsuki_dma_log_snapshot(h, buf.baseAddress, UInt32(buf.count))
+        }
+        var out: [DMATransfer] = []
+        out.reserveCapacity(Int(n))
+        for i in 0..<Int(n) {
+            let e = raw[i]
+            out.append(DMATransfer(srcAddr: e.src_addr,
+                                   size: e.size,
+                                   channel: e.channel,
+                                   direction: e.direction,
+                                   mode: e.mode,
+                                   dstReg: e.dst_reg,
+                                   hits: e.hits,
+                                   lastFrame: e.last_frame))
+        }
+        return out
+    }
+
     struct BacktraceFrame: Identifiable, Equatable, Codable {
         var id = UUID()
         var callsite: UInt32   // 24-bit

@@ -318,6 +318,29 @@ uint32_t kintsuki_disassemble_at_ex(kintsuki_t*, uint32_t pc, uint32_t count,
                                     int e_override, int m_override, int x_override,
                                     kintsuki_disasm_line_t* out);
 
+// ---- DMA transfer log ---------------------------------------------------
+// Captures every Channel::dmaRun fire. Deduplicates by (src + dst + size)
+// — if a game re-pushes the same buffer every frame the entry's hit
+// count bumps instead of growing the log. Most-recent at index 0.
+// Bounded to 64 entries on the host side.
+typedef struct kintsuki_dma_event_t {
+  uint32_t src_addr;     // 24-bit
+  uint16_t size;
+  uint8_t  channel;
+  uint8_t  direction;    // 0 = A->B (CPU->PPU), 1 = B->A
+  uint8_t  mode;         // transferMode (0..7)
+  uint8_t  dst_reg;      // PPU register low byte ($21XX)
+  uint8_t  _pad[2];
+  uint32_t hits;
+  uint64_t last_frame;
+} kintsuki_dma_event_t;
+
+uint32_t kintsuki_dma_log_count(kintsuki_t*);
+uint32_t kintsuki_dma_log_snapshot(kintsuki_t*,
+                                   kintsuki_dma_event_t* out,
+                                   uint32_t cap);
+void     kintsuki_dma_log_clear(kintsuki_t*);
+
 #ifdef __cplusplus
 }
 #endif

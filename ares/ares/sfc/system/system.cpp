@@ -79,6 +79,20 @@ volatile bool kintsukiBailRequested = false;
 __attribute__((visibility("default")))
 volatile bool kintsukiHaltRequested = false;
 
+// DMA dispatch hook. Channel::dmaRun fires this once per channel
+// before the transfer loop with (channel id, direction, mode,
+// 24-bit src, PPU register low byte, length). Host installs a
+// callback to ring-log transfers — used for "what fed VRAM at the
+// BG tilemap range" guesses inside the Memory Viewer.
+typedef void (*KintsukiDmaHook)(uint8_t channel,
+                                uint8_t direction,
+                                uint8_t mode,
+                                uint32_t src_addr,
+                                uint8_t dst_reg,
+                                uint16_t size);
+__attribute__((visibility("default")))
+KintsukiDmaHook kintsukiDmaHook = nullptr;
+
 auto System::load(Node::System& root, string name) -> bool {
   if(node) unload();
 

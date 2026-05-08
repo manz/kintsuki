@@ -22,6 +22,9 @@
 namespace ares::SuperFamicom {
   extern volatile bool kintsukiBailRequested;
   extern volatile bool kintsukiHaltRequested;
+  typedef void (*KintsukiDmaHook)(uint8_t, uint8_t, uint8_t,
+                                  uint32_t, uint8_t, uint16_t);
+  extern KintsukiDmaHook kintsukiDmaHook;
 }
 
 // ---- Shadow callstack + .adbg label table -------------------------------
@@ -954,6 +957,94 @@ int kintsuki_lookup_source(kintsuki_t* h, uint32_t addr,
   if(out_line)   *out_line   = line;
   if(out_column) *out_column = column;
   return 1;
+}
+
+// ---- DMA transfer log ---------------------------------------------------
+// Captures each Channel::dmaRun call, deduplicating by (src, dst, size)
+// so a game that re-pushes the same buffer every frame collapses to a
+// single entry. Recent-first ordering: when an existing entry is hit
+// again we move it to slot 0 and bump its hit count, otherwise we
+// insert at slot 0 and evict the oldest. Bounded to 64 entries.
+namespace {
+struct DmaLogEntry {
+  uint32_t src_addr;   // 24-bit
+  uint16_t size;
+  uint8_t  channel;
+  uint8_t  direction;
+  uint8_t  mode;
+  uint8_t  dst_reg;
+  uint32_t hits;
+  uint64_t last_frame;
+};
+constexpr size_t kDmaLogCap = 64;
+DmaLogEntry g_dmaLog[kDmaLogCap] = {};
+size_t g_dmaLogSize = 0;
+
+void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
+               uint32_t src, uint8_t dst, uint16_t size) {
+  // Search for an existing matching entry (src + dst + size).
+  for(size_t i = 0; i < g_dmaLogSize; i++) {
+    auto& e = g_dmaLog[i];
+    if(e.src_addr == src && e.dst_reg == dst && e.size == size) {
+      e.hits += 1;
+      e.last_frame = (g_handle ? g_handle->program->framesRendered : 0);
+      // Bubble to front so most-recent stays at slot 0.
+      if(i > 0) {
+        DmaLogEntry tmp = e;
+        for(size_t j = i; j > 0; j--) g_dmaLog[j] = g_dmaLog[j - 1];
+        g_dmaLog[0] = tmp;
+      }
+      return;
+    }
+  }
+  // Fresh entry — evict the oldest (last slot) when full, then shift.
+  size_t insertCount = (g_dmaLogSize < kDmaLogCap) ? g_dmaLogSize : kDmaLogCap - 1;
+  for(size_t j = insertCount; j > 0; j--) g_dmaLog[j] = g_dmaLog[j - 1];
+  g_dmaLog[0] = DmaLogEntry{
+    .src_addr = src,
+    .size = size,
+    .channel = channel,
+    .direction = direction,
+    .mode = mode,
+    .dst_reg = dst,
+    .hits = 1,
+    .last_frame = (g_handle ? g_handle->program->framesRendered : 0),
+  };
+  if(g_dmaLogSize < kDmaLogCap) g_dmaLogSize++;
+}
+
+struct DmaHookInstaller {
+  DmaHookInstaller() { ares::SuperFamicom::kintsukiDmaHook = &dmaHookFn; }
+} g_dmaHookInstaller;
+}
+
+uint32_t kintsuki_dma_log_count(kintsuki_t* h) {
+  if(!h) return 0;
+  return (uint32_t)g_dmaLogSize;
+}
+
+uint32_t kintsuki_dma_log_snapshot(kintsuki_t* h,
+                                   kintsuki_dma_event_t* out,
+                                   uint32_t cap) {
+  if(!h || !out || cap == 0) return 0;
+  uint32_t n = (uint32_t)((g_dmaLogSize < cap) ? g_dmaLogSize : cap);
+  for(uint32_t i = 0; i < n; i++) {
+    auto& e = g_dmaLog[i];
+    out[i].src_addr = e.src_addr;
+    out[i].size = e.size;
+    out[i].channel = e.channel;
+    out[i].direction = e.direction;
+    out[i].mode = e.mode;
+    out[i].dst_reg = e.dst_reg;
+    out[i].hits = e.hits;
+    out[i].last_frame = e.last_frame;
+  }
+  return n;
+}
+
+void kintsuki_dma_log_clear(kintsuki_t* h) {
+  if(!h) return;
+  g_dmaLogSize = 0;
 }
 
 // ---- Label enumeration --------------------------------------------------

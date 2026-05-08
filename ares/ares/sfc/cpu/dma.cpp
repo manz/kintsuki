@@ -108,6 +108,23 @@ inline auto CPU::Channel::transfer(n24 addressA, n2 index) -> void {
 inline auto CPU::Channel::dmaRun() -> void {
   if(!dmaEnable) return;
 
+  // kintsuki: fire dma hook once per channel run BEFORE the transfer
+  // loop. Host (libkintsuki) rings the (id, direction, mode, src,
+  // dst, size) tuple so the Memory Viewer can mark which WRAM/ROM
+  // ranges fed each VRAM region.
+  {
+    typedef void (*KintsukiDmaHook)(uint8_t, uint8_t, uint8_t,
+                                    uint32_t, uint8_t, uint16_t);
+    extern KintsukiDmaHook kintsukiDmaHook;
+    if(kintsukiDmaHook) {
+      kintsukiDmaHook((uint8_t)id, (uint8_t)direction,
+                      (uint8_t)transferMode,
+                      ((uint32_t)sourceBank << 16) | (uint32_t)sourceAddress,
+                      (uint8_t)targetAddress,
+                      (uint16_t)transferSize);
+    }
+  }
+
   step(8);
   edge();
 
