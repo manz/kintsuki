@@ -158,6 +158,26 @@ _bind("kintsuki_callstack_snapshot", c_uint32,
       [HANDLE, POINTER(CallFrame), c_uint32])
 _bind("kintsuki_callstack_clear", None, [HANDLE])
 
+
+# DMA transfer log — populated by libkintsuki via the ares dmaHook.
+class DmaEvent(Structure):
+    _fields_ = [
+        ("src_addr",  c_uint32),
+        ("size",      c_uint16),
+        ("channel",   c_uint8),
+        ("direction", c_uint8),
+        ("mode",      c_uint8),
+        ("dst_reg",   c_uint8),
+        ("_pad",      c_uint8 * 2),
+        ("hits",      c_uint32),
+        ("last_frame", c_uint64),
+    ]
+
+
+_bind("kintsuki_dma_log_count",    c_uint32, [HANDLE])
+_bind("kintsuki_dma_log_snapshot", c_uint32, [HANDLE, POINTER(DmaEvent), c_uint32])
+_bind("kintsuki_dma_log_clear",    None,     [HANDLE])
+
 # .adbg label table.
 _bind("kintsuki_load_adbg",     c_int,    [HANDLE, c_char_p])
 _bind("kintsuki_clear_adbg",    None,     [HANDLE])
