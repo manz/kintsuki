@@ -1,25 +1,40 @@
 import SwiftUI
 import AppKit
 
-/// Hex viewer + editor for every host-readable memory region. Same
-/// pause/refresh model as the other tool windows: cached snapshot,
-/// 2 Hz auto-refresh, plain Emulator reference (no @EnvironmentObject)
-/// so opening the window doesn't pin the emulator's redraw graph.
+/// Reference-typed page store so MemoryViewerView can mutate the dict
+/// from inside row body lazy-loads without triggering SwiftUI's
+/// "state modified during view update" complaint.
+@MainActor
+final class MemoryPageCache {
+    var pages: [Int: Data] = [:]
+}
+
+/// Hex viewer + editor for every host-readable memory region.
 ///
-/// Editing is allowed for every region but the bus does the right thing
-/// — ROM writes typically silently drop on hardware-mapped LoROM banks.
+/// Pages on demand: rows render through a 256-byte page cache so an
+/// 8 MB ROM region scrolls without ever materialising the whole region
+/// in one go. Auto-refresh (2 Hz) just bumps a generation counter —
+/// pages are invalidated lazily as rows redraw, so off-screen pages
+/// don't get re-fetched until the user scrolls back to them.
 struct MemoryViewerView: View {
     let emulator: Emulator
     @State private var region: Emulator.MemRegion = .wram
-    @State private var baseAddr: UInt32 = 0
-    @State private var rowCount: Int = 32
-    @State private var snapshot: Data = Data()
     @State private var addrInput: String = ""
     @State private var selectedOffset: Int? = nil
     @State private var editing: Bool = false
     @State private var editValue: String = ""
+    @State private var jumpRow: Int? = nil
+    /// Reference-type cache holding decoded pages. Lives behind
+    /// @State so SwiftUI doesn't yell about "mutating state during
+    /// view update" when a row body lazily fetches its missing page.
+    @State private var cache = MemoryPageCache()
+    /// Bumped by the 2 Hz timer (or manual refresh) to invalidate
+    /// `cache`. Visible rows re-fetch their page on next render.
+    @State private var generation: Int = 0
 
     private static let bytesPerRow: Int = 16
+    private static let rowsPerPage: Int = 16
+    private static let bytesPerPage: Int = bytesPerRow * rowsPerPage   // 256
 
     var body: some View {
         VStack(spacing: 0) {
@@ -34,19 +49,17 @@ struct MemoryViewerView: View {
             }
         }
         .frame(minWidth: 760, minHeight: 480)
-        .onAppear { rebuildSnapshot() }
         .onChange(of: emulator.running) { _, isRunning in
-            if !isRunning { rebuildSnapshot() }
+            if !isRunning { invalidate() }
         }
-        .onChange(of: emulator.loadedROM) { _, _ in rebuildSnapshot() }
+        .onChange(of: emulator.loadedROM) { _, _ in invalidate() }
         .onChange(of: region) { _, _ in
-            baseAddr = 0
             selectedOffset = nil
-            rebuildSnapshot()
+            jumpRow = 0
+            invalidate()
         }
-        .onChange(of: baseAddr) { _, _ in rebuildSnapshot() }
         .onReceive(Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()) { _ in
-            if !editing { rebuildSnapshot() }
+            if !editing { invalidate() }
         }
     }
 
@@ -62,10 +75,6 @@ struct MemoryViewerView: View {
             .labelsHidden()
             .frame(maxWidth: 380)
 
-            Text(addrLabel())
-                .font(.system(.caption, design: .monospaced))
-                .foregroundStyle(.secondary)
-
             Spacer()
 
             HStack(spacing: 4) {
@@ -77,54 +86,46 @@ struct MemoryViewerView: View {
                     .onSubmit { jumpToAddrInput() }
             }
 
-            Button("Refresh") { rebuildSnapshot() }
+            Button("Refresh") { invalidate() }
                 .keyboardShortcut("r", modifiers: [.command, .option])
         }
         .padding(8)
     }
 
-    private func addrLabel() -> String {
-        // Surface the absolute bus address that offset 0 of the snapshot
-        // resolves to. Helps the user reason about LoROM mapping
-        // ($8000:00–7D for ROM, $7E0000+ for WRAM, etc.).
-        switch region {
-        case .wram:  return String(format: "$%06X..%06X (WRAM via bus)",
-                                   0x7E0000 + Int(baseAddr),
-                                   0x7E0000 + Int(baseAddr) + snapshot.count - 1)
-        case .rom:
-            let bank = Int(baseAddr) / 0x8000
-            let addr = (bank << 16) | 0x8000 | (Int(baseAddr) & 0x7FFF)
-            return String(format: "$%06X (LoROM)", addr)
-        case .sram:
-            return String(format: "$70:%04X (SRAM via bus)", Int(baseAddr) & 0xFFFF)
-        case .vram:  return String(format: "$%04X (VRAM bytes)", Int(baseAddr))
-        case .cgram: return String(format: "$%03X (CGRAM bytes)", Int(baseAddr))
-        case .oam:   return String(format: "$%03X (OAM bytes)", Int(baseAddr))
-        }
-    }
-
     // ----- Hex body -----
     private var hexBody: some View {
-        ScrollView([.vertical]) {
-            VStack(alignment: .leading, spacing: 0) {
-                hexHeader
-                Divider()
-                ForEach(0..<rowCount, id: \.self) { row in
-                    hexRow(row: row)
+        let totalBytes = Int(region.size)
+        let totalRows = (totalBytes + Self.bytesPerRow - 1) / Self.bytesPerRow
+        return ScrollViewReader { scroller in
+            ScrollView([.vertical]) {
+                LazyVStack(alignment: .leading, spacing: 0) {
+                    hexHeader
+                    Divider()
+                    ForEach(0..<totalRows, id: \.self) { row in
+                        hexRow(row: row)
+                            .id(row)
+                    }
+                }
+                .font(.system(.body, design: .monospaced))
+                .padding(.horizontal, 8)
+                .padding(.vertical, 6)
+            }
+            .background(.background)
+            .onChange(of: jumpRow) { _, target in
+                if let t = target {
+                    withAnimation(.none) { scroller.scrollTo(t, anchor: .top) }
+                    jumpRow = nil
                 }
             }
-            .font(.system(.body, design: .monospaced))
-            .padding(.horizontal, 8)
-            .padding(.vertical, 6)
         }
-        .background(.background)
     }
 
     private var hexHeader: some View {
         HStack(spacing: 12) {
             Text("offset").font(.caption2).foregroundStyle(.secondary)
                 .frame(width: 80, alignment: .leading)
-            Text(headerHexLine())
+            Text((0..<Self.bytesPerRow).map { String(format: "%02X", $0) }
+                    .joined(separator: " "))
                 .font(.system(.caption2, design: .monospaced))
                 .foregroundStyle(.secondary)
             Spacer()
@@ -133,24 +134,18 @@ struct MemoryViewerView: View {
         .padding(.vertical, 2)
     }
 
-    private func headerHexLine() -> String {
-        return (0..<Self.bytesPerRow).map { String(format: "%02X", $0) }.joined(separator: " ")
-    }
-
     private func hexRow(row: Int) -> some View {
-        let offset = row * Self.bytesPerRow
-        let lineBase = Int(baseAddr) + offset
+        let rowOffset = row * Self.bytesPerRow
         let bytes = (0..<Self.bytesPerRow).map { i -> UInt8? in
-            let idx = offset + i
-            return idx < snapshot.count ? snapshot[idx] : nil
+            byteAt(rowOffset + i)
         }
         return HStack(spacing: 12) {
-            Text(String(format: "%06X", lineBase))
+            Text(addrLabel(forOffset: rowOffset))
                 .foregroundStyle(.secondary)
                 .frame(width: 80, alignment: .leading)
             HStack(spacing: 4) {
                 ForEach(0..<Self.bytesPerRow, id: \.self) { i in
-                    hexCell(absoluteOffset: offset + i, byte: bytes[i])
+                    hexCell(absoluteOffset: rowOffset + i, byte: bytes[i])
                 }
             }
             Spacer()
@@ -194,8 +189,6 @@ struct MemoryViewerView: View {
         var s = ""
         for b in bytes {
             guard let b else { s.append(" "); continue }
-            // SNES text isn't ASCII but printable bytes still help spot
-            // strings + alignment. Non-printable -> '.'
             if b >= 0x20 && b < 0x7F {
                 s.append(Character(UnicodeScalar(b)))
             } else {
@@ -205,7 +198,49 @@ struct MemoryViewerView: View {
         return s
     }
 
+    // ----- Page cache -----
+    private func byteAt(_ offset: Int) -> UInt8? {
+        guard offset >= 0, offset < Int(region.size) else { return nil }
+        let pageIdx = offset / Self.bytesPerPage
+        let pageOff = offset % Self.bytesPerPage
+        if let page = cache.pages[pageIdx] {
+            return pageOff < page.count ? page[pageOff] : nil
+        }
+        // Fetch the missing page synchronously — readRegion is one
+        // FFI hop for WRAM/SRAM (kintsuki_read_range) and a small
+        // bounded-loop for VRAM/CGRAM/OAM. Sub-100µs per page.
+        let baseAddr = UInt32(pageIdx * Self.bytesPerPage)
+        let length = min(Self.bytesPerPage, Int(region.size) - Int(baseAddr))
+        let data = emulator.readRegion(region, offset: baseAddr, length: length)
+        // Reference-typed cache → mutating its dict doesn't tickle
+        // SwiftUI's "modified state during view update" warning, since
+        // the @State only tracks the reference (unchanged).
+        cache.pages[pageIdx] = data
+        return pageOff < data.count ? data[pageOff] : nil
+    }
+
+    private func addrLabel(forOffset offset: Int) -> String {
+        switch region {
+        case .wram:  return String(format: "%06X", 0x7E0000 + offset)
+        case .rom:
+            let bank = offset / 0x8000
+            let addr = (bank << 16) | 0x8000 | (offset & 0x7FFF)
+            return String(format: "%06X", addr)
+        case .sram:  return String(format: "70:%04X", offset & 0xFFFF)
+        case .vram:  return String(format: "VRAM:%04X", offset & 0xFFFF)
+        case .cgram: return String(format: "CGRM:%03X", offset & 0x1FF)
+        case .oam:   return String(format: "OAM:%03X", offset & 0x3FF)
+        }
+    }
+
     // ----- Actions -----
+    private func invalidate() {
+        cache.pages.removeAll(keepingCapacity: true)
+        // @State change forces SwiftUI to re-eval the body so visible
+        // rows hit the empty cache and re-fetch.
+        generation &+= 1
+    }
+
     private func commitEdit() {
         defer { editing = false; editValue = "" }
         guard let off = selectedOffset else { return }
@@ -217,8 +252,11 @@ struct MemoryViewerView: View {
             NSSound.beep()
             return
         }
-        emulator.writeRegion(region, offset: baseAddr + UInt32(off), byte: value)
-        rebuildSnapshot()
+        emulator.writeRegion(region, offset: UInt32(off), byte: value)
+        // Drop the touched page so the new value paints on next frame.
+        let pageIdx = off / Self.bytesPerPage
+        cache.pages.removeValue(forKey: pageIdx)
+        generation &+= 1
     }
 
     private func jumpToAddrInput() {
@@ -231,19 +269,10 @@ struct MemoryViewerView: View {
             NSSound.beep(); return
         }
         let regionSize = region.size
-        let target = min(v, regionSize > 0 ? regionSize - 1 : 0)
-        // Snap to row alignment so the hex grid stays tidy.
-        baseAddr = target & ~UInt32(Self.bytesPerRow - 1)
+        let target = Int(min(v, regionSize > 0 ? regionSize - 1 : 0))
+        let row = (target & ~(Self.bytesPerRow - 1)) / Self.bytesPerRow
         addrInput = ""
-        selectedOffset = nil
-        rebuildSnapshot()
-    }
-
-    private func rebuildSnapshot() {
-        guard emulator.loadedROM != nil else { snapshot = Data(); return }
-        let length = rowCount * Self.bytesPerRow
-        let cap = region.size > 0 ? Int(region.size) - Int(baseAddr) : length
-        let want = max(0, min(length, cap))
-        snapshot = emulator.readRegion(region, offset: baseAddr, length: want)
+        selectedOffset = target
+        jumpRow = row
     }
 }
