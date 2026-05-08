@@ -4,7 +4,7 @@ import SwiftData
 
 @main
 struct KintsukiApp: App {
-    @StateObject private var emulator = Emulator()
+    @State private var emulator = Emulator()
     @State private var showStateBrowser = false
     @Environment(\.openWindow) private var openWindow
 
@@ -13,7 +13,7 @@ struct KintsukiApp: App {
     var body: some Scene {
         Window("Kintsuki", id: "main") {
             ContentView(showStateBrowser: $showStateBrowser)
-                .environmentObject(emulator)
+                .environment(emulator)
                 .frame(minWidth: 564, minHeight: 484)
                 .onAppear { handleLaunchArguments() }
         }

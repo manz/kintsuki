@@ -6,16 +6,17 @@ import CKintsuki
 /// High-level wrapper around libkintsuki. Lives on the main actor so
 /// SwiftUI bindings stay safe; emulation step itself is cheap (~16ms / frame).
 @MainActor
-final class Emulator: ObservableObject {
-    @Published private(set) var running: Bool = false
-    @Published private(set) var loadedROM: URL?
-    @Published private(set) var recentROMs: [URL] = []
+@Observable
+final class Emulator {
+    private(set) var running: Bool = false
+    private(set) var loadedROM: URL?
+    private(set) var recentROMs: [URL] = []
     private let recentsKey = "kintsuki.recentROMs"
     private let recentsLimit = 10
-    @Published private(set) var lastFrameID: UInt64 = 0
-    @Published private(set) var fps: Double = 0
-    @Published private(set) var cpuState = CpuState()
-    @Published private(set) var breakpoints: [Breakpoint] = []
+    private(set) var lastFrameID: UInt64 = 0
+    private(set) var fps: Double = 0
+    private(set) var cpuState = CpuState()
+    private(set) var breakpoints: [Breakpoint] = []
 
     /// Set by ContentView once SwiftData's ModelContext is available.
     /// Use `setModelContext(_:)` rather than assigning directly — it
@@ -64,19 +65,19 @@ final class Emulator: ObservableObject {
     /// True when the CPU executed STP and is sitting in instructionStop's
     /// idle loop — the game has effectively crashed (or hit a manual halt).
     /// Drives the "Game stopped" overlay in ContentView.
-    @Published private(set) var halted: Bool = false
+    private(set) var halted: Bool = false
 
     /// Crash-recovery mode: emulator was launched from a `.kcr` dump,
     /// rewind capture is suppressed so the loaded ring stays a faithful
     /// pre-crash recording, and the run loop starts paused. Toggled on
     /// by `loadCrashDump(_:)` and off only by a fresh ROM load.
-    @Published private(set) var recoveryMode: Bool = false
+    private(set) var recoveryMode: Bool = false
 
     /// On-disk path of the most recent `.kcr` written for this session
     /// (or loaded into recovery mode). Surfaced in the UI so the user
     /// can copy it for `kintsuki --recover` or hand it to a Python
     /// reproducer script.
-    @Published private(set) var lastCrashDumpURL: URL? = nil
+    private(set) var lastCrashDumpURL: URL? = nil
 
     struct BacktraceFrame: Identifiable, Equatable, Codable {
         var id = UUID()
@@ -103,13 +104,13 @@ final class Emulator: ObservableObject {
     /// Captured shadow callstack at the moment the CPU first transitioned
     /// to halted=true. Cleared when the CPU resumes (after rearm, reset,
     /// hot-reload). Topmost frame first (deepest call).
-    @Published private(set) var crashBacktrace: [BacktraceFrame] = []
+    private(set) var crashBacktrace: [BacktraceFrame] = []
 
     /// Resolved metadata for the PC the CPU executed STP at — populated
     /// at the same time as `crashBacktrace`. The shadow stack only
     /// reports JSR/JSL callsites (= where the caller WAS), so without
     /// this the routine the BRK / STP actually fired in goes unnamed.
-    @Published private(set) var crashSite: BacktraceFrame? = nil
+    private(set) var crashSite: BacktraceFrame? = nil
 
     /// Effective framebuffer dimensions reported by ares last frame.
     /// The pixel data lives inside libkintsuki and is exposed via
@@ -145,7 +146,7 @@ final class Emulator: ObservableObject {
     private var rewindBuffer = RewindBuffer(capacity: 3600,
                                             keyframeInterval: 60)
     /// Frames currently retained in the rewind buffer (for the status pill).
-    @Published private(set) var rewindFrames: Int = 0
+    private(set) var rewindFrames: Int = 0
     /// Set true while a rewind is in progress so the run loop pauses
     /// captures (otherwise we'd push the rewound state right back onto
     /// the buffer and never make progress).
@@ -219,14 +220,21 @@ final class Emulator: ObservableObject {
     }
 
     deinit {
-        if let mon = rewindKeyMonitor {
-            NSEvent.removeMonitor(mon)
-        }
-        if let mon = pauseKeyMonitor {
-            NSEvent.removeMonitor(mon)
-        }
-        if let h = handle {
-            kintsuki_destroy(h)
+        // Pre-@Observable the deinit could touch @MainActor members
+        // because ObservableObject classes carried implicit deinit
+        // isolation; @Observable + @MainActor requires us to assert
+        // we're on the main actor. Emulator is owned by the App scene
+        // (always-on main), so this assertion holds.
+        MainActor.assumeIsolated {
+            if let mon = rewindKeyMonitor {
+                NSEvent.removeMonitor(mon)
+            }
+            if let mon = pauseKeyMonitor {
+                NSEvent.removeMonitor(mon)
+            }
+            if let h = handle {
+                kintsuki_destroy(h)
+            }
         }
     }
 
@@ -1362,7 +1370,7 @@ final class Emulator: ObservableObject {
     /// Set by a halting breakpoint's callback dispatcher; consumed by
     /// `tick()` after each `kintsuki_run_frames` call. Drives the
     /// run-loop pause + UI focus jump to the breakpoint's PC.
-    @Published private(set) var pendingBreakpointHaltId: UUID? = nil
+    private(set) var pendingBreakpointHaltId: UUID? = nil
 
     /// Add a breakpoint. `halt: true` pauses the emulator on hit; default
     /// is `false` (tracing — counters update, execution continues). The

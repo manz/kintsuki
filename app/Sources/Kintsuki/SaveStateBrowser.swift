@@ -5,7 +5,7 @@ import AppKit
 /// Grid of save states for the currently loaded ROM. Click a card to load,
 /// double-click the title to rename, hover for delete.
 struct SaveStateBrowserView: View {
-    @EnvironmentObject var emulator: Emulator
+    @Environment(Emulator.self) var emulator
     @Environment(\.dismiss) private var dismiss
     @Query private var entries: [SaveStateEntry]
 
@@ -46,7 +46,7 @@ struct SaveStateBrowserView: View {
                     LazyVGrid(columns: columns, spacing: 12) {
                         ForEach(entries) { entry in
                             SaveStateCard(entry: entry)
-                                .environmentObject(emulator)
+                                .environment(emulator)
                                 .onTapGesture(count: 2) {
                                     emulator.loadState(entry)
                                     dismiss()
@@ -72,7 +72,7 @@ struct SaveStateBrowserView: View {
 }
 
 private struct SaveStateCard: View {
-    @EnvironmentObject var emulator: Emulator
+    @Environment(Emulator.self) var emulator
     let entry: SaveStateEntry
     @State private var hovering = false
     @State private var renaming = false

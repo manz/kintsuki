@@ -2,7 +2,7 @@ import SwiftUI
 import SwiftData
 
 struct ContentView: View {
-    @EnvironmentObject var emulator: Emulator
+    @Environment(Emulator.self) var emulator
     @Environment(\.modelContext) private var modelContext
     @Binding var showStateBrowser: Bool
 
@@ -61,7 +61,7 @@ struct ContentView: View {
         .sheet(isPresented: $showStateBrowser) {
             if let url = emulator.loadedROM {
                 SaveStateBrowserView(romPath: url.path)
-                    .environmentObject(emulator)
+                    .environment(emulator)
             }
         }
     }
@@ -73,7 +73,7 @@ struct ContentView: View {
 /// full PC + backtrace onto NSPasteboard, action buttons inline so the
 /// overlay doesn't block the run loop the way an NSAlert would.
 private struct CrashOverlay: View {
-    @ObservedObject var emulator: Emulator
+    let emulator: Emulator
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {

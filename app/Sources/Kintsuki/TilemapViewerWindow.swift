@@ -70,10 +70,10 @@ struct TilemapViewerView: View {
         // Subscribe selectively via `.onReceive` rather than carrying an
         // `@EnvironmentObject` — the latter would invalidate this body on
         // every emulator @Published mutation (60 Hz).
-        .onReceive(emulator.$running) { isRunning in
+        .onChange(of: emulator.running) { _, isRunning in
             if !isRunning { rebuildSnapshot() }
         }
-        .onReceive(emulator.$loadedROM) { _ in rebuildSnapshot() }
+        .onChange(of: emulator.loadedROM) { _, _ in rebuildSnapshot() }
         .onChange(of: selectedLayer) { _, _ in rebuildSnapshot() }
         // 2 Hz auto-refresh while running so the canvas tracks tilemap
         // edits without forcing the user to pause. Cheap: each rebuild

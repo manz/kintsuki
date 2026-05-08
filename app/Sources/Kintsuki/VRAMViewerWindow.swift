@@ -40,10 +40,10 @@ struct VRAMViewerView: View {
         }
         .frame(minWidth: 800, minHeight: 480)
         .onAppear { rebuildSnapshot() }
-        .onReceive(emulator.$running) { isRunning in
+        .onChange(of: emulator.running) { _, isRunning in
             if !isRunning { rebuildSnapshot() }
         }
-        .onReceive(emulator.$loadedROM) { _ in rebuildSnapshot() }
+        .onChange(of: emulator.loadedROM) { _, _ in rebuildSnapshot() }
         .onChange(of: bpp) { _, _ in rebuildSnapshot() }
         .onChange(of: paletteIndex) { _, _ in rebuildSnapshot() }
         // 2 Hz auto-refresh — same cost model as the tilemap viewer.

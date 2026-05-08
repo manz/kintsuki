@@ -94,16 +94,16 @@ struct DebuggerView: View {
         // on the published streams keeps working regardless and avoids
         // the 60 Hz redraw storm that comes with full ObservableObject
         // subscription.
-        .onReceive(emulator.$running) { isRunning in
+        .onChange(of: emulator.running) { _, isRunning in
             displayedRunning = isRunning
             if !isRunning { rebuildLines() }
         }
-        .onReceive(emulator.$loadedROM) { _ in
+        .onChange(of: emulator.loadedROM) { _, _ in
             labelCache = emulator.allLabels()
             rebuildLines()
         }
-        .onReceive(emulator.$breakpoints) { _ in rebuildLines() }
-        .onReceive(emulator.$crashBacktrace) { _ in rebuildLines() }
+        .onChange(of: emulator.breakpoints) { _, _ in rebuildLines() }
+        .onChange(of: emulator.crashBacktrace) { _, _ in rebuildLines() }
         // (refreshTick is bumped *by* rebuildLines to force the LazyVStack
         // to re-anchor; calling rebuildLines from its own onChange would
         // recurse, so the scroll-side handlers below depend on
