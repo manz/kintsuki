@@ -652,7 +652,12 @@ final class HexCanvasView: NSView {
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         let loc = convert(event.locationInWindow, from: nil)
-        guard let off = offsetAt(point: loc, clamping: true) else { return }
+        // No clamping on the initial click — clicking the empty
+        // gutter / address column shouldn't snap selection to row 0
+        // (which the user reads as "jumped to the start of the
+        // session"). Drag still uses clamping so a drag that started
+        // inside the hex area can extend past its left/right margins.
+        guard let off = offsetAt(point: loc, clamping: false) else { return }
         pendingNibble = nil
         let extend = event.modifierFlags.contains(.shift)
         if extend, let cur = selection {
