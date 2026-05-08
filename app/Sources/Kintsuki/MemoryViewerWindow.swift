@@ -284,9 +284,15 @@ final class HexCanvasView: NSView {
         guard totalBytes > 0 else { return }
 
         let rowH = rowHeight
-        let firstRow = max(0, Int(dirtyRect.minY / rowH) - 1)
-        let lastRow = min((totalBytes + bytesPerRow - 1) / bytesPerRow,
-                          Int(dirtyRect.maxY / rowH) + 1)
+        let totalRows = (totalBytes + bytesPerRow - 1) / bytesPerRow
+        // Negative dirtyRect (AppKit hands us partial-overlap rects with
+        // negative origins for off-canvas scrolling) collapses both
+        // bounds → range fatal. Clamp + ensure lastRow >= firstRow.
+        let rawFirst = Int((dirtyRect.minY / rowH).rounded(.down)) - 1
+        let rawLast  = Int((dirtyRect.maxY / rowH).rounded(.up)) + 1
+        let firstRow = min(max(0, rawFirst), totalRows)
+        let lastRow  = min(max(firstRow, rawLast), totalRows)
+        guard firstRow < lastRow else { return }
 
         let attrs: [NSAttributedString.Key: Any] = [
             .font: font,
