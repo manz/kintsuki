@@ -6,6 +6,7 @@ import SwiftData
 struct KintsukiApp: App {
     @StateObject private var emulator = Emulator()
     @State private var showStateBrowser = false
+    @Environment(\.openWindow) private var openWindow
 
     private let modelContainer: ModelContainer = Self.makeContainer()
 
@@ -14,8 +15,23 @@ struct KintsukiApp: App {
             ContentView(showStateBrowser: $showStateBrowser)
                 .environmentObject(emulator)
                 .frame(minWidth: 564, minHeight: 484)
+                .onAppear { handleLaunchArguments() }
         }
         .modelContainer(modelContainer)
+
+        Window("Tilemap Viewer", id: "tilemap") {
+            // Plain reference, like DebuggerView — keeps the viewer
+            // from re-rendering 60 Hz on every emulator @Published mutation.
+            TilemapViewerView(emulator: emulator)
+        }
+
+        Window("Debugger", id: "debugger") {
+            // Hand the Emulator over as a plain reference rather than an
+            // `.environmentObject`. DebuggerView intentionally does not
+            // subscribe to its `@Published` mutations — see the doc on
+            // `DebuggerView.emulator` for the FPS rationale.
+            DebuggerView(emulator: emulator)
+        }
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Open ROM…") {
@@ -35,6 +51,12 @@ struct KintsukiApp: App {
                 Divider()
                 Button("Load Save File (.srm)…") { loadSRMViaPanel() }
                     .disabled(emulator.loadedROM == nil)
+                Divider()
+                Button("Open Crash Dump…") { openCrashDumpViaPanel() }
+                    .keyboardShortcut("o", modifiers: [.command, .shift])
+                Button("Reveal Crash Dumps in Finder") {
+                    NSWorkspace.shared.activateFileViewerSelecting([Emulator.crashDumpsDirectory])
+                }
             }
             CommandGroup(after: .toolbar) {
                 Button("Reset") { emulator.reset() }
@@ -63,6 +85,10 @@ struct KintsukiApp: App {
                     emulator.inspectorOpen.toggle()
                 }
                 .keyboardShortcut("i", modifiers: .command)
+                Button("Tilemap Viewer") { openWindow(id: "tilemap") }
+                    .keyboardShortcut("t", modifiers: [.command, .shift])
+                Button("Debugger") { openWindow(id: "debugger") }
+                    .keyboardShortcut("d", modifiers: [.command, .shift])
             }
             CommandMenu("State") {
                 Button("Show Save States in Finder") {
@@ -80,6 +106,40 @@ struct KintsukiApp: App {
                     .disabled(emulator.loadedROM == nil)
                 Button("Import State from File…") { importStateViaPanel() }
                     .disabled(emulator.loadedROM == nil)
+            }
+        }
+    }
+
+    /// Honour `--recover <path>` on launch by loading a `.kcr` dump
+    /// straight into recovery mode. Anything else (including a bare
+    /// positional ROM path) is left to the existing open-ROM flow.
+    private func handleLaunchArguments() {
+        let args = ProcessInfo.processInfo.arguments
+        guard let i = args.firstIndex(of: "--recover"),
+              i + 1 < args.count else { return }
+        let path = args[i + 1]
+        let url = URL(fileURLWithPath: path)
+        if !emulator.loadCrashDump(url) {
+            NSLog("kintsuki: --recover load failed for \(path)")
+        }
+    }
+
+    private func openCrashDumpViaPanel() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.message = "Select a Kintsuki crash dump (.kcr)"
+        panel.prompt = "Recover"
+        panel.directoryURL = Emulator.crashDumpsDirectory
+        if panel.runModal() == .OK, let url = panel.url {
+            let ok = emulator.loadCrashDump(url)
+            if !ok {
+                let alert = NSAlert()
+                alert.alertStyle = .warning
+                alert.messageText = "Crash dump load failed"
+                alert.informativeText = "Could not load \(url.lastPathComponent)."
+                alert.runModal()
             }
         }
     }

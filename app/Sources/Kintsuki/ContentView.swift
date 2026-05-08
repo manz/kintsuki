@@ -62,7 +62,7 @@ struct ContentView: View {
             }
         }
         .animation(.easeInOut(duration: 0.2), value: emulator.inspectorOpen)
-        .onAppear { emulator.modelContext = modelContext }
+        .onAppear { emulator.setModelContext(modelContext) }
         .sheet(isPresented: $showStateBrowser) {
             if let url = emulator.loadedROM {
                 SaveStateBrowserView(romPath: url.path)

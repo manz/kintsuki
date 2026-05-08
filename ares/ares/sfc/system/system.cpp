@@ -71,6 +71,14 @@ auto System::run() -> void {
 __attribute__((visibility("default")))
 volatile bool kintsukiBailRequested = false;
 
+// Sticky halt flag — once raised, `Program::runFrames` breaks out of
+// its inner `system.run()` loop instead of spinning the CPU coroutine
+// forward to the next frame boundary. Used by halting breakpoints so
+// the host stops AT the BP address rather than wherever the frame
+// happened to end. Cleared explicitly by the host on resume.
+__attribute__((visibility("default")))
+volatile bool kintsukiHaltRequested = false;
+
 auto System::load(Node::System& root, string name) -> bool {
   if(node) unload();
 

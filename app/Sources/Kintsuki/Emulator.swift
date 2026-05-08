@@ -19,7 +19,18 @@ final class Emulator: ObservableObject {
     @Published private(set) var breakpoints: [Breakpoint] = []
 
     /// Set by ContentView once SwiftData's ModelContext is available.
-    var modelContext: ModelContext?
+    /// Use `setModelContext(_:)` rather than assigning directly — it
+    /// pumps any auto-load that fired before the context was ready.
+    private(set) var modelContext: ModelContext?
+
+    /// Wire up the SwiftData context. Triggers a deferred autosave load
+    /// when a ROM was already loaded before the context arrived
+    /// (cold-launch race: `loadROM` from `Emulator.init` can race the
+    /// ContentView onAppear that owns the SwiftData environment).
+    func setModelContext(_ ctx: ModelContext) {
+        modelContext = ctx
+        if loadedROM != nil { _ = loadAutosave() }
+    }
 
     enum BreakKind: Int, CaseIterable, Identifiable {
         case exec = 0, read = 1, write = 2
@@ -32,13 +43,16 @@ final class Emulator: ObservableObject {
         var kind: BreakKind
         var lo: UInt32
         var hi: UInt32
+        /// True = pause the emulator on hit (real breakpoint).
+        /// False = log/count only (tracing watchpoint).
+        var halt: Bool = false
         var hitCount: Int = 0
         var lastHit: UInt32 = 0
         // Native callback id from kintsuki_add_callback.
         var nativeId: Int32 = 0
     }
 
-    struct CpuState: Equatable {
+    struct CpuState: Equatable, Codable {
         var a: UInt16 = 0, x: UInt16 = 0, y: UInt16 = 0
         var s: UInt16 = 0, d: UInt16 = 0
         var b: UInt8 = 0, p: UInt8 = 0
@@ -53,8 +67,20 @@ final class Emulator: ObservableObject {
     /// Drives the "Game stopped" overlay in ContentView.
     @Published private(set) var halted: Bool = false
 
-    struct BacktraceFrame: Identifiable, Equatable {
-        let id = UUID()
+    /// Crash-recovery mode: emulator was launched from a `.kcr` dump,
+    /// rewind capture is suppressed so the loaded ring stays a faithful
+    /// pre-crash recording, and the run loop starts paused. Toggled on
+    /// by `loadCrashDump(_:)` and off only by a fresh ROM load.
+    @Published private(set) var recoveryMode: Bool = false
+
+    /// On-disk path of the most recent `.kcr` written for this session
+    /// (or loaded into recovery mode). Surfaced in the UI so the user
+    /// can copy it for `kintsuki --recover` or hand it to a Python
+    /// reproducer script.
+    @Published private(set) var lastCrashDumpURL: URL? = nil
+
+    struct BacktraceFrame: Identifiable, Equatable, Codable {
+        var id = UUID()
         var callsite: UInt32   // 24-bit
         var target:   UInt32   // 24-bit
         var kind:     UInt8    // 0=JSR, 1=JSL, 0xFF=halt site
@@ -117,7 +143,7 @@ final class Emulator: ObservableObject {
     /// frames @ 60 fps (3600). The buffer stores XOR-compressed deltas
     /// against periodic keyframes so the worst-case footprint is bounded
     /// at ~50 MB rather than 60s × 60fps × full state.
-    private let rewindBuffer = RewindBuffer(capacity: 3600,
+    private var rewindBuffer = RewindBuffer(capacity: 3600,
                                             keyframeInterval: 60)
     /// Frames currently retained in the rewind buffer (for the status pill).
     @Published private(set) var rewindFrames: Int = 0
@@ -146,6 +172,14 @@ final class Emulator: ObservableObject {
     private var rewindHolding: Bool = false
     private var rewindHoldResumeWork: DispatchWorkItem?
     private let rewindHoldTimeout: TimeInterval = 0.15
+    /// While the user is actively rewinding, a dedicated timer drives
+    /// the buffer at full frame-rate (60 Hz) instead of relying on OS
+    /// key-repeat (which throttles ~30 Hz and slows rewind below 1:1).
+    /// Mesen-S behaviour: hold the rewind key, watch state scrub
+    /// smoothly backwards in real time.
+    private var rewindTimer: Timer?
+    /// Frames per rewind tick. 1 = 1:1 real-time. Bump for fast-rewind.
+    private(set) var rewindStepPerTick: Int = 1
 
     init() {
         // Set KINTSUKI_SYSTEM_PAK env var so the dylib finds boards.bml/ipl.rom
@@ -269,6 +303,15 @@ final class Emulator: ObservableObject {
         // New ROM = fresh timeline. Drop any rewind frames from a
         // previous session.
         clearRewindBuffer()
+        // Fresh ROM = no longer reproducing a crash dump.
+        recoveryMode = false
+        // If the SwiftData context is already wired up, restore the
+        // per-ROM autosave slot so the user lands exactly where they
+        // left off. When the context isn't ready yet (cold launch race
+        // — `modelContext` is set by ContentView's onAppear, which can
+        // run after this auto-load), the deferred trigger in
+        // `setModelContext(_:)` covers that path.
+        if modelContext != nil { _ = loadAutosave() }
         rememberRecent(url)
         // Auto-load a sibling `.adbg` so the halt overlay can resolve
         // crash callstacks without an explicit user action. a816 emits
@@ -339,13 +382,171 @@ final class Emulator: ObservableObject {
     // ----- Run loop --------------------------------------------------------
     func togglePause() {
         running.toggle()
-        if running { startRunLoop() } else { stopRunLoop() }
+        if running {
+            // Resuming after a halting BP — clear the pending signal so
+            // the next frame doesn't immediately re-pause us.
+            pendingBreakpointHaltId = nil
+            startRunLoop()
+        } else {
+            stopRunLoop()
+            refreshBacktrace()
+        }
     }
 
     func stepOneFrame() {
         guard let h = handle else { return }
         kintsuki_run_frames(h, 1)
         snapshotFramebuffer()
+    }
+
+    /// Single-instruction step. Pause the run loop, advance one 65816
+    /// opcode, refresh the cached CPU state. No-op when no ROM is loaded.
+    func stepInstruction() {
+        guard let h = handle else { return }
+        if running { stopRunLoop(); running = false }
+        kintsuki_step(h)
+        snapshotCpuState()
+        snapshotFramebuffer()
+        refreshBacktrace()
+    }
+
+    /// Step Over: when the current opcode is JSR ($20)/JSL ($22), run to
+    /// the instruction immediately after it. Otherwise behaves like
+    /// `stepInstruction`. Caps at one emulated frame so a misbehaving
+    /// callee can't lock the UI thread.
+    func stepOver() {
+        guard let h = handle else { return }
+        if running { stopRunLoop(); running = false }
+        var line = kintsuki_disasm_line_t()
+        let n = kintsuki_disassemble_at(h, cpuState.pc, 1, &line)
+        guard n > 0 else { kintsuki_step(h); snapshotCpuState(); snapshotFramebuffer(); return }
+        let opcode = kintsuki_read_u8(h, cpuState.pc)
+        if opcode == 0x20 || opcode == 0x22 || opcode == 0xFC {
+            let next = (cpuState.pc & 0xFF0000) | ((cpuState.pc &+ UInt32(line.length)) & 0xFFFF)
+            _ = kintsuki_run_until(h, next, 1)
+        } else {
+            kintsuki_step(h)
+        }
+        snapshotCpuState()
+        snapshotFramebuffer()
+        refreshBacktrace()
+    }
+
+    /// Step Out: drive the CPU until the topmost shadow-callstack frame's
+    /// return address is reached. Best-effort — when the callstack is
+    /// empty (e.g. ran past an RTS without a tracked JSR) falls back to a
+    /// single instruction step. Caps at one frame to bound the wait.
+    func stepOut() {
+        guard let h = handle else { return }
+        if running { stopRunLoop(); running = false }
+        var frames = [kintsuki_call_frame_t](repeating: kintsuki_call_frame_t(),
+                                             count: 32)
+        let depth = frames.withUnsafeMutableBufferPointer { buf -> UInt32 in
+            kintsuki_callstack_snapshot(h, buf.baseAddress, UInt32(buf.count))
+        }
+        if depth == 0 {
+            kintsuki_step(h)
+        } else {
+            // Topmost frame = last entry (deepest first ordering per ABI).
+            let top = frames[Int(depth) - 1]
+            // Return address = JSR/JSL instruction's PC + length (3 for JSR,
+            // 4 for JSL). Stay in-bank as the CPU would after RTS/RTL.
+            let len: UInt32 = (top.kind == 0) ? 3 : 4
+            let ret = (top.callsite_pc & 0xFF0000) | ((top.callsite_pc &+ len) & 0xFFFF)
+            _ = kintsuki_run_until(h, ret, 1)
+        }
+        snapshotCpuState()
+        snapshotFramebuffer()
+        refreshBacktrace()
+    }
+
+    /// Run to cursor: install a one-shot halting breakpoint at `pc`,
+    /// resume the run loop, and let the regular BP-halt path stop us
+    /// when execution reaches the target. Falls back gracefully if the
+    /// target never gets hit — the user can pause to drop the transient
+    /// BP. Async-friendly (UI stays live), unlike the prior `run_until`
+    /// path that blocked the main thread up to `max_frames` frames.
+    @discardableResult
+    func runToCursor(pc: UInt32) -> Bool {
+        guard handle != nil else { return false }
+        // Drop any pending halt request so the run loop doesn't
+        // immediately re-pause on the previous breakpoint.
+        pendingBreakpointHaltId = nil
+        // One-shot halting BP at cursor. The standard BP-halt branch in
+        // tick() will pause + refresh the debugger when it fires; we
+        // mark it via metadata so the user's BP list isn't polluted.
+        let target = pc & 0xFFFFFF
+        addRunToCursorBP(target: target)
+        if !running {
+            running = true
+            startRunLoop()
+        }
+        return true
+    }
+
+    /// Track transient run-to-cursor BPs so we can clean them up when
+    /// they fire (or the user cancels).
+    private var runToCursorBPIds: Set<UUID> = []
+
+    private func addRunToCursorBP(target: UInt32) {
+        addBreakpoint(kind: .exec, lo: target, hi: target, halt: true)
+        if let bp = breakpoints.last {
+            runToCursorBPIds.insert(bp.id)
+        }
+    }
+
+    /// Called from tick() right after a BP halt to discard any
+    /// transient run-to-cursor BPs (avoids polluting the user's BP set
+    /// across multiple run-to-cursor invocations).
+    fileprivate func consumeRunToCursorBPs() {
+        guard !runToCursorBPIds.isEmpty else { return }
+        let toRemove = breakpoints.filter { runToCursorBPIds.contains($0.id) }
+        for bp in toRemove { removeBreakpoint(bp) }
+        runToCursorBPIds.removeAll()
+    }
+
+    /// Disassemble `count` instructions starting at `pc`. Returns the
+    /// rendered lines + per-instruction lengths. Used by the debugger
+    /// window to populate its source pane.
+    struct DisasmLine: Identifiable, Equatable {
+        let id = UUID()
+        let pc: UInt32
+        let length: UInt8
+        let text: String
+        /// Static control-flow target when the instruction is a
+        /// JMP/JML/JSR/JSL/Bxx/BRL with a constant operand. Nil for
+        /// non-branching ops or indirect/indexed jumps.
+        let target: UInt32?
+    }
+
+    func disassemble(at pc: UInt32, count: Int,
+                     eOverride: Bool? = nil,
+                     mOverride: Bool? = nil,
+                     xOverride: Bool? = nil) -> [DisasmLine] {
+        // Calling the disassembler before a cart is mapped derefs an
+        // unmapped bus pointer (readDisassembler segfaults). Guard so the
+        // debugger window can render an empty list pre-ROM.
+        guard let h = handle, loadedROM != nil, count > 0 else { return [] }
+        var raw = [kintsuki_disasm_line_t](repeating: kintsuki_disasm_line_t(),
+                                           count: count)
+        let e: Int32 = eOverride.map { $0 ? 1 : 0 } ?? -1
+        let m: Int32 = mOverride.map { $0 ? 1 : 0 } ?? -1
+        let x: Int32 = xOverride.map { $0 ? 1 : 0 } ?? -1
+        let n = raw.withUnsafeMutableBufferPointer { buf -> UInt32 in
+            kintsuki_disassemble_at_ex(h, pc & 0xFFFFFF, UInt32(buf.count),
+                                       e, m, x, buf.baseAddress)
+        }
+        return (0..<Int(n)).map { i in
+            var entry = raw[i]
+            let text = withUnsafePointer(to: &entry.text) { tup in
+                tup.withMemoryRebound(to: CChar.self, capacity: 128) { p in
+                    String(cString: p)
+                }
+            }
+            let target: UInt32? = entry.target == 0xFFFFFFFF ? nil : entry.target
+            return DisasmLine(pc: entry.pc, length: entry.length,
+                              text: text, target: target)
+        }
     }
 
     private func startRunLoop() {
@@ -398,9 +599,41 @@ final class Emulator: ObservableObject {
             return
         }
         kintsuki_run_frames(h, 1)
-        captureRewindFrame()
+        // Rewind capture goes through `kintsuki_save_state` which calls
+        // `System::serialize(true)` → `scheduler.enter(Synchronize)`,
+        // running every coroutine forward to a sync boundary. After a
+        // halting breakpoint that advances `cpu.r.pc.d` from the BP
+        // address to wherever the sync lands. Skip capture this tick
+        // when a halt is pending; the next normal tick (post-resume)
+        // will resume capture.
+        if pendingBreakpointHaltId == nil {
+            captureRewindFrame()
+        }
         snapshotFramebuffer()
         snapshotCpuState()
+        // Halting breakpoint hit during this frame? Pause the run loop
+        // so the user can inspect. The callback's hop to main has
+        // already updated `pendingBreakpointHaltId` by the time the
+        // bail-induced early return lands here.
+        if pendingBreakpointHaltId != nil && running {
+            // Drop any one-shot run-to-cursor breakpoints so they don't
+            // accumulate in the user-visible BP list.
+            consumeRunToCursorBPs()
+            // Re-snapshot the CPU register file at the bail boundary —
+            // the earlier `snapshotCpuState()` runs before the halt
+            // bookkeeping below, but we want to make absolutely sure
+            // the @Published `cpuState` matches the BP address before
+            // the debugger's onReceive subscribers fire.
+            snapshotCpuState()
+            running = false
+            stopRunLoop()
+            // Populate the backtrace snapshot the debugger surface
+            // reads. Without this the sidebar showed
+            // "(running — pause to capture)" even though we'd just
+            // halted on a breakpoint.
+            refreshBacktrace()
+            NSLog(String(format: "kintsuki: paused on breakpoint at %06X", cpuState.pc))
+        }
         let now = Date.now
         let elapsed = now.timeIntervalSince(lastFpsTime)
         if elapsed >= 0.5 {
@@ -420,7 +653,7 @@ final class Emulator: ObservableObject {
     /// dispatched to a serial background queue so the run loop doesn't
     /// pay it. push order is preserved by the queue's serial nature.
     private func captureRewindFrame() {
-        guard !rewinding, let h = handle else { return }
+        guard !rewinding, !recoveryMode, let h = handle else { return }
         let needed = kintsuki_save_state(h, nil, 0)
         guard needed > 0 else { return }
         // Producer-style push: ares writes the savestate straight into
@@ -433,9 +666,22 @@ final class Emulator: ObservableObject {
             let written = kintsuki_save_state(h, base, UInt32(dst.count))
             return Int(written)
         }
+        // `rewindFrames` is `@Published` and read by ContentView's status
+        // pill + KintsukiApp's menu disabled-state. Mutating it every
+        // push was firing objectWillChange 60 Hz pre-saturation — every
+        // SwiftUI view holding an `@EnvironmentObject` Emulator would
+        // redraw, which compounded with the Metal renderer's frame
+        // present cost into a perf cliff around 50s of fill. Throttle
+        // updates to ~6 Hz; status display lag is invisible at human
+        // perception, hot path stays cheap.
         let n = rewindBuffer.count
-        if rewindFrames != n { rewindFrames = n }
+        if rewindFrames != n,
+           lastFrameID >= lastRewindFramesPublish + 10 {
+            rewindFrames = n
+            lastRewindFramesPublish = lastFrameID
+        }
     }
+    private var lastRewindFramesPublish: UInt64 = 0
 
     /// Pop the most-recent retained frame and load it. Returns true if
     /// the buffer had something to rewind to. Triggered by the UI's
@@ -449,54 +695,100 @@ final class Emulator: ObservableObject {
     /// CMD+← (1 frame) and CMD+Shift+← (1 second = 60 frames) shortcuts.
     @discardableResult
     func rewindBy(frames n: Int) -> Bool {
-        guard let h = handle, n >= 1 else { return false }
-        // Mark the run loop as "user is scrubbing"; tick() will skip
-        // forward emulation until the hold timeout fires.
+        guard handle != nil, n >= 1 else { return false }
+        // The actual buffer consumption is done by `rewindTimer` (60 Hz,
+        // see `startRewindTimer`). This method only:
+        //   1. Engages the timer if not already running.
+        //   2. Pushes the hold-deadline forward so the timer keeps ticking.
+        // Each OS key-repeat extends the deadline; release stops repeats
+        // → deadline expires → trailing-edge work item stops the timer
+        // and does the final repaint. Doing the buffer step here too
+        // would race the timer and double-consume the ring, which is
+        // what made rewind feel "stuck on" (timer tries to drain a
+        // buffer the menu-action already chewed through).
         rewindHolding = true
+        startRewindTimer()
         rewindHoldResumeWork?.cancel()
         let work = DispatchWorkItem { [weak self] in
-            self?.rewindHolding = false
-            self?.rewindHoldResumeWork = nil
+            guard let self else { return }
+            self.rewindHolding = false
+            self.rewindHoldResumeWork = nil
+            self.stopRewindTimer()
+            // Trailing-edge repaint: one emulated frame to refresh the
+            // PPU output buffer to the post-rewind state. Per-step
+            // repaints already happen inside the timer, so this is a
+            // belt-and-suspenders refresh in case the user released
+            // mid-tick.
+            if let h = self.handle {
+                kintsuki_run_frames(h, 1)
+                self.snapshotFramebuffer()
+                self.snapshotCpuState()
+            }
         }
         rewindHoldResumeWork = work
         DispatchQueue.main.asyncAfter(deadline: .now() + rewindHoldTimeout,
                                       execute: work)
+        rewindStepPerTick = max(1, n)
+        return rewindBuffer.count > 0
+    }
 
-        rewinding = true
-        defer { rewinding = false }
-        // Pop n+1 frames and load the last one popped: the first pop
-        // discards the current state (already live in the emulator),
-        // the next n step backward by n frames. If the buffer is
-        // shallower than that, we land on the oldest frame retained.
-        var lastPopped: Data?
-        for _ in 0..<(n + 1) {
-            guard let b = rewindBuffer.popLast() else { break }
-            lastPopped = b
+    /// Drive the rewind buffer at 60 Hz while the user is holding the
+    /// rewind shortcut. Each tick rewinds `rewindStepPerTick` frames.
+    /// Stops when no rewindBy() call has happened for `rewindHoldTimeout`
+    /// seconds (the existing hold-debounce work cancels us).
+    private func startRewindTimer() {
+        guard rewindTimer == nil, let h = handle else { return }
+        let timer = Timer(timeInterval: 1.0 / 60.0, repeats: true) { [weak self] _ in
+            guard let self, self.handle != nil else { return }
+            // Defensive: if the hold flag flipped off behind our back
+            // (e.g., the trailing-edge work item raced ahead of timer
+            // invalidation), stop ourselves rather than silently drain
+            // the ring. The "stuck in rewind mode" symptom maps to a
+            // timer that kept ticking after a stale flag.
+            guard self.rewindHolding else {
+                self.stopRewindTimer()
+                return
+            }
+            // Bypass the public rewindBy() entry — we ARE the hold loop.
+            // Each tick: drop + materialize + load + rearm + repaint.
+            // Visible cost per tick post-optimization is ~9-12 ms, fits
+            // a 16 ms 60 Hz budget so the user sees state scrub
+            // backwards in real time (Mesen-S parity).
+            let n = self.rewindStepPerTick
+            let dropCount = min(n + 1, self.rewindBuffer.count)
+            self.rewindBuffer.dropLast(dropCount - 1)
+            guard self.rewindBuffer.count > 0 else { return }
+            let ok: Int32 = self.rewindBuffer.withMaterialized(
+                at: self.rewindBuffer.count - 1
+            ) { raw -> Int32 in
+                kintsuki_load_state(h, raw.baseAddress, UInt32(raw.count))
+            } ?? 0
+            self.rewindBuffer.dropLast(1)
+            self.rewindFrames = self.rewindBuffer.count
+            if ok != 0 {
+                kintsuki_rearm_cpu(h)
+                kintsuki_run_frames(h, 1)
+                self.snapshotFramebuffer()
+                self.snapshotCpuState()
+            }
         }
-        guard let blob = lastPopped else {
-            rewindFrames = rewindBuffer.count
-            return false
-        }
-        let ok = blob.withUnsafeBytes { raw -> Int32 in
-            kintsuki_load_state(h, raw.baseAddress, UInt32(blob.count))
-        }
-        rewindFrames = rewindBuffer.count
-        if ok != 0 {
-            // ares doesn't serialize the libco coroutine RIP, so the
-            // next run_frames would otherwise wake the coroutine inside
-            // whatever wait loop it suspended in — rearm gives us a
-            // fresh coroutine that picks up the restored register file.
-            kintsuki_rearm_cpu(h)
-            // The savestate restores PPU registers but not the live
-            // render output buffer. Advance one frame so the PPU
-            // re-paints the restored scene; otherwise the MTKView
-            // keeps showing whatever was last drawn before the rewind.
-            kintsuki_run_frames(h, 1)
-            snapshotFramebuffer()
-            snapshotCpuState()
-            return true
-        }
-        return false
+        timer.tolerance = 1.0 / 240.0
+        RunLoop.main.add(timer, forMode: .common)
+        rewindTimer = timer
+    }
+
+    private func stopRewindTimer() {
+        rewindTimer?.invalidate()
+        rewindTimer = nil
+        // Reset stride so a subsequent ⌘← (1 frame) rewind doesn't
+        // inherit a previous ⇧⌘← (60 frames) value.
+        rewindStepPerTick = 1
+    }
+
+    /// Set the rewind playback speed. 1 = 1:1 (60 fps backwards),
+    /// 2 = 2× fast-rewind, etc. Hooked to a future UI toggle.
+    func setRewindSpeed(framesPerTick: Int) {
+        rewindStepPerTick = max(1, framesPerTick)
     }
 
     /// Drop every retained rewind frame (e.g., on ROM unload).
@@ -542,11 +834,30 @@ final class Emulator: ObservableObject {
                 let stack = captureBacktrace()  // shallowest → newest
                 crashBacktrace = stack + [site]
                 crashSite = site
+                // Persist the rewind buffer + crash context for post-mortem
+                // debugging. Skip when we're already in recovery mode —
+                // re-dumping would overwrite the file the user is studying.
+                if !recoveryMode { writeCrashDump() }
             } else {
                 crashBacktrace = []
                 crashSite = nil
             }
         }
+    }
+
+    /// Capture-on-pause: rebuild `crashBacktrace` from the live shadow
+    /// callstack regardless of STP state. Drives the debugger window's
+    /// backtrace section so the user can inspect call chain on every
+    /// manual pause / step / breakpoint hit, not only on a crash.
+    func refreshBacktrace() {
+        let stack = captureBacktrace()
+        let s = cpuState
+        // Trace ordering matches the STP path: shallowest call first,
+        // current site last. Use the live PC as the deepest "frame".
+        var here = resolveFrame(at: s.pc, kind: s.stp ? 0xFF : 0xFE, target: 0)
+        here.cpu = s
+        crashBacktrace = stack + [here]
+        crashSite = here
     }
 
     /// Snapshot the native shadow callstack and resolve each frame's
@@ -1006,26 +1317,67 @@ final class Emulator: ObservableObject {
         let bpId: UUID
         init(owner: Emulator, bpId: UUID) { self.owner = owner; self.bpId = bpId }
         func fire(addr: UInt32) {
-            // Hop to main since callback runs on the emulator (main) thread.
-            DispatchQueue.main.async { [weak owner, bpId] in
-                guard let owner else { return }
-                if let i = owner.breakpoints.firstIndex(where: { $0.id == bpId }) {
+            // The callback runs synchronously inside kintsuki_run_frames,
+            // which is itself called on the main actor. We're driven by
+            // tick() on main, so it's safe to touch isolated state.
+            guard let owner else { return }
+            MainActor.assumeIsolated {
+                guard let i = owner.breakpoints.firstIndex(where: { $0.id == bpId })
+                else { return }
+                let isHalt = owner.breakpoints[i].halt
+                // Tracing BPs: tally silently into a non-published counter
+                // so the 60 Hz hit storm doesn't churn the UI. The
+                // breakpoint row exposes the silent count via a separate
+                // accessor that consumers can poll on demand. Halting BPs
+                // update the @Published row directly, which is fine since
+                // the run loop is about to pause anyway.
+                if isHalt {
                     owner.breakpoints[i].hitCount &+= 1
                     owner.breakpoints[i].lastHit = addr
+                    owner.pendingBreakpointHaltId = bpId
+                } else {
+                    owner.silentHits[bpId, default: 0] &+= 1
+                    owner.silentLastHit[bpId] = addr
                 }
             }
         }
     }
     private var breakContexts: [UUID: BreakCallbackContext] = [:]
 
-    func addBreakpoint(kind: BreakKind, lo: UInt32, hi: UInt32) {
+    /// Hit counters for tracing breakpoints, kept off `@Published` to
+    /// avoid 60 Hz SwiftUI churn. Read via `tracingHitCount(_:)` when
+    /// the user actually wants to see them (e.g. after a manual pause).
+    fileprivate var silentHits: [UUID: Int] = [:]
+    fileprivate var silentLastHit: [UUID: UInt32] = [:]
+
+    /// Snapshot the silent hit counter for a tracing breakpoint. Returns
+    /// 0 when none recorded. Halting BPs use `Breakpoint.hitCount`.
+    func tracingHitCount(_ bp: Breakpoint) -> Int {
+        return silentHits[bp.id, default: 0]
+    }
+
+    func tracingLastHit(_ bp: Breakpoint) -> UInt32? {
+        return silentLastHit[bp.id]
+    }
+
+    /// Set by a halting breakpoint's callback dispatcher; consumed by
+    /// `tick()` after each `kintsuki_run_frames` call. Drives the
+    /// run-loop pause + UI focus jump to the breakpoint's PC.
+    @Published private(set) var pendingBreakpointHaltId: UUID? = nil
+
+    /// Add a breakpoint. `halt: true` pauses the emulator on hit; default
+    /// is `false` (tracing — counters update, execution continues). The
+    /// debugger window asks for halting BPs; the inspector's quick-add
+    /// watchpoints stay tracing-only.
+    func addBreakpoint(kind: BreakKind, lo: UInt32, hi: UInt32, halt: Bool = false) {
         guard let h = handle else { return }
-        var bp = Breakpoint(kind: kind, lo: lo, hi: hi)
+        var bp = Breakpoint(kind: kind, lo: lo, hi: hi, halt: halt)
         let ctx = BreakCallbackContext(owner: self, bpId: bp.id)
         breakContexts[bp.id] = ctx
         let opaque = Unmanaged.passUnretained(ctx).toOpaque()
-        bp.nativeId = Int32(kintsuki_add_callback(h, Int32(kind.rawValue), lo, hi,
-                                                  Self.breakCallback, opaque))
+        bp.nativeId = Int32(kintsuki_add_callback_ex(
+            h, Int32(kind.rawValue), lo, hi, halt ? 1 : 0,
+            Self.breakCallback, opaque))
         breakpoints.append(bp)
     }
 
@@ -1033,6 +1385,8 @@ final class Emulator: ObservableObject {
         guard let h = handle else { return }
         kintsuki_remove_callback(h, Int32(bp.kind.rawValue), bp.nativeId)
         breakContexts.removeValue(forKey: bp.id)
+        silentHits.removeValue(forKey: bp.id)
+        silentLastHit.removeValue(forKey: bp.id)
         breakpoints.removeAll { $0.id == bp.id }
     }
 
@@ -1076,5 +1430,242 @@ final class Emulator: ObservableObject {
     func press(port: Int32, button: Int32, pressed: Bool) {
         guard let h = handle else { return }
         kintsuki_press(h, port, button, pressed ? 1 : 0)
+    }
+
+    // ----- PPU snapshot for viewers (tilemap, sprites, ...) ----------------
+    /// Read-only snapshot of write-only PPU registers. Backed by
+    /// `kintsuki_get_ppu_state`. Returns nil before a ROM is loaded.
+    func ppuState() -> kintsuki_ppu_state_t? {
+        guard let h = handle else { return nil }
+        var s = kintsuki_ppu_state_t()
+        kintsuki_get_ppu_state(h, &s)
+        return s
+    }
+
+    /// VRAM snapshot from the inspector cache (refreshed at most ~6 Hz).
+    /// Triggers a refresh if the cache is stale. Cheap when fresh — the
+    /// returned `Data` shares the cache's storage via copy-on-write.
+    func vramSnapshot() -> Data {
+        refreshInspectorCachesIfDue()
+        return vramCache
+    }
+
+    /// CGRAM snapshot from the inspector cache. Same semantics as
+    /// `vramSnapshot`. 512 bytes (256 BGR555 entries).
+    func cgramSnapshot() -> Data {
+        refreshInspectorCachesIfDue()
+        return cgramCache
+    }
+
+    // ----- .adbg label surface (debugger UI) ------------------------------
+    struct Label: Identifiable, Hashable {
+        let addr: UInt32        // 24-bit
+        let name: String
+        var id: UInt32 { addr }
+    }
+
+    /// All labels loaded from the active `.adbg` sidecar, sorted by
+    /// address ascending. Empty when no .adbg is loaded. Cached snapshot
+    /// — invalidated on `loadADBG` (caller responsibility to re-fetch).
+    func allLabels() -> [Label] {
+        guard let h = handle else { return [] }
+        let count = Int(kintsuki_label_count(h))
+        if count == 0 { return [] }
+        var raw = [kintsuki_label_entry_t](repeating: kintsuki_label_entry_t(),
+                                           count: count)
+        let n = raw.withUnsafeMutableBufferPointer { buf -> UInt32 in
+            kintsuki_label_snapshot(h, buf.baseAddress, UInt32(buf.count))
+        }
+        var out: [Label] = []
+        out.reserveCapacity(Int(n))
+        for i in 0..<Int(n) {
+            let e = raw[i]
+            guard let p = e.name else { continue }
+            out.append(Label(addr: e.addr, name: String(cString: p)))
+        }
+        return out
+    }
+
+    /// Resolve a label by name → 24-bit PC. Returns nil when no .adbg is
+    /// loaded or no label by that name exists.
+    func resolveSymbol(_ name: String) -> UInt32? {
+        guard let h = handle else { return nil }
+        var addr: UInt32 = 0
+        let ok = name.withCString { kintsuki_lookup_symbol_addr(h, $0, &addr) }
+        return ok != 0 ? addr : nil
+    }
+
+    /// Containing-routine resolution for an arbitrary PC. Returns
+    /// `(name, offset_in_routine)` when the .adbg has any label whose
+    /// address is ≤ pc; nil otherwise.
+    func containingLabel(at pc: UInt32) -> (name: String, offset: UInt32)? {
+        guard let h = handle else { return nil }
+        var off: UInt32 = 0
+        guard let p = kintsuki_lookup_label_containing(h, pc, &off) else {
+            return nil
+        }
+        return (String(cString: p), off)
+    }
+
+    /// Exact-address label lookup. Cheaper than `containingLabel` when
+    /// the caller wants to know "is this PC the start of a routine?".
+    func exactLabel(at pc: UInt32) -> String? {
+        guard let h = handle else { return nil }
+        guard let p = kintsuki_lookup_label(h, pc) else { return nil }
+        return String(cString: p)
+    }
+
+    /// `.adbg` source-line lookup. Returns `(file, line, column)` when
+    /// the loaded debug info has a LINES entry covering `pc`; nil when
+    /// no .adbg is loaded or the PC predates the first emitted line.
+    func sourceLine(at pc: UInt32) -> (file: String, line: UInt32, column: UInt16)? {
+        guard let h = handle else { return nil }
+        var filePtr: UnsafePointer<CChar>? = nil
+        var line: UInt32 = 0
+        var col: UInt16 = 0
+        let ok = kintsuki_lookup_source(h, pc, &filePtr, &line, &col)
+        guard ok != 0, let p = filePtr else { return nil }
+        return (String(cString: p), line, col)
+    }
+
+    // ----- Crash recovery --------------------------------------------------
+    /// Persistent location for `.kcr` dumps:
+    /// `~/Library/Application Support/Kintsuki/crashes/`. The directory is
+    /// created on demand.
+    static var crashDumpsDirectory: URL {
+        let fm = FileManager.default
+        let base = fm.urls(for: .applicationSupportDirectory,
+                           in: .userDomainMask).first
+            ?? fm.homeDirectoryForCurrentUser
+                .appendingPathComponent("Library/Application Support")
+        let dir = base.appendingPathComponent("Kintsuki/crashes",
+                                              isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        return dir
+    }
+
+    /// Snapshot the live rewind buffer + crash backtrace into a `.kcr`
+    /// file. Triggered on the STP edge (see `snapshotCpuState`). Rotates
+    /// older dumps so disk doesn't grow unbounded across dev iterations.
+    @discardableResult
+    func writeCrashDump() -> URL? {
+        guard let rom = loadedROM else { return nil }
+        let romHash = CrashDump.sha256(of: rom)
+        let adbg = rom.deletingPathExtension().appendingPathExtension("adbg")
+        let adbgHash: Data? = FileManager.default.fileExists(atPath: adbg.path)
+            ? CrashDump.sha256(of: adbg) : nil
+        let bt = (try? JSONEncoder().encode(crashBacktrace)) ?? Data("[]".utf8)
+        let dump = CrashDump(
+            romPath: rom.path,
+            romSHA256: romHash,
+            adbgSHA256: adbgHash,
+            crashPC: crashSite?.callsite ?? cpuState.pc,
+            crashCpu: cpuState,
+            backtraceJSON: bt,
+            keyframeInterval: 60,
+            capacity: 3600,
+            frames: rewindBuffer.serializedFrames()
+        )
+        let stem = rom.deletingPathExtension().lastPathComponent
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        let stamp = formatter.string(from: .now)
+        let url = Self.crashDumpsDirectory
+            .appendingPathComponent("\(stem)-\(stamp).kcr")
+        do {
+            try dump.write(to: url)
+            lastCrashDumpURL = url
+            NSLog("kintsuki: wrote crash dump \(url.path)")
+            rotateCrashDumps(keeping: 10)
+            return url
+        } catch {
+            NSLog("kintsuki: crash dump write failed: \(error)")
+            return nil
+        }
+    }
+
+    /// Load a `.kcr` dump and put the emulator into recovery mode. The
+    /// referenced ROM is reloaded if needed; the rewind buffer is
+    /// repopulated; recovery mode pauses the run loop and disables
+    /// future captures so the loaded ring stays a faithful recording.
+    /// Returns false on read errors or ROM mismatch.
+    @discardableResult
+    func loadCrashDump(_ url: URL) -> Bool {
+        let dump: CrashDump
+        do { dump = try CrashDump.read(from: url) }
+        catch {
+            NSLog("kintsuki: crash dump read failed: \(error)")
+            return false
+        }
+        // ROM resolution: the dump records the absolute path. Re-load it
+        // if not already live; mismatched ROM hashes get a warning but
+        // proceed — the user may have rebuilt with the same code.
+        let romURL = URL(fileURLWithPath: dump.romPath)
+        if loadedROM?.path != dump.romPath {
+            stopRunLoop()
+            loadROM(romURL)
+        }
+        let liveHash = CrashDump.sha256(of: romURL)
+        if liveHash != dump.romSHA256 {
+            NSLog("kintsuki: crash dump ROM hash mismatch — proceeding anyway")
+        }
+        // Rebuild the rewind buffer from serialized frames.
+        clearRewindBuffer()
+        let restored = RewindBuffer(restoring: dump.frames,
+                                    capacity: dump.capacity,
+                                    keyframeInterval: dump.keyframeInterval)
+        rewindBuffer_replace(with: restored)
+        rewindFrames = restored.count
+        // Seek to the last (= most recent / pre-crash) frame, load it
+        // into the live emulator so the UI matches the dump's PC.
+        if let lastBlob = restored.materialize(at: restored.count - 1),
+           let h = handle {
+            let ok = lastBlob.withUnsafeBytes { raw -> Int32 in
+                kintsuki_load_state(h, raw.baseAddress, UInt32(lastBlob.count))
+            }
+            if ok != 0 { kintsuki_rearm_cpu(h); kintsuki_run_frames(h, 1) }
+        }
+        recoveryMode = true
+        running = false
+        stopRunLoop()
+        snapshotFramebuffer()
+        snapshotCpuState()
+        // Replay the dump's backtrace into the UI so the overlay matches
+        // the original crash even though the live CPU may not be in STP
+        // post-load (loading a savestate clears r.stp).
+        if let frames = try? JSONDecoder().decode([BacktraceFrame].self,
+                                                   from: dump.backtraceJSON) {
+            crashBacktrace = frames
+            crashSite = frames.last
+        }
+        halted = true
+        lastCrashDumpURL = url
+        NSLog("kintsuki: recovery mode active for \(url.lastPathComponent)")
+        return true
+    }
+
+    /// Swap the rewind buffer for a freshly-deserialized one. The
+    /// existing buffer is left for ARC to reclaim once references drop.
+    private func rewindBuffer_replace(with new: RewindBuffer) {
+        rewindBuffer = new
+    }
+
+    private func rotateCrashDumps(keeping limit: Int) {
+        let fm = FileManager.default
+        let dir = Self.crashDumpsDirectory
+        guard let entries = try? fm.contentsOfDirectory(at: dir,
+            includingPropertiesForKeys: [.contentModificationDateKey],
+            options: [.skipsHiddenFiles]) else { return }
+        let kcr = entries.filter { $0.pathExtension == "kcr" }
+        let sorted = kcr.sorted { a, b in
+            let da = (try? a.resourceValues(forKeys: [.contentModificationDateKey])
+                .contentModificationDate) ?? .distantPast
+            let db = (try? b.resourceValues(forKeys: [.contentModificationDateKey])
+                .contentModificationDate) ?? .distantPast
+            return da > db
+        }
+        for stale in sorted.dropFirst(limit) {
+            try? fm.removeItem(at: stale)
+        }
     }
 }

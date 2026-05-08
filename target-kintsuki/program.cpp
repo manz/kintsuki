@@ -21,6 +21,10 @@
 using namespace nall;
 using namespace ares;
 
+namespace ares::SuperFamicom {
+  extern volatile bool kintsukiHaltRequested;
+}
+
 Program* kintsukiProgram = nullptr;
 
 namespace {
@@ -278,6 +282,10 @@ auto Program::injectSram(const u8* data, u32 len) -> u32 {
 
 auto Program::runFrames(u32 n) -> void {
   if(!loaded) return;
+  // Clear the sticky halt flag at the top so a previously-fired BP
+  // doesn't immediately re-bail on the next call. The flag will be
+  // re-raised mid-run when the BP exec hook fires again.
+  SuperFamicom::kintsukiHaltRequested = false;
   u64 target = framesRendered + n;
   u64 spin = 0;
   u64 spinCap = u64(n) * 10'000'000ull;
@@ -289,6 +297,11 @@ auto Program::runFrames(u32 n) -> void {
     // r.stp is observed so the host loop can react (paint the halt
     // overlay, prompt for reset) instead of spinning the scheduler.
     if(SuperFamicom::cpu.r.stp) break;
+    // Halting breakpoint hit: scheduler.exit yielded the coroutine on
+    // the bail flag, but without the sticky halt this loop would just
+    // resume system.run() and keep executing past the BP. Bail here
+    // so the host sees PC at the BP address.
+    if(SuperFamicom::kintsukiHaltRequested) break;
   }
 }
 
