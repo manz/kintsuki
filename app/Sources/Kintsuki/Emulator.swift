@@ -57,17 +57,34 @@ final class Emulator: ObservableObject {
         let id = UUID()
         var callsite: UInt32   // 24-bit
         var target:   UInt32   // 24-bit
-        var kind:     UInt8    // 0=JSR, 1=JSL
+        var kind:     UInt8    // 0=JSR, 1=JSL, 0xFF=halt site
         var label:    String?  // containing routine name from .adbg, nil if none
         var offset:   UInt32   // bytes into `label` (0 when no label)
         var file:     String?  // resolved via .adbg LINES, nil if no entry
         var line:     UInt32?  // 1-based, nil if no entry
+        // Containing label for `target` — i.e. the routine the JSR/JSL
+        // actually dispatched into. Lets the overlay print a "what was
+        // called" line between frames so the chain reads top-to-bottom
+        // without the user juggling addresses. Nil for the halt-site
+        // frame (no target) or when the target lands in unlabeled code.
+        var targetLabel: String? = nil
+        // CPU register snapshot. Populated only for the halt-site frame
+        // (`kind == 0xFF`); older callsite frames would need per-JSR
+        // snapshotting in the call hook to recover, which doubles the
+        // hook's cost — defer until somebody asks for it.
+        var cpu:      CpuState? = nil
     }
 
     /// Captured shadow callstack at the moment the CPU first transitioned
     /// to halted=true. Cleared when the CPU resumes (after rearm, reset,
     /// hot-reload). Topmost frame first (deepest call).
     @Published private(set) var crashBacktrace: [BacktraceFrame] = []
+
+    /// Resolved metadata for the PC the CPU executed STP at — populated
+    /// at the same time as `crashBacktrace`. The shadow stack only
+    /// reports JSR/JSL callsites (= where the caller WAS), so without
+    /// this the routine the BRK / STP actually fired in goes unnamed.
+    @Published private(set) var crashSite: BacktraceFrame? = nil
 
     /// Effective framebuffer dimensions reported by ares last frame.
     /// The pixel data lives inside libkintsuki and is exposed via
@@ -253,16 +270,31 @@ final class Emulator: ObservableObject {
         // previous session.
         clearRewindBuffer()
         rememberRecent(url)
-        // Auto-load `<rom>.adbg` if it sits next to the cart so the halt
-        // overlay can resolve crash callstacks without an explicit user
-        // action. Failure (missing / unreadable) is silent — most ROMs
-        // ship without one.
-        let adbg = URL(fileURLWithPath: url.path + ".adbg")
-        if FileManager.default.fileExists(atPath: adbg.path) {
-            let ok = adbg.path.withCString { kintsuki_load_adbg(h, $0) }
-            NSLog("kintsuki: load_adbg \(adbg.lastPathComponent) -> \(ok != 0 ? "ok" : "failed")")
-        } else {
+        // Auto-load a sibling `.adbg` so the halt overlay can resolve
+        // crash callstacks without an explicit user action. a816 emits
+        // the debug-info file next to whichever build artifact it just
+        // wrote — `.sfc.adbg` for direct SFC builds, `.ips.adbg` when
+        // the user assembles a patch and applies it to a base ROM.
+        // Probe a few candidates: same path with `.adbg` appended, then
+        // the same stem with `.adbg` swapped for the extension, then
+        // `.ips.adbg` against the stem.
+        let stem = (url.path as NSString).deletingPathExtension
+        let candidates = [
+            url.path + ".adbg",
+            stem + ".adbg",
+            stem + ".ips.adbg",
+        ]
+        var loaded = false
+        for c in candidates {
+            guard FileManager.default.fileExists(atPath: c) else { continue }
+            let ok = c.withCString { kintsuki_load_adbg(h, $0) }
+            NSLog("kintsuki: load_adbg \((c as NSString).lastPathComponent) -> \(ok != 0 ? "ok" : "failed")")
+            if ok != 0 { loaded = true; break }
+        }
+        if !loaded {
             kintsuki_clear_adbg(h)
+            NSLog("kintsuki: no .adbg found next to \(url.lastPathComponent) "
+                  + "(tried .sfc.adbg, .adbg, .ips.adbg)")
         }
         startRunLoop()
     }
@@ -487,7 +519,33 @@ final class Emulator: ObservableObject {
             // Capture once on the rising edge of the halt — calling the
             // C ABI is cheap but doing it 60Hz while the CPU is idle in
             // STP would churn @Published for nothing.
-            crashBacktrace = s.stp ? captureBacktrace() : []
+            if s.stp {
+                // Python-traceback ordering: shallowest call first,
+                // deepest call (the BRK/STP site) last. The shadow
+                // stack from C is already shallowest-first, so we just
+                // append the resolved halt site at the end and let the
+                // overlay walk top-to-bottom.
+                //
+                // Decrement the lookup PC by 1: STP advances PC past
+                // its own opcode before halting, so `s.pc` lands one
+                // byte beyond the instruction and `lookup_label_
+                // containing` would resolve against the *next* routine
+                // instead of the brk_handler the STP actually lives in.
+                // Wrap inside the 16-bit page so a halt at the start
+                // of a bank stays in the same bank.
+                let pcLow = s.pc & 0xFFFF
+                let prev = (pcLow == 0)
+                    ? (s.pc & 0xFF0000) | 0xFFFF
+                    : s.pc - 1
+                var site = resolveFrame(at: prev, kind: 0xFF, target: 0)
+                site.cpu = s
+                let stack = captureBacktrace()  // shallowest → newest
+                crashBacktrace = stack + [site]
+                crashSite = site
+            } else {
+                crashBacktrace = []
+                crashSite = nil
+            }
         }
     }
 
@@ -505,30 +563,46 @@ final class Emulator: ObservableObject {
         out.reserveCapacity(Int(n))
         for i in 0..<Int(n) {
             let f = buf[i]
-            // Containing-label lookup: callsites land mid-routine far
-            // more often than at a symbol's start address, so a strict
-            // exact match would leave most backtrace frames unsymbolicated.
-            var labelOffset: UInt32 = 0
-            let label = kintsuki_lookup_label_containing(h, f.callsite_pc,
-                                                         &labelOffset).map {
-                String(cString: $0)
+            var frame = resolveFrame(at: f.callsite_pc, kind: f.kind,
+                                     target: f.target_pc)
+            // Resolve the called routine's name so the overlay can
+            // print a "→ JSR/JSL <name>" line between frames. Use exact
+            // lookup here — JSR/JSL targets are routine entry points,
+            // not mid-routine addresses.
+            if let h = handle,
+               let raw = kintsuki_lookup_label(h, f.target_pc) {
+                frame.targetLabel = String(cString: raw)
             }
-            var filePtr: UnsafePointer<CChar>? = nil
-            var lineNum: UInt32 = 0
-            var colNum: UInt16 = 0
-            let hasSrc = kintsuki_lookup_source(h, f.callsite_pc,
-                                                &filePtr, &lineNum, &colNum) != 0
-            let file = (hasSrc && filePtr != nil) ? String(cString: filePtr!) : nil
-            let line: UInt32? = hasSrc ? lineNum : nil
-            out.append(BacktraceFrame(callsite: f.callsite_pc,
-                                      target:   f.target_pc,
-                                      kind:     f.kind,
-                                      label:    label,
-                                      offset:   label != nil ? labelOffset : 0,
-                                      file:     file,
-                                      line:     line))
+            out.append(frame)
         }
         return out
+    }
+
+    /// Resolve a 24-bit PC into a `BacktraceFrame` with `.adbg`-backed
+    /// containing-label, offset, and source location. Used both for
+    /// shadow-stack frames (callsite PC) and the BRK / STP halt site
+    /// (current PC at the moment of halt).
+    private func resolveFrame(at pc: UInt32, kind: UInt8,
+                              target: UInt32) -> BacktraceFrame {
+        guard let h = handle else {
+            return BacktraceFrame(callsite: pc, target: target, kind: kind,
+                                  label: nil, offset: 0, file: nil, line: nil)
+        }
+        var labelOffset: UInt32 = 0
+        let label = kintsuki_lookup_label_containing(h, pc, &labelOffset).map {
+            String(cString: $0)
+        }
+        var filePtr: UnsafePointer<CChar>? = nil
+        var lineNum: UInt32 = 0
+        var colNum: UInt16 = 0
+        let hasSrc = kintsuki_lookup_source(h, pc, &filePtr,
+                                            &lineNum, &colNum) != 0
+        let file = (hasSrc && filePtr != nil) ? String(cString: filePtr!) : nil
+        let line: UInt32? = hasSrc ? lineNum : nil
+        return BacktraceFrame(callsite: pc, target: target, kind: kind,
+                              label: label,
+                              offset: label != nil ? labelOffset : 0,
+                              file: file, line: line)
     }
 
     // ----- Memory snapshot for hex/palette/tile views ---------------------

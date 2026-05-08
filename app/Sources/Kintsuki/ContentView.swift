@@ -124,36 +124,75 @@ private struct CrashOverlay: View {
     }
 
     private var crashHeaderText: String {
-        String(format: "CPU STP @ %02X:%04X",
-               (emulator.cpuState.pc >> 16) & 0xFF,
-               emulator.cpuState.pc & 0xFFFF)
+        // Python-traceback header. Frames are listed shallowest-first
+        // below, deepest-call (the STP site) at the bottom.
+        "Traceback (CPU STP, most recent call last):"
     }
 
     private var backtraceText: String {
-        emulator.crashBacktrace.enumerated().map { idx, frame in
+        var lines: [String] = []
+        for frame in emulator.crashBacktrace {
             let pc = String(format: "%02X:%04X",
                             (frame.callsite >> 16) & 0xFF,
                             frame.callsite & 0xFFFF)
-            // `+offset` suffix only when non-zero — exact-start hits
-            // read cleaner without a "+0x0".
+            // Python-style header line:  `  PC, in <name+offset>`.
             let labelPart: String
             if let name = frame.label {
                 labelPart = frame.offset > 0
-                    ? String(format: " in %@+0x%X", name, frame.offset)
-                    : " in \(name)"
+                    ? String(format: ", in %@+0x%X", name, frame.offset)
+                    : ", in \(name)"
             } else {
-                labelPart = ""
+                labelPart = ", in <unknown>"
             }
-            // Trim verbose absolute paths to just the file's basename so
-            // the overlay stays readable; user can grep/IDE-jump on the
-            // copied report which has the full path embedded too.
             var srcPart = ""
             if let file = frame.file, let line = frame.line {
                 let base = (file as NSString).lastPathComponent
                 srcPart = "  (\(base):\(line))"
             }
-            return String(format: "#%-2d %@%@%@", idx, pc, labelPart, srcPart)
-        }.joined(separator: "\n")
+            lines.append("  \(pc)\(labelPart)\(srcPart)")
+            // Call frames carry a target label — print the dispatched
+            // call as the next indented line so the chain reads as a
+            // sequence of "we were here, then we did this jump".
+            if frame.kind != 0xFF {
+                let mnem = frame.kind == 1 ? "JSL" : "JSR"
+                let target = String(format: "%02X:%04X",
+                                    (frame.target >> 16) & 0xFF,
+                                    frame.target & 0xFFFF)
+                let targetName = frame.targetLabel ?? target
+                lines.append("    → \(mnem) \(targetName)")
+            }
+            // Registers ride with the halt-site frame (the deepest /
+            // last entry).
+            if let cpu = frame.cpu {
+                lines.append(formatRegisters(cpu))
+            }
+        }
+        return lines.joined(separator: "\n")
+    }
+
+    private func formatRegisters(_ cpu: Emulator.CpuState) -> String {
+        // Mesen-style register dump. Flags get the NVMXDIZC mnemonic
+        // (uppercase = set, lowercase = clear) so users can read the
+        // status without unpacking the hex byte. STP/WAI tagged when
+        // set so the halt cause is unambiguous.
+        let p = cpu.p
+        let flagOrder: [(UInt8, Character, Character)] = [
+            (0x80, "N", "n"),
+            (0x40, "V", "v"),
+            (0x20, "M", "m"),
+            (0x10, "X", "x"),
+            (0x08, "D", "d"),
+            (0x04, "I", "i"),
+            (0x02, "Z", "z"),
+            (0x01, "C", "c"),
+        ]
+        let flags = String(flagOrder.map { (p & $0.0) != 0 ? $0.1 : $0.2 })
+        // STP/WAI are noise here — the overlay only renders when the
+        // CPU is STP'd, so they'd always read the same value.
+        let emuFlag = cpu.e ? " E" : ""
+        return String(format:
+            "    A:%04X X:%04X Y:%04X S:%04X D:%04X B:%02X P:%02X[%@]%@",
+            cpu.a, cpu.x, cpu.y, cpu.s, cpu.d, cpu.b, p, flags, emuFlag)
     }
 
     private func copyToPasteboard() {

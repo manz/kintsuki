@@ -1,0 +1,89 @@
+[project]
+site_name = "kintsuki"
+site_description = "SNES emulator core (ares-based) with a Python wrapper, a Swift macOS app, and a debugger-grade C ABI."
+site_author = "manz"
+copyright = """
+Copyright &copy; 2026 kintsuki contributors
+"""
+
+nav = [
+    { "Home" = "index.md" },
+    { "Tutorials" = [
+        { "Run a ROM from Python" = "tutorials/python-quickstart.md" },
+        { "Crash backtraces with .adbg" = "tutorials/crash-backtraces.md" },
+        { "Pixel-diff goldens" = "tutorials/visual-goldens.md" },
+    ] },
+    { "Python API" = "python-api.md" },
+    { "Tracer" = "tracer.md" },
+    { "Shadow callstack" = "shadow-callstack.md" },
+    { "Rewind buffer" = "rewind.md" },
+    { "Save states" = "save-states.md" },
+    { "Visual oracle" = "visual-oracle.md" },
+    { "macOS app (Kintsuki.app)" = "macos-app.md" },
+    { "C ABI reference" = "c-abi.md" },
+    { "Building" = "building.md" },
+]
+
+[project.theme]
+language = "en"
+features = [
+    "content.code.annotate",
+    "content.code.copy",
+    "content.code.select",
+    "content.tabs.link",
+    "content.tooltips",
+    "navigation.footer",
+    "navigation.indexes",
+    "navigation.instant",
+    "navigation.instant.prefetch",
+    "navigation.path",
+    "navigation.sections",
+    "navigation.top",
+    "navigation.tracking",
+    "search.highlight",
+]
+
+[[project.theme.palette]]
+scheme = "default"
+toggle.icon = "lucide/sun"
+toggle.name = "Switch to dark mode"
+
+[[project.theme.palette]]
+scheme = "slate"
+toggle.icon = "lucide/moon"
+toggle.name = "Switch to light mode"
+
+[[project.extra.social]]
+icon = "fontawesome/brands/github"
+link = "https://github.com/manz/kintsuki"
+
+[project.markdown_extensions.abbr]
+[project.markdown_extensions.admonition]
+[project.markdown_extensions.attr_list]
+[project.markdown_extensions.def_list]
+[project.markdown_extensions.footnotes]
+[project.markdown_extensions.md_in_html]
+[project.markdown_extensions.toc]
+permalink = true
+[project.markdown_extensions.pymdownx.betterem]
+[project.markdown_extensions.pymdownx.caret]
+[project.markdown_extensions.pymdownx.details]
+[project.markdown_extensions.pymdownx.highlight]
+anchor_linenums = true
+line_spans = "__span"
+pygments_lang_class = true
+[project.markdown_extensions.pymdownx.inlinehilite]
+[project.markdown_extensions.pymdownx.keys]
+[project.markdown_extensions.pymdownx.magiclink]
+[project.markdown_extensions.pymdownx.mark]
+[project.markdown_extensions.pymdownx.smartsymbols]
+[project.markdown_extensions.pymdownx.superfences]
+custom_fences = [
+  { name = "mermaid", class = "mermaid", format = "pymdownx.superfences.fence_code_format" }
+]
+[project.markdown_extensions.pymdownx.tabbed]
+alternate_style = true
+combine_header_slug = true
+[project.markdown_extensions.pymdownx.tasklist]
+custom_checkbox = true
+[project.markdown_extensions.pymdownx.tilde]
