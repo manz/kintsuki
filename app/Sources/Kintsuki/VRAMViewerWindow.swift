@@ -236,8 +236,8 @@ struct VRAMViewerView: View {
                                 .font(.system(.caption, design: .monospaced))
                                 .foregroundStyle(Color.accentColor)
                                 .underline()
-                            Text(String(format: "→ $21%02X  %d B  ×%d",
-                                        x.dstReg, x.size, x.hits))
+                            Text(String(format: "→ VRAM $%04X.w (%d B) ×%d",
+                                        x.vramAddr, x.size, x.hits))
                                 .font(.system(.caption2, design: .monospaced))
                                 .foregroundStyle(.secondary)
                             Spacer()

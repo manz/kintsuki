@@ -330,7 +330,8 @@ typedef struct kintsuki_dma_event_t {
   uint8_t  direction;    // 0 = A->B (CPU->PPU), 1 = B->A
   uint8_t  mode;         // transferMode (0..7)
   uint8_t  dst_reg;      // PPU register low byte ($21XX)
-  uint8_t  _pad[2];
+  uint16_t vram_addr;    // VMADDR at fire (word address); meaningful
+                         // only when dst_reg == 0x18 / 0x19
   uint32_t hits;
   uint64_t last_frame;
 } kintsuki_dma_event_t;

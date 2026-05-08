@@ -967,12 +967,13 @@ int kintsuki_lookup_source(kintsuki_t* h, uint32_t addr,
 // insert at slot 0 and evict the oldest. Bounded to 64 entries.
 namespace {
 struct DmaLogEntry {
-  uint32_t src_addr;   // 24-bit
+  uint32_t src_addr;     // 24-bit
   uint16_t size;
   uint8_t  channel;
   uint8_t  direction;
   uint8_t  mode;
   uint8_t  dst_reg;
+  uint16_t vram_addr;    // VMADDR at DMA fire (word address)
   uint32_t hits;
   uint64_t last_frame;
 };
@@ -982,13 +983,19 @@ size_t g_dmaLogSize = 0;
 
 void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
                uint32_t src, uint8_t dst, uint16_t size) {
-  // Search for an existing matching entry (src + dst + size).
+  // Capture VMADDR (word) at the moment the DMA fires — gives the
+  // user the actual VRAM destination, not just "we wrote something
+  // through VMDATA". Read from the live performance PPU; the
+  // CGRAM/OAM equivalents could be added later if needed.
+  uint16_t vramAddr = (uint16_t)ares::SuperFamicom::ppuPerformanceImpl.vram.address;
+  // Dedupe key now includes vram_addr so two transfers to different
+  // VRAM regions through the same VMDATA register don't collapse.
   for(size_t i = 0; i < g_dmaLogSize; i++) {
     auto& e = g_dmaLog[i];
-    if(e.src_addr == src && e.dst_reg == dst && e.size == size) {
+    if(e.src_addr == src && e.dst_reg == dst && e.size == size
+       && e.vram_addr == vramAddr) {
       e.hits += 1;
       e.last_frame = (g_handle ? g_handle->program->framesRendered : 0);
-      // Bubble to front so most-recent stays at slot 0.
       if(i > 0) {
         DmaLogEntry tmp = e;
         for(size_t j = i; j > 0; j--) g_dmaLog[j] = g_dmaLog[j - 1];
@@ -997,7 +1004,6 @@ void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
       return;
     }
   }
-  // Fresh entry — evict the oldest (last slot) when full, then shift.
   size_t insertCount = (g_dmaLogSize < kDmaLogCap) ? g_dmaLogSize : kDmaLogCap - 1;
   for(size_t j = insertCount; j > 0; j--) g_dmaLog[j] = g_dmaLog[j - 1];
   g_dmaLog[0] = DmaLogEntry{
@@ -1007,6 +1013,7 @@ void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
     .direction = direction,
     .mode = mode,
     .dst_reg = dst,
+    .vram_addr = vramAddr,
     .hits = 1,
     .last_frame = (g_handle ? g_handle->program->framesRendered : 0),
   };
@@ -1036,6 +1043,7 @@ uint32_t kintsuki_dma_log_snapshot(kintsuki_t* h,
     out[i].direction = e.direction;
     out[i].mode = e.mode;
     out[i].dst_reg = e.dst_reg;
+    out[i].vram_addr = e.vram_addr;
     out[i].hits = e.hits;
     out[i].last_frame = e.last_frame;
   }

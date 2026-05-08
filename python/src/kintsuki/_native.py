@@ -168,7 +168,7 @@ class DmaEvent(Structure):
         ("direction", c_uint8),
         ("mode",      c_uint8),
         ("dst_reg",   c_uint8),
-        ("_pad",      c_uint8 * 2),
+        ("vram_addr", c_uint16),
         ("hits",      c_uint32),
         ("last_frame", c_uint64),
     ]

@@ -375,6 +375,7 @@ class Emu:
                 "direction":  int(e.direction),
                 "mode":       int(e.mode),
                 "dst_reg":    int(e.dst_reg),
+                "vram_addr":  int(e.vram_addr),
                 "hits":       int(e.hits),
                 "last_frame": int(e.last_frame),
             })

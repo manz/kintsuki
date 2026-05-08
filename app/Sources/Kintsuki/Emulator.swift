@@ -122,14 +122,26 @@ final class Emulator {
         let direction: UInt8     // 0 = CPU->PPU
         let mode: UInt8
         let dstReg: UInt8        // PPU $21XX low byte
+        /// VMADDR at fire (word address). Only meaningful when
+        /// `isVRAMWrite` is true.
+        let vramAddr: UInt16
         let hits: UInt32
         let lastFrame: UInt64
         var id: UInt64 {
-            (UInt64(srcAddr) << 24) | (UInt64(size) << 8) | UInt64(dstReg)
+            (UInt64(srcAddr) << 32) | (UInt64(vramAddr) << 16) | UInt64(size)
         }
         var isVRAMWrite: Bool { direction == 0 && (dstReg == 0x18 || dstReg == 0x19) }
         var isCGRAMWrite: Bool { direction == 0 && dstReg == 0x22 }
         var isOAMWrite: Bool { direction == 0 && dstReg == 0x04 }
+        /// VRAM byte range covered by this transfer (when applicable).
+        /// 16-bit VMADDR is a word address; bytes start at 2× and span
+        /// `size` bytes. Wraps inside the 64 KB VRAM space.
+        var vramByteRange: ClosedRange<Int>? {
+            guard isVRAMWrite, size > 0 else { return nil }
+            let lo = (Int(vramAddr) << 1) & 0xFFFF
+            let hi = min(0xFFFF, lo + Int(size) - 1)
+            return lo...hi
+        }
     }
 
     func dmaTransfers() -> [DMATransfer] {
@@ -151,6 +163,7 @@ final class Emulator {
                                    direction: e.direction,
                                    mode: e.mode,
                                    dstReg: e.dst_reg,
+                                   vramAddr: e.vram_addr,
                                    hits: e.hits,
                                    lastFrame: e.last_frame))
         }

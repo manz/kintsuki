@@ -201,40 +201,74 @@ struct TilemapViewerView: View {
     /// transfer length. Helps the user trace "what fed this region".
     @ViewBuilder
     private var dmaSourcesSection: some View {
-        let xfers = emulator.dmaTransfers().filter { $0.isVRAMWrite }
+        // Only surface CPU→VRAM transfers whose destination range
+        // overlaps THIS layer's tilemap or charset window. Stops the
+        // panel from drowning the user in unrelated copies (sprite
+        // tile uploads, OAM-DMA-via-VRAM tricks, etc.).
+        let xfers = emulator.dmaTransfers().filter { x in
+            guard x.isVRAMWrite, let dst = x.vramByteRange else { return false }
+            return ranges(forLayer: cachedSnapshot).contains { r in
+                dst.overlaps(r)
+            }
+        }
         VStack(alignment: .leading, spacing: 6) {
-            Text("VRAM DMA sources").font(.headline)
+            Text("Layer DMA sources").font(.headline)
             if xfers.isEmpty {
-                Text("(no transfers logged yet — pause/play to capture)")
+                Text("(no transfers into this layer yet — pause/play to capture)")
                     .font(.caption).foregroundStyle(.secondary)
             } else {
                 ForEach(xfers.prefix(8)) { x in
-                    Button {
-                        let region: Emulator.MemRegion =
-                            (0x7E0000...0x7FFFFF).contains(x.srcAddr)
-                                ? .wram : .rom
-                        let off = region == .wram
-                            ? Int(x.srcAddr & 0x1FFFF)
-                            : romOffsetFor(busAddr: x.srcAddr)
-                        emulator.requestMemoryView(region: region, offset: off)
-                        openWindow(id: "memory")
-                    } label: {
-                        HStack {
-                            Text(String(format: "%06X", x.srcAddr))
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundStyle(Color.accentColor)
-                                .underline()
-                            Text(String(format: "→ $21%02X  %d B  ×%d",
-                                        x.dstReg, x.size, x.hits))
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                        }
-                    }
-                    .buttonStyle(.plain)
+                    dmaRow(x)
                 }
             }
         }
+    }
+
+    private func dmaRow(_ x: Emulator.DMATransfer) -> some View {
+        let dstByte = (Int(x.vramAddr) << 1) & 0xFFFF
+        return Button {
+            let region: Emulator.MemRegion =
+                (0x7E0000...0x7FFFFF).contains(x.srcAddr) ? .wram : .rom
+            let off = region == .wram
+                ? Int(x.srcAddr & 0x1FFFF)
+                : romOffsetFor(busAddr: x.srcAddr)
+            emulator.requestMemoryView(region: region, offset: off)
+            openWindow(id: "memory")
+        } label: {
+            VStack(alignment: .leading, spacing: 1) {
+                HStack {
+                    Text(String(format: "%06X", x.srcAddr))
+                        .font(.system(.caption, design: .monospaced))
+                        .foregroundStyle(Color.accentColor)
+                        .underline()
+                    Text(String(format: "→ VRAM $%04X.w (%d B) ×%d",
+                                dstByte >> 1, x.size, x.hits))
+                        .font(.system(.caption2, design: .monospaced))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+            }
+        }
+        .buttonStyle(.plain)
+    }
+
+    /// Byte ranges in VRAM "owned" by the current layer — tilemap
+    /// (sub-plane × 0x800) plus a 4 KB char-base hint window. Used
+    /// to filter the DMA log to entries that hit the layer the user
+    /// is looking at.
+    private func ranges(forLayer snap: LayerSnapshot?) -> [ClosedRange<Int>] {
+        guard let snap else { return [] }
+        var out: [ClosedRange<Int>] = []
+        // Tilemap range matches what HexMarker uses in MemoryViewer.
+        let subPlanes = snap.size.subPlanes
+        let mapLo = snap.mapBaseByte & 0xFFFF
+        let mapHi = min(0xFFFF, mapLo + subPlanes * 0x800 - 1)
+        if mapLo < mapHi { out.append(mapLo...mapHi) }
+        // Char base hint: 4 KB.
+        let charLo = snap.charBaseByte & 0xFFFF
+        let charHi = min(0xFFFF, charLo + 0x1000 - 1)
+        if charLo < charHi { out.append(charLo...charHi) }
+        return out
     }
 
     /// Translate a 24-bit bus address into the LoROM region offset
