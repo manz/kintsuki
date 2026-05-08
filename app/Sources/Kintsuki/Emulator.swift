@@ -1266,10 +1266,24 @@ final class Emulator {
     @discardableResult
     func saveAutosave() -> SaveStateEntry? {
         guard let h = handle, let rom = loadedROM, let ctx = modelContext else { return nil }
-        let size = kintsuki_save_state(h, nil, 0)
-        guard size > 0 else { return nil }
-        var blob = Data(count: Int(size))
-        blob.withUnsafeMutableBytes { _ = kintsuki_save_state(h, $0.baseAddress, size) }
+        // Prefer the latest rewind-buffer frame: it was captured at
+        // the end of the previous tick, which is a known-good
+        // boundary. A fresh `kintsuki_save_state` on quit runs
+        // `scheduler.enter(Synchronize)` and may advance the CPU
+        // past the user's last interaction, leaving them mid-frame
+        // when they relaunch. Fall back to live save_state when the
+        // ring is empty (boot, post-reset, recovery mode).
+        let blob: Data
+        if rewindBuffer.count > 0,
+           let materialized = rewindBuffer.materialize(at: rewindBuffer.count - 1) {
+            blob = materialized
+        } else {
+            let size = kintsuki_save_state(h, nil, 0)
+            guard size > 0 else { return nil }
+            var fresh = Data(count: Int(size))
+            fresh.withUnsafeMutableBytes { _ = kintsuki_save_state(h, $0.baseAddress, size) }
+            blob = fresh
+        }
         let thumb = (framebufferData().flatMap {
             SaveStateThumbnail.png(fromBGRA: $0,
                                    width: Int(fbWidth), height: Int(fbHeight))
