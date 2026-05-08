@@ -208,16 +208,28 @@ struct VRAMViewerView: View {
     }
 
     /// Recent CPU→VRAM DMA transfers surfaced from the libkintsuki
-    /// ring. Each row is a link that opens the Memory Viewer focused
-    /// on the source WRAM/ROM offset; lets the user trace which
-    /// buffer fed which VRAM region without leaving this window.
+    /// ring. When a tile is selected the panel narrows to transfers
+    /// that touched THAT tile's bytes; otherwise it shows everything
+    /// recent. Click any row to open the Memory Viewer focused on
+    /// the source WRAM/ROM offset.
     @ViewBuilder
     private var dmaSourcesSection: some View {
-        let xfers = dmaTransfers.filter { $0.isVRAMWrite }
+        let allVRAM = dmaTransfers.filter { $0.isVRAMWrite }
+        let tileRange = selectedTileRange()
+        let xfers: [Emulator.DMATransfer] = {
+            guard let r = tileRange else { return allVRAM }
+            return allVRAM.filter { x in
+                guard let dst = x.vramByteRange else { return false }
+                return dst.overlaps(r)
+            }
+        }()
         VStack(alignment: .leading, spacing: 6) {
-            Text("VRAM DMA sources").font(.headline)
+            Text(tileRange == nil ? "VRAM DMA sources"
+                                  : "DMA into selected tile").font(.headline)
             if xfers.isEmpty {
-                Text("(no transfers logged yet)")
+                Text(tileRange == nil
+                     ? "(no transfers logged yet)"
+                     : "(no DMA touched this tile yet)")
                     .font(.caption).foregroundStyle(.secondary)
             } else {
                 ForEach(xfers.prefix(8)) { x in
@@ -247,6 +259,18 @@ struct VRAMViewerView: View {
                 }
             }
         }
+    }
+
+    /// VRAM byte range covered by the currently selected tile. Nil
+    /// when no tile is selected — the DMA panel falls back to the
+    /// full recent log in that case.
+    private func selectedTileRange() -> ClosedRange<Int>? {
+        guard let t = selectedTile, let snap = snapshot else { return nil }
+        let bytes = snap.bpp.tileBytes
+        let lo = (t * bytes) & 0xFFFF
+        let hi = min(0xFFFF, lo + bytes - 1)
+        guard lo <= hi else { return nil }
+        return lo...hi
     }
 
     /// 24-bit bus addr → LoROM region offset (matches MemoryViewer's
