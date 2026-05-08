@@ -13,7 +13,6 @@ struct MemoryViewerView: View {
     @State private var region: Emulator.MemRegion = .wram
     @State private var addrInput: String = ""
     @State private var selectedOffset: Int? = nil
-    @State private var pendingEdit: Int? = nil
     @State private var jumpTarget: Int? = nil
     @State private var generation: Int = 0
     @State private var cache = MemoryPageCache()
@@ -33,16 +32,13 @@ struct MemoryViewerView: View {
                     addrLabel: { addrLabel(forOffset: $0) },
                     byteAt: { byteAt($0) },
                     onTap: { offset in selectedOffset = offset },
-                    onDoubleTap: { offset in pendingEdit = offset; selectedOffset = offset },
+                    onWrite: { offset, byte in commitWrite(offset: offset, byte: byte) },
+                    onMoveSelection: { offset in selectedOffset = offset },
                     onJumpHandled: { jumpTarget = nil }
                 )
             } else {
                 ContentUnavailableView("No ROM", systemImage: "rectangle.dashed")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-            }
-            if let edit = pendingEdit {
-                Divider()
-                editBar(offset: edit)
             }
         }
         .frame(minWidth: 760, minHeight: 480)
@@ -52,11 +48,10 @@ struct MemoryViewerView: View {
         .onChange(of: emulator.loadedROM) { _, _ in invalidate() }
         .onChange(of: region) { _, _ in
             selectedOffset = nil
-            pendingEdit = nil
             invalidate()
         }
         .onReceive(Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()) { _ in
-            if pendingEdit == nil { invalidate() }
+            invalidate()
         }
     }
 
@@ -88,30 +83,14 @@ struct MemoryViewerView: View {
         .padding(8)
     }
 
-    private func editBar(offset: Int) -> some View {
-        let current = byteAt(offset).map { String(format: "%02X", $0) } ?? "??"
-        return HStack(spacing: 8) {
-            Text(String(format: "Edit %@ (current %@):",
-                        addrLabel(forOffset: offset), current))
-                .font(.system(.caption, design: .monospaced))
-            TextField("hex", text: editBinding(),
-                      onCommit: { commitEdit(at: offset) })
-                .textFieldStyle(.roundedBorder)
-                .frame(width: 60)
-                .font(.system(.caption, design: .monospaced))
-            Button("Cancel") { pendingEdit = nil; tempEditValue = "" }
-                .keyboardShortcut(.cancelAction)
-            Spacer()
-        }
-        .padding(8)
-    }
-
-    @State private var tempEditValue: String = ""
-    private func editBinding() -> Binding<String> {
-        Binding(
-            get: { tempEditValue },
-            set: { tempEditValue = $0 }
-        )
+    /// Write a single byte through the bus, drop the affected page so
+    /// the next paint reflects the new value, and bump the generation
+    /// counter so SwiftUI redraws the canvas with the fresh data.
+    private func commitWrite(offset: Int, byte: UInt8) {
+        emulator.writeRegion(region, offset: UInt32(offset), byte: byte)
+        let pageIdx = offset / Self.bytesPerPage
+        cache.pages.removeValue(forKey: pageIdx)
+        generation &+= 1
     }
 
     // ----- Page cache -----
@@ -146,24 +125,6 @@ struct MemoryViewerView: View {
     // ----- Actions -----
     private func invalidate() {
         cache.pages.removeAll(keepingCapacity: true)
-        generation &+= 1
-    }
-
-    private func commitEdit(at offset: Int) {
-        defer {
-            tempEditValue = ""
-            pendingEdit = nil
-        }
-        var hex = tempEditValue.trimmingCharacters(in: .whitespaces)
-        if hex.hasPrefix("$") { hex.removeFirst() }
-        guard hex.count <= 2,
-              hex.allSatisfy({ "0123456789abcdefABCDEF".contains($0) }),
-              let value = UInt8(hex, radix: 16) else {
-            NSSound.beep(); return
-        }
-        emulator.writeRegion(region, offset: UInt32(offset), byte: value)
-        let pageIdx = offset / Self.bytesPerPage
-        cache.pages.removeValue(forKey: pageIdx)
         generation &+= 1
     }
 
@@ -203,7 +164,8 @@ struct HexCanvasRepresentable: NSViewRepresentable {
     let addrLabel: (Int) -> String
     let byteAt: (Int) -> UInt8?
     let onTap: (Int) -> Void
-    let onDoubleTap: (Int) -> Void
+    let onWrite: (Int, UInt8) -> Void
+    let onMoveSelection: (Int) -> Void
     let onJumpHandled: () -> Void
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -219,7 +181,8 @@ struct HexCanvasRepresentable: NSViewRepresentable {
         canvas.addrLabel = addrLabel
         canvas.byteAt = byteAt
         canvas.onTap = onTap
-        canvas.onDoubleTap = onDoubleTap
+        canvas.onWrite = onWrite
+        canvas.onMoveSelection = onMoveSelection
         canvas.totalBytes = totalBytes
         canvas.selectedOffset = selectedOffset
         scroll.documentView = canvas
@@ -232,7 +195,8 @@ struct HexCanvasRepresentable: NSViewRepresentable {
         canvas.addrLabel = addrLabel
         canvas.byteAt = byteAt
         canvas.onTap = onTap
-        canvas.onDoubleTap = onDoubleTap
+        canvas.onWrite = onWrite
+        canvas.onMoveSelection = onMoveSelection
         if canvas.totalBytes != totalBytes {
             canvas.totalBytes = totalBytes
             applyCanvasFrame(scroll: scroll, canvas: canvas)
@@ -275,7 +239,14 @@ final class HexCanvasView: NSView {
     var addrLabel: ((Int) -> String) = { _ in "" }
     var byteAt: ((Int) -> UInt8?) = { _ in nil }
     var onTap: ((Int) -> Void)? = nil
-    var onDoubleTap: ((Int) -> Void)? = nil
+    var onWrite: ((Int, UInt8) -> Void)? = nil
+    var onMoveSelection: ((Int) -> Void)? = nil
+    /// Partial high nibble accumulator. While set, a hex digit was
+    /// pressed at `selectedOffset`; the next digit commits both
+    /// nibbles as the new byte and advances the selection.
+    private var pendingNibble: UInt8? = nil {
+        didSet { needsDisplay = true }
+    }
 
     let bytesPerRow: Int = 16
     private let font: NSFont = .monospacedSystemFont(ofSize: 12, weight: .regular)
@@ -287,6 +258,13 @@ final class HexCanvasView: NSView {
     private var asciiStart: CGFloat { hexAreaStart + hexAreaWidth + 12 }
 
     override var isFlipped: Bool { true }
+    override var acceptsFirstResponder: Bool { true }
+    override func becomeFirstResponder() -> Bool { needsDisplay = true; return true }
+    override func resignFirstResponder() -> Bool {
+        pendingNibble = nil
+        needsDisplay = true
+        return true
+    }
 
     override var intrinsicContentSize: NSSize {
         let rows = (totalBytes + bytesPerRow - 1) / bytesPerRow
@@ -339,9 +317,26 @@ final class HexCanvasView: NSView {
                 }
 
                 if off < totalBytes, let b = byteAt(off) {
-                    let s = String(format: "%02X", b)
-                    (s as NSString).draw(at: NSPoint(x: cellX + 2, y: y),
-                                         withAttributes: attrs)
+                    // While a high-nibble is buffered at the selected
+                    // offset, render the nibble being typed in
+                    // accent + the existing low nibble dimmed so the
+                    // user sees what they typed before the second key.
+                    if let high = pendingNibble, selectedOffset == off {
+                        let highStr = String(format: "%X", high)
+                        let lowStr  = String(format: "%X", b & 0x0F)
+                        let hiAttrs: [NSAttributedString.Key: Any] = [
+                            .font: font,
+                            .foregroundColor: NSColor.controlAccentColor,
+                        ]
+                        (highStr as NSString).draw(at: NSPoint(x: cellX + 2, y: y),
+                                                    withAttributes: hiAttrs)
+                        (lowStr as NSString).draw(at: NSPoint(x: cellX + 12, y: y),
+                                                   withAttributes: dim)
+                    } else {
+                        let s = String(format: "%02X", b)
+                        (s as NSString).draw(at: NSPoint(x: cellX + 2, y: y),
+                                             withAttributes: attrs)
+                    }
                     asciiBuf.append((b >= 0x20 && b < 0x7F)
                                     ? Character(UnicodeScalar(b))
                                     : ".")
@@ -365,12 +360,63 @@ final class HexCanvasView: NSView {
 
     // ----- Hit testing -----
     override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
         let loc = convert(event.locationInWindow, from: nil)
         guard let off = offsetAt(point: loc) else { return }
-        if event.clickCount >= 2 {
-            onDoubleTap?(off)
-        } else {
-            onTap?(off)
+        pendingNibble = nil
+        onTap?(off)
+    }
+
+    override func keyDown(with event: NSEvent) {
+        guard let off = selectedOffset else { super.keyDown(with: event); return }
+        switch event.keyCode {
+        case 0x7B:                                       // ←
+            advanceSelection(by: -1); pendingNibble = nil; return
+        case 0x7C:                                       // →
+            advanceSelection(by: 1);  pendingNibble = nil; return
+        case 0x7E:                                       // ↑
+            advanceSelection(by: -bytesPerRow); pendingNibble = nil; return
+        case 0x7D:                                       // ↓
+            advanceSelection(by: bytesPerRow);  pendingNibble = nil; return
+        case 0x35:                                       // Esc
+            pendingNibble = nil; return
+        default:
+            break
+        }
+        guard let chars = event.charactersIgnoringModifiers, let ch = chars.first else {
+            super.keyDown(with: event); return
+        }
+        if let nibble = hexNibble(ch) {
+            if let high = pendingNibble {
+                let value = (high << 4) | nibble
+                onWrite?(off, value)
+                pendingNibble = nil
+                advanceSelection(by: 1)
+            } else {
+                pendingNibble = nibble
+            }
+            return
+        }
+        super.keyDown(with: event)
+    }
+
+    private func hexNibble(_ c: Character) -> UInt8? {
+        guard let ascii = c.asciiValue else { return nil }
+        switch ascii {
+        case UInt8(ascii: "0")...UInt8(ascii: "9"): return ascii - UInt8(ascii: "0")
+        case UInt8(ascii: "a")...UInt8(ascii: "f"): return 10 + ascii - UInt8(ascii: "a")
+        case UInt8(ascii: "A")...UInt8(ascii: "F"): return 10 + ascii - UInt8(ascii: "A")
+        default: return nil
+        }
+    }
+
+    private func advanceSelection(by delta: Int) {
+        guard let cur = selectedOffset else { return }
+        let next = max(0, min(totalBytes - 1, cur + delta))
+        if next != cur {
+            selectedOffset = next
+            onMoveSelection?(next)
+            scrollToOffset(next)
         }
     }
 
