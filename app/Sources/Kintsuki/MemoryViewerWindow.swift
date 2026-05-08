@@ -214,6 +214,8 @@ struct HexCanvasRepresentable: NSViewRepresentable {
         scroll.borderType = .noBorder
         scroll.drawsBackground = false
         let canvas = HexCanvasView(frame: .zero)
+        canvas.translatesAutoresizingMaskIntoConstraints = true
+        canvas.autoresizingMask = [.width]
         canvas.addrLabel = addrLabel
         canvas.byteAt = byteAt
         canvas.onTap = onTap
@@ -221,6 +223,7 @@ struct HexCanvasRepresentable: NSViewRepresentable {
         canvas.totalBytes = totalBytes
         canvas.selectedOffset = selectedOffset
         scroll.documentView = canvas
+        applyCanvasFrame(scroll: scroll, canvas: canvas)
         return scroll
     }
 
@@ -232,7 +235,7 @@ struct HexCanvasRepresentable: NSViewRepresentable {
         canvas.onDoubleTap = onDoubleTap
         if canvas.totalBytes != totalBytes {
             canvas.totalBytes = totalBytes
-            canvas.invalidateIntrinsicContentSize()
+            applyCanvasFrame(scroll: scroll, canvas: canvas)
         }
         if canvas.selectedOffset != selectedOffset {
             canvas.selectedOffset = selectedOffset
@@ -242,6 +245,18 @@ struct HexCanvasRepresentable: NSViewRepresentable {
             canvas.scrollToOffset(t)
             onJumpHandled()
         }
+    }
+
+    /// NSScrollView uses the documentView's *frame*, not its
+    /// intrinsicContentSize, to size the scrollable area. Without an
+    /// explicit frame set on every totalBytes change the canvas stayed
+    /// the size of the clip view and scrolling capped at the first
+    /// page — locking the user on row 0 of an 8 MB region.
+    private func applyCanvasFrame(scroll: NSScrollView, canvas: HexCanvasView) {
+        let totalRows = (canvas.totalBytes + canvas.bytesPerRow - 1) / canvas.bytesPerRow
+        let height = canvas.rowHeight * CGFloat(totalRows + 1)
+        let width = max(scroll.contentView.bounds.width, 600)
+        canvas.frame = NSRect(x: 0, y: 0, width: width, height: height)
     }
 }
 
@@ -262,9 +277,9 @@ final class HexCanvasView: NSView {
     var onTap: ((Int) -> Void)? = nil
     var onDoubleTap: ((Int) -> Void)? = nil
 
-    private let bytesPerRow: Int = 16
+    let bytesPerRow: Int = 16
     private let font: NSFont = .monospacedSystemFont(ofSize: 12, weight: .regular)
-    private var rowHeight: CGFloat { ceil(font.boundingRectForFont.height) + 2 }
+    var rowHeight: CGFloat { ceil(font.boundingRectForFont.height) + 2 }
     private var addrWidth: CGFloat = 80
     private var hexCellWidth: CGFloat = 22
     private var hexAreaStart: CGFloat { addrWidth + 8 }
