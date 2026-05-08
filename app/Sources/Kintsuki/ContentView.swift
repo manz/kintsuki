@@ -56,12 +56,7 @@ struct ContentView: View {
                     }
                 }
             }
-            if emulator.inspectorOpen {
-                InspectorView()
-                    .transition(.move(edge: .trailing))
-            }
         }
-        .animation(.easeInOut(duration: 0.2), value: emulator.inspectorOpen)
         .onAppear { emulator.setModelContext(modelContext) }
         .sheet(isPresented: $showStateBrowser) {
             if let url = emulator.loadedROM {

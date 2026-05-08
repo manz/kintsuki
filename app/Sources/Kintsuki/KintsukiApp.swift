@@ -85,10 +85,6 @@ struct KintsukiApp: App {
                     .keyboardShortcut(.leftArrow, modifiers: [.command, .shift])
                     .disabled(emulator.rewindFrames < 2)
                 Divider()
-                Button(emulator.inspectorOpen ? "Hide Inspector" : "Show Inspector") {
-                    emulator.inspectorOpen.toggle()
-                }
-                .keyboardShortcut("i", modifiers: .command)
                 Button("Tilemap Viewer") { openWindow(id: "tilemap") }
                     .keyboardShortcut("t", modifiers: [.command, .shift])
                 Button("VRAM Viewer") { openWindow(id: "vram") }

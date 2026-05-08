@@ -13,7 +13,6 @@ final class Emulator: ObservableObject {
     private let recentsKey = "kintsuki.recentROMs"
     private let recentsLimit = 10
     @Published private(set) var lastFrameID: UInt64 = 0
-    @Published var inspectorOpen: Bool = false
     @Published private(set) var fps: Double = 0
     @Published private(set) var cpuState = CpuState()
     @Published private(set) var breakpoints: [Breakpoint] = []
