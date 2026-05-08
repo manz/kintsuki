@@ -11,6 +11,7 @@ struct TilemapViewerView: View {
     /// CGImage build) to redraw every tick. We pull snapshots on
     /// pause / explicit refresh instead.
     let emulator: Emulator
+    @Environment(\.openWindow) private var openWindow
     @State private var selectedLayer: Int = 1
     @State private var showGrid: Bool = true
     @State private var showScrollOverlay: Bool = true
@@ -111,8 +112,8 @@ struct TilemapViewerView: View {
             Text("Tilemap").font(.headline)
             metaRow("Size", "\(snap.size.widthCells)×\(snap.size.heightCells)")
             metaRow("Size (px)", "\(snap.size.widthCells * 8)×\(snap.size.heightCells * 8)")
-            metaRow("Tilemap", String(format: "$%04X.w", snap.mapBaseByte >> 1))
-            metaRow("Tileset",  String(format: "$%04X.w", snap.charBaseByte >> 1))
+            vramLinkRow(label: "Tilemap", byteOffset: snap.mapBaseByte)
+            vramLinkRow(label: "Tileset", byteOffset: snap.charBaseByte)
             metaRow("Format", "\(snap.bpp.rawValue) bpp")
             metaRow("Mode", "BG\(snap.layer) (mode \(snap.bgMode))")
         }
@@ -134,9 +135,9 @@ struct TilemapViewerView: View {
                 metaRow("Column, Row", "\(sel.col), \(sel.row)")
                 metaRow("X, Y", "\(sel.col * 8), \(sel.row * 8)")
                 metaRow("Size", "8×8")
-                metaRow("Tilemap addr", String(format: "$%04X.w", cellByteOffset >> 1))
+                vramLinkRow(label: "Tilemap addr", byteOffset: cellByteOffset)
                 metaRow("Tile index", String(format: "$%03X", cell.tile))
-                metaRow("Tile addr", String(format: "$%04X.w", tileByteAddr >> 1))
+                vramLinkRow(label: "Tile addr", byteOffset: tileByteAddr)
                 metaRow("Palette idx", "\(cell.palette)")
                 metaRow("Palette addr", String(format: "$%02X", palBase))
                 flagRow("Horizontal mirror", cell.hflip)
@@ -188,6 +189,29 @@ struct TilemapViewerView: View {
             Text(k).font(.caption).foregroundStyle(.secondary)
                 .frame(width: 110, alignment: .leading)
             Text(v).font(.system(.caption, design: .monospaced))
+            Spacer()
+        }
+    }
+
+    /// Address row that doubles as a link to the Memory Viewer's VRAM
+    /// tab, focused on the given byte offset. Click → opens the
+    /// memory window if needed and dispatches a navigation request
+    /// through the shared `Emulator.requestMemoryView` channel.
+    private func vramLinkRow(label: String, byteOffset: Int) -> some View {
+        HStack {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+                .frame(width: 110, alignment: .leading)
+            Button {
+                emulator.requestMemoryView(region: .vram,
+                                           offset: byteOffset & 0xFFFF)
+                openWindow(id: "memory")
+            } label: {
+                Text(String(format: "$%04X.w", byteOffset >> 1))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(Color.accentColor)
+                    .underline()
+            }
+            .buttonStyle(.plain)
             Spacer()
         }
     }

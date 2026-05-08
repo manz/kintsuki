@@ -57,11 +57,30 @@ struct MemoryViewerView: View {
             invalidate()
             rebuildMarkers()
         }
-        .onAppear { rebuildMarkers() }
+        .onAppear {
+            rebuildMarkers()
+            handleNavRequest()
+        }
+        .onChange(of: emulator.memoryNavRequest) { _, _ in handleNavRequest() }
         .onReceive(Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()) { _ in
             invalidate()
             rebuildMarkers()
         }
+    }
+
+    /// Honour an `Emulator.memoryNavRequest`: switch region, jump,
+    /// then clear the request so the same address can be re-targeted
+    /// without manual reset.
+    private func handleNavRequest() {
+        guard let req = emulator.memoryNavRequest else { return }
+        if region != req.region {
+            region = req.region
+        }
+        let target = max(0, min(Int(region.size) - 1, req.offset))
+        selection = .single(target)
+        jumpTarget = target
+        invalidate()
+        emulator.clearMemoryNavRequest()
     }
 
     // ----- Toolbar -----
@@ -127,20 +146,27 @@ struct MemoryViewerView: View {
     }
 
     private var markerLegend: some View {
-        // Lay out as a wrapping flow of color-chip + label pairs;
-        // tells the user which colour means what without crowding
-        // the canvas itself.
+        // Color-chip + label pairs; each chip is a button that jumps
+        // the canvas to the start of its range so the legend doubles
+        // as a navigation index.
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 12) {
                 ForEach(markers) { m in
-                    HStack(spacing: 4) {
-                        Rectangle()
-                            .fill(Color(m.color).opacity(0.4))
-                            .frame(width: 10, height: 10)
-                        Text(m.label)
-                            .font(.system(.caption2, design: .monospaced))
-                            .foregroundStyle(.secondary)
+                    Button {
+                        let lo = m.range.lowerBound
+                        selection = .single(lo)
+                        jumpTarget = lo
+                    } label: {
+                        HStack(spacing: 4) {
+                            Rectangle()
+                                .fill(Color(m.color).opacity(0.4))
+                                .frame(width: 10, height: 10)
+                            Text(m.label)
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                        }
                     }
+                    .buttonStyle(.plain)
                 }
             }
             .padding(.horizontal, 8)

@@ -79,6 +79,38 @@ final class Emulator {
     /// reproducer script.
     private(set) var lastCrashDumpURL: URL? = nil
 
+    /// Cross-window navigation request, e.g. the Tilemap Viewer asking
+    /// the Memory Viewer to focus on a particular VRAM address. Set
+    /// by `requestMemoryView`; read + cleared by MemoryViewerView when
+    /// the window receives the request.
+    struct MemoryNavRequest: Equatable {
+        let region: MemRegion
+        let offset: Int
+        // Bumped on every set so two requests targeting the same
+        // (region, offset) still trigger a re-jump. Without this the
+        // observer's `.onChange` would no-op the second click.
+        let nonce: Int
+    }
+    private(set) var memoryNavRequest: MemoryNavRequest? = nil
+    private var memoryNavNonce: Int = 0
+
+    /// Hand the Memory Viewer a focus request. Pair with
+    /// `openWindow(id: "memory")` from the caller to make sure the
+    /// window exists before the request is delivered.
+    func requestMemoryView(region: MemRegion, offset: Int) {
+        memoryNavNonce &+= 1
+        memoryNavRequest = MemoryNavRequest(region: region,
+                                            offset: offset,
+                                            nonce: memoryNavNonce)
+    }
+
+    /// Called by MemoryViewerView once it has handled a request, so
+    /// the same address can be focused again later without manual
+    /// state hygiene at the call site.
+    func clearMemoryNavRequest() {
+        memoryNavRequest = nil
+    }
+
     struct BacktraceFrame: Identifiable, Equatable, Codable {
         var id = UUID()
         var callsite: UInt32   // 24-bit
