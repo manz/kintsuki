@@ -18,6 +18,14 @@ struct MemoryViewerView: View {
     @State private var generation: Int = 0
     @State private var cache = MemoryPageCache()
     @State private var markers: [HexMarker] = []
+    /// Last navigation request nonce we've already honoured. Prevents
+    /// the 2 Hz refresh tick from re-jumping back to the marker after
+    /// the user has scrolled away (each tick re-evaluates the body
+    /// which would otherwise re-call handleNavRequest with the same
+    /// stale request still pending).
+    @State private var lastHandledNavNonce: Int = 0
+    @State private var bytesPerRow: Int = 16
+    @State private var bytesPerRowInput: String = "16"
 
     private static let bytesPerPage: Int = 256
 
@@ -28,6 +36,7 @@ struct MemoryViewerView: View {
             if emulator.loadedROM != nil {
                 HexCanvasRepresentable(
                     totalBytes: Int(region.size),
+                    bytesPerRow: bytesPerRow,
                     selection: selection,
                     markers: markers,
                     jumpTarget: jumpTarget,
@@ -68,11 +77,15 @@ struct MemoryViewerView: View {
         }
     }
 
-    /// Honour an `Emulator.memoryNavRequest`: switch region, jump,
-    /// then clear the request so the same address can be re-targeted
-    /// without manual reset.
+    /// Honour an `Emulator.memoryNavRequest` exactly once per nonce.
+    /// The nonce gate is what stops the 2 Hz tick from re-jumping the
+    /// canvas back to the marker after the user has scrolled away —
+    /// the request stays around (so a second window can also pick it
+    /// up later), but each handler instance only fires on a new nonce.
     private func handleNavRequest() {
         guard let req = emulator.memoryNavRequest else { return }
+        guard req.nonce != lastHandledNavNonce else { return }
+        lastHandledNavNonce = req.nonce
         if region != req.region {
             region = req.region
         }
@@ -80,7 +93,6 @@ struct MemoryViewerView: View {
         selection = .single(target)
         jumpTarget = target
         invalidate()
-        emulator.clearMemoryNavRequest()
     }
 
     // ----- Toolbar -----
@@ -97,6 +109,14 @@ struct MemoryViewerView: View {
 
             Spacer()
 
+            HStack(spacing: 4) {
+                Text("Row").font(.caption).foregroundStyle(.secondary)
+                TextField("16", text: $bytesPerRowInput)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.caption, design: .monospaced))
+                    .frame(width: 38)
+                    .onSubmit { commitBytesPerRow() }
+            }
             goToMenu
             Button("Refresh") { invalidate() }
                 .keyboardShortcut("r", modifiers: [.command, .option])
@@ -172,6 +192,17 @@ struct MemoryViewerView: View {
             .padding(.horizontal, 8)
             .padding(.vertical, 4)
         }
+    }
+
+    private func commitBytesPerRow() {
+        let s = bytesPerRowInput.trimmingCharacters(in: .whitespaces)
+        guard let v = Int(s), v >= 1, v <= 64 else {
+            bytesPerRowInput = String(bytesPerRow)
+            NSSound.beep()
+            return
+        }
+        bytesPerRow = v
+        bytesPerRowInput = String(v)
     }
 
     /// Write `byte` to every offset in `range`. Drops touched pages
@@ -388,6 +419,7 @@ struct HexMarker: Identifiable, Equatable {
 /// draws only visible rows, and forwards taps via the closure inputs.
 struct HexCanvasRepresentable: NSViewRepresentable {
     let totalBytes: Int
+    let bytesPerRow: Int
     let selection: HexSelection?
     let markers: [HexMarker]
     let jumpTarget: Int?
@@ -412,6 +444,7 @@ struct HexCanvasRepresentable: NSViewRepresentable {
         canvas.byteAt = byteAt
         canvas.onSelectionChanged = onSelectionChanged
         canvas.onWrite = onWrite
+        canvas.bytesPerRow = bytesPerRow
         canvas.totalBytes = totalBytes
         canvas.selection = selection
         canvas.markers = markers
@@ -426,6 +459,10 @@ struct HexCanvasRepresentable: NSViewRepresentable {
         canvas.byteAt = byteAt
         canvas.onSelectionChanged = onSelectionChanged
         canvas.onWrite = onWrite
+        if canvas.bytesPerRow != bytesPerRow {
+            canvas.bytesPerRow = bytesPerRow
+            applyCanvasFrame(scroll: scroll, canvas: canvas)
+        }
         if canvas.totalBytes != totalBytes {
             canvas.totalBytes = totalBytes
             applyCanvasFrame(scroll: scroll, canvas: canvas)
@@ -482,7 +519,11 @@ final class HexCanvasView: NSView {
         didSet { needsDisplay = true }
     }
 
-    let bytesPerRow: Int = 16
+    var bytesPerRow: Int = 16 {
+        didSet {
+            if bytesPerRow != oldValue { invalidateIntrinsicContentSize(); needsDisplay = true }
+        }
+    }
     private let font: NSFont = .monospacedSystemFont(ofSize: 12, weight: .regular)
     var rowHeight: CGFloat { ceil(font.boundingRectForFont.height) + 2 }
     private var addrWidth: CGFloat = 80
