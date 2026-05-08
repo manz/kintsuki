@@ -60,6 +60,10 @@ struct DebuggerView: View {
     /// shadow it into @State and refresh via `.onReceive` so each
     /// row sees the latest BP set when it re-renders.
     @State private var displayedBreakpoints: [Emulator.Breakpoint] = []
+    /// Cached running flag — drives toolbar Pause/Resume label without
+    /// taking a `@ObservedObject` subscription that would re-render the
+    /// pane every emulator @Published mutation.
+    @State private var displayedRunning: Bool = false
     /// Cached label list — refetched when .adbg state changes (currently
     /// after a ROM load resets the table). Cheap snapshot via a single
     /// FFI hop, so re-grab any time `refreshTick` advances.
@@ -82,6 +86,7 @@ struct DebuggerView: View {
         .frame(minWidth: 760, minHeight: 480)
         .onAppear {
             labelCache = emulator.allLabels()
+            displayedRunning = emulator.running
             rebuildLines()
         }
         // We don't subscribe to `emulator` via `@EnvironmentObject`, so
@@ -90,6 +95,7 @@ struct DebuggerView: View {
         // the 60 Hz redraw storm that comes with full ObservableObject
         // subscription.
         .onReceive(emulator.$running) { isRunning in
+            displayedRunning = isRunning
             if !isRunning { rebuildLines() }
         }
         .onReceive(emulator.$loadedROM) { _ in
@@ -111,24 +117,24 @@ struct DebuggerView: View {
     private var toolbar: some View {
         HStack(spacing: 6) {
             Button(action: { emulator.togglePause() }) {
-                Image(systemName: emulator.running ? "pause.fill" : "play.fill")
-                Text(emulator.running ? "Pause" : "Resume")
+                Image(systemName: displayedRunning ? "pause.fill" : "play.fill")
+                Text(displayedRunning ? "Pause" : "Resume")
             }
             Button(action: { emulator.stepInstruction(); rebuildLines() }) {
                 Image(systemName: "arrow.right.to.line.compact")
                 Text("Step")
             }
-            .disabled(emulator.running)
+            .disabled(displayedRunning)
             Button(action: { emulator.stepOver(); rebuildLines() }) {
                 Image(systemName: "arrow.turn.down.right")
                 Text("Over")
             }
-            .disabled(emulator.running)
+            .disabled(displayedRunning)
             Button(action: { emulator.stepOut(); rebuildLines() }) {
                 Image(systemName: "arrow.up.forward")
                 Text("Out")
             }
-            .disabled(emulator.running)
+            .disabled(displayedRunning)
             Button(action: {
                 if let pc = cursorPC {
                     _ = emulator.runToCursor(pc: pc)
@@ -138,7 +144,7 @@ struct DebuggerView: View {
                 Image(systemName: "smallcircle.filled.circle")
                 Text("Run to Cursor")
             }
-            .disabled(emulator.running || cursorPC == nil)
+            .disabled(displayedRunning || cursorPC == nil)
             Spacer()
             navBackButton
             navForwardButton

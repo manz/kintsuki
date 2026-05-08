@@ -75,6 +75,13 @@ struct TilemapViewerView: View {
         }
         .onReceive(emulator.$loadedROM) { _ in rebuildSnapshot() }
         .onChange(of: selectedLayer) { _, _ in rebuildSnapshot() }
+        // 2 Hz auto-refresh while running so the canvas tracks tilemap
+        // edits without forcing the user to pause. Cheap: each rebuild
+        // is one PPU snapshot + one tilemap CGImage build, far below
+        // 60 Hz cost.
+        .onReceive(Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()) { _ in
+            rebuildSnapshot()
+        }
     }
 
     private func rebuildSnapshot() {
@@ -400,7 +407,7 @@ private struct TilemapCanvas: View {
                 path.move(to: CGPoint(x: 0, y: yy))
                 path.addLine(to: CGPoint(x: w, y: yy))
             }
-            ctx.stroke(path, with: .color(.white.opacity(0.08)), lineWidth: 0.5)
+            ctx.stroke(path, with: .color(.white.opacity(0.25)), lineWidth: 1)
         }
         .frame(width: CGFloat(pxW) * scale, height: CGFloat(pxH) * scale)
         .allowsHitTesting(false)

@@ -32,6 +32,10 @@ struct KintsukiApp: App {
             // `DebuggerView.emulator` for the FPS rationale.
             DebuggerView(emulator: emulator)
         }
+
+        Window("VRAM Viewer", id: "vram") {
+            VRAMViewerView(emulator: emulator)
+        }
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Open ROM…") {
@@ -87,6 +91,8 @@ struct KintsukiApp: App {
                 .keyboardShortcut("i", modifiers: .command)
                 Button("Tilemap Viewer") { openWindow(id: "tilemap") }
                     .keyboardShortcut("t", modifiers: [.command, .shift])
+                Button("VRAM Viewer") { openWindow(id: "vram") }
+                    .keyboardShortcut("v", modifiers: [.command, .shift])
                 Button("Debugger") { openWindow(id: "debugger") }
                     .keyboardShortcut("d", modifiers: [.command, .shift])
             }
