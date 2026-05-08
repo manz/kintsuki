@@ -12,10 +12,12 @@ struct MemoryViewerView: View {
     let emulator: Emulator
     @State private var region: Emulator.MemRegion = .wram
     @State private var addrInput: String = ""
-    @State private var selectedOffset: Int? = nil
+    @State private var addrPickerShown: Bool = false
+    @State private var selection: HexSelection? = nil
     @State private var jumpTarget: Int? = nil
     @State private var generation: Int = 0
     @State private var cache = MemoryPageCache()
+    @State private var markers: [HexMarker] = []
 
     private static let bytesPerPage: Int = 256
 
@@ -26,16 +28,20 @@ struct MemoryViewerView: View {
             if emulator.loadedROM != nil {
                 HexCanvasRepresentable(
                     totalBytes: Int(region.size),
-                    selectedOffset: selectedOffset,
+                    selection: selection,
+                    markers: markers,
                     jumpTarget: jumpTarget,
                     generation: generation,
                     addrLabel: { addrLabel(forOffset: $0) },
                     byteAt: { byteAt($0) },
-                    onTap: { offset in selectedOffset = offset },
-                    onWrite: { offset, byte in commitWrite(offset: offset, byte: byte) },
-                    onMoveSelection: { offset in selectedOffset = offset },
+                    onSelectionChanged: { sel in selection = sel },
+                    onWrite: { range, byte in commitWrite(range: range, byte: byte) },
                     onJumpHandled: { jumpTarget = nil }
                 )
+                if !markers.isEmpty {
+                    Divider()
+                    markerLegend
+                }
             } else {
                 ContentUnavailableView("No ROM", systemImage: "rectangle.dashed")
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -47,11 +53,14 @@ struct MemoryViewerView: View {
         }
         .onChange(of: emulator.loadedROM) { _, _ in invalidate() }
         .onChange(of: region) { _, _ in
-            selectedOffset = nil
+            selection = nil
             invalidate()
+            rebuildMarkers()
         }
+        .onAppear { rebuildMarkers() }
         .onReceive(Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()) { _ in
             invalidate()
+            rebuildMarkers()
         }
     }
 
@@ -69,28 +78,195 @@ struct MemoryViewerView: View {
 
             Spacer()
 
-            HStack(spacing: 4) {
-                Text("Go to").font(.caption).foregroundStyle(.secondary)
-                TextField("$XXXXXX", text: $addrInput)
-                    .textFieldStyle(.roundedBorder)
-                    .font(.system(.caption, design: .monospaced))
-                    .frame(width: 110)
-                    .onSubmit { jumpToAddrInput() }
-            }
+            goToMenu
             Button("Refresh") { invalidate() }
                 .keyboardShortcut("r", modifiers: [.command, .option])
         }
         .padding(8)
     }
 
-    /// Write a single byte through the bus, drop the affected page so
-    /// the next paint reflects the new value, and bump the generation
-    /// counter so SwiftUI redraws the canvas with the fresh data.
-    private func commitWrite(offset: Int, byte: UInt8) {
-        emulator.writeRegion(region, offset: UInt32(offset), byte: byte)
-        let pageIdx = offset / Self.bytesPerPage
-        cache.pages.removeValue(forKey: pageIdx)
+    /// "Go to…" menu — semantic targets first (BG tilemaps, char bases,
+    /// OAM, CGRAM derived from PPU regs), then a free-form address
+    /// popover. Replaces the always-visible TextField so the toolbar
+    /// stays clean when the user isn't navigating.
+    private var goToMenu: some View {
+        Menu {
+            ForEach(semanticTargets()) { tgt in
+                Button(tgt.label) {
+                    region = tgt.region
+                    selection = .single(tgt.offset)
+                    jumpTarget = tgt.offset
+                }
+            }
+            Divider()
+            Button("Custom address…") { addrPickerShown.toggle() }
+        } label: {
+            HStack(spacing: 2) {
+                Image(systemName: "scope")
+                Text("Go to")
+            }
+        }
+        .menuStyle(.borderlessButton)
+        .frame(width: 90)
+        .popover(isPresented: $addrPickerShown) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Go to address").font(.headline)
+                TextField("$XXXXXX", text: $addrInput)
+                    .textFieldStyle(.roundedBorder)
+                    .font(.system(.body, design: .monospaced))
+                    .frame(width: 220)
+                    .onSubmit { jumpToAddrInput(); addrPickerShown = false }
+                HStack {
+                    Spacer()
+                    Button("Jump") { jumpToAddrInput(); addrPickerShown = false }
+                        .keyboardShortcut(.defaultAction)
+                }
+            }
+            .padding(10)
+        }
+    }
+
+    private var markerLegend: some View {
+        // Lay out as a wrapping flow of color-chip + label pairs;
+        // tells the user which colour means what without crowding
+        // the canvas itself.
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 12) {
+                ForEach(markers) { m in
+                    HStack(spacing: 4) {
+                        Rectangle()
+                            .fill(Color(m.color).opacity(0.4))
+                            .frame(width: 10, height: 10)
+                        Text(m.label)
+                            .font(.system(.caption2, design: .monospaced))
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+        }
+    }
+
+    /// Write `byte` to every offset in `range`. Drops touched pages
+    /// so the next paint reflects the new values; bumps the generation
+    /// counter so SwiftUI rebuilds the canvas snapshot.
+    private func commitWrite(range: ClosedRange<Int>, byte: UInt8) {
+        for off in range {
+            emulator.writeRegion(region, offset: UInt32(off), byte: byte)
+        }
+        let firstPage = range.lowerBound / Self.bytesPerPage
+        let lastPage  = range.upperBound / Self.bytesPerPage
+        for p in firstPage...lastPage { cache.pages.removeValue(forKey: p) }
         generation &+= 1
+    }
+
+    // ----- Semantic targets (Go to…) + region markers ---------------------
+
+    private struct GoTarget: Identifiable {
+        let id = UUID()
+        let label: String
+        let region: Emulator.MemRegion
+        let offset: Int
+    }
+
+    private func semanticTargets() -> [GoTarget] {
+        var out: [GoTarget] = []
+        guard let ppu = emulator.ppuState() else { return out }
+        // BG tilemap bases — BGxSC bits 7..2 are the word base.
+        for layer in 1...4 {
+            let bgsc: UInt8
+            switch layer {
+            case 1: bgsc = ppu.bg1sc
+            case 2: bgsc = ppu.bg2sc
+            case 3: bgsc = ppu.bg3sc
+            default: bgsc = ppu.bg4sc
+            }
+            let mapBaseByte = (Int(bgsc & 0xFC) << 8) << 1
+            out.append(GoTarget(label: String(format: "BG%d tilemap ($%04X.w)", layer, mapBaseByte >> 1),
+                                region: .vram,
+                                offset: mapBaseByte & 0xFFFF))
+        }
+        // Char bases — BG12NBA / BG34NBA, 4-bit fields × 0x1000 words.
+        let bg1nba = (Int(ppu.bg12nba) & 0x0F) * 0x1000 << 1
+        let bg2nba = ((Int(ppu.bg12nba) >> 4) & 0x0F) * 0x1000 << 1
+        let bg3nba = (Int(ppu.bg34nba) & 0x0F) * 0x1000 << 1
+        let bg4nba = ((Int(ppu.bg34nba) >> 4) & 0x0F) * 0x1000 << 1
+        out.append(GoTarget(label: String(format: "BG1 char ($%04X.w)", bg1nba >> 1),
+                            region: .vram, offset: bg1nba & 0xFFFF))
+        out.append(GoTarget(label: String(format: "BG2 char ($%04X.w)", bg2nba >> 1),
+                            region: .vram, offset: bg2nba & 0xFFFF))
+        out.append(GoTarget(label: String(format: "BG3 char ($%04X.w)", bg3nba >> 1),
+                            region: .vram, offset: bg3nba & 0xFFFF))
+        out.append(GoTarget(label: String(format: "BG4 char ($%04X.w)", bg4nba >> 1),
+                            region: .vram, offset: bg4nba & 0xFFFF))
+        out.append(GoTarget(label: "OAM start", region: .oam, offset: 0))
+        out.append(GoTarget(label: "CGRAM start", region: .cgram, offset: 0))
+        out.append(GoTarget(label: "WRAM $7E:0000", region: .wram, offset: 0))
+        return out
+    }
+
+    /// Region markers — VRAM-only for now (BG tilemap ranges + char
+    /// bases derived from PPU regs). WRAM markers would need a DMA
+    /// transfer log to know which regions hold tile/tilemap data;
+    /// shelved until a DMA spy ring lands.
+    private func rebuildMarkers() {
+        guard region == .vram, let ppu = emulator.ppuState() else {
+            if !markers.isEmpty { markers = [] }
+            return
+        }
+        var built: [HexMarker] = []
+        let layerColors: [NSColor] = [
+            .systemBlue, .systemGreen, .systemOrange, .systemPurple,
+        ]
+        for layer in 1...4 {
+            let bgsc: UInt8
+            switch layer {
+            case 1: bgsc = ppu.bg1sc
+            case 2: bgsc = ppu.bg2sc
+            case 3: bgsc = ppu.bg3sc
+            default: bgsc = ppu.bg4sc
+            }
+            let mapBaseByte = (Int(bgsc & 0xFC) << 8) << 1
+            // Plane size encoded in BGxSC bits 1..0; each sub-plane is
+            // 0x800 bytes (32×32 cells × 2).
+            let subPlanes: Int
+            switch bgsc & 0x03 {
+            case 1, 2: subPlanes = 2
+            case 3:    subPlanes = 4
+            default:   subPlanes = 1
+            }
+            let length = subPlanes * 0x800
+            let lo = mapBaseByte & 0xFFFF
+            let hi = min(0xFFFF, lo + length - 1)
+            if lo < hi {
+                built.append(HexMarker(range: lo...hi,
+                                       color: layerColors[layer - 1],
+                                       label: "BG\(layer) tilemap"))
+            }
+        }
+        let nbas: [(layer: Int, base: Int)] = [
+            (1, (Int(ppu.bg12nba) & 0x0F) * 0x1000 << 1),
+            (2, ((Int(ppu.bg12nba) >> 4) & 0x0F) * 0x1000 << 1),
+            (3, (Int(ppu.bg34nba) & 0x0F) * 0x1000 << 1),
+            (4, ((Int(ppu.bg34nba) >> 4) & 0x0F) * 0x1000 << 1),
+        ]
+        // Char ranges aren't bounded by hardware — give them a 4 KB
+        // window each as a visual hint; overlapping with another
+        // marker is fine, the canvas paints first-listed wins.
+        let charColors: [NSColor] = [
+            .systemTeal, .systemMint, .systemYellow, .systemPink,
+        ]
+        for (i, e) in nbas.enumerated() {
+            let lo = e.base & 0xFFFF
+            let hi = min(0xFFFF, lo + 0x1000 - 1)
+            if lo < hi {
+                built.append(HexMarker(range: lo...hi,
+                                       color: charColors[i],
+                                       label: "BG\(e.layer) char"))
+            }
+        }
+        if built != markers { markers = built }
     }
 
     // ----- Page cache -----
@@ -140,7 +316,7 @@ struct MemoryViewerView: View {
         let regionSize = region.size
         let target = Int(min(v, regionSize > 0 ? regionSize - 1 : 0))
         addrInput = ""
-        selectedOffset = target
+        selection = .single(target)
         jumpTarget = target
     }
 }
@@ -152,20 +328,48 @@ final class MemoryPageCache {
     var pages: [Int: Data] = [:]
 }
 
+/// Two-anchor selection model: `anchor` is set by mouseDown / Esc /
+/// non-shift movement, `cursor` slides on drag / Shift+arrow. The
+/// effective byte range is the closed range bounded by both.
+struct HexSelection: Equatable {
+    var anchor: Int
+    var cursor: Int
+    var range: ClosedRange<Int> {
+        min(anchor, cursor)...max(anchor, cursor)
+    }
+    var isCollapsed: Bool { anchor == cursor }
+    static func single(_ off: Int) -> HexSelection {
+        HexSelection(anchor: off, cursor: off)
+    }
+}
+
+/// Coloured semantic overlay (BG tilemap, charset, OAM, .adbg-labelled
+/// WRAM, etc). HexCanvasView paints a translucent tint over the cells
+/// covered by `range`; the legend lives outside the canvas.
+struct HexMarker: Identifiable, Equatable {
+    let id = UUID()
+    let range: ClosedRange<Int>
+    let color: NSColor
+    let label: String
+    static func == (l: HexMarker, r: HexMarker) -> Bool {
+        l.range == r.range && l.label == r.label
+    }
+}
+
 // MARK: - HexCanvasRepresentable + NSView
 
 /// SwiftUI bridge to `HexCanvasView`. The NSView owns its NSScrollView,
 /// draws only visible rows, and forwards taps via the closure inputs.
 struct HexCanvasRepresentable: NSViewRepresentable {
     let totalBytes: Int
-    let selectedOffset: Int?
+    let selection: HexSelection?
+    let markers: [HexMarker]
     let jumpTarget: Int?
     let generation: Int
     let addrLabel: (Int) -> String
     let byteAt: (Int) -> UInt8?
-    let onTap: (Int) -> Void
-    let onWrite: (Int, UInt8) -> Void
-    let onMoveSelection: (Int) -> Void
+    let onSelectionChanged: (HexSelection) -> Void
+    let onWrite: (ClosedRange<Int>, UInt8) -> Void
     let onJumpHandled: () -> Void
 
     func makeNSView(context: Context) -> NSScrollView {
@@ -180,11 +384,11 @@ struct HexCanvasRepresentable: NSViewRepresentable {
         canvas.autoresizingMask = [.width]
         canvas.addrLabel = addrLabel
         canvas.byteAt = byteAt
-        canvas.onTap = onTap
+        canvas.onSelectionChanged = onSelectionChanged
         canvas.onWrite = onWrite
-        canvas.onMoveSelection = onMoveSelection
         canvas.totalBytes = totalBytes
-        canvas.selectedOffset = selectedOffset
+        canvas.selection = selection
+        canvas.markers = markers
         scroll.documentView = canvas
         applyCanvasFrame(scroll: scroll, canvas: canvas)
         return scroll
@@ -194,15 +398,17 @@ struct HexCanvasRepresentable: NSViewRepresentable {
         guard let canvas = scroll.documentView as? HexCanvasView else { return }
         canvas.addrLabel = addrLabel
         canvas.byteAt = byteAt
-        canvas.onTap = onTap
+        canvas.onSelectionChanged = onSelectionChanged
         canvas.onWrite = onWrite
-        canvas.onMoveSelection = onMoveSelection
         if canvas.totalBytes != totalBytes {
             canvas.totalBytes = totalBytes
             applyCanvasFrame(scroll: scroll, canvas: canvas)
         }
-        if canvas.selectedOffset != selectedOffset {
-            canvas.selectedOffset = selectedOffset
+        if canvas.selection != selection {
+            canvas.selection = selection
+        }
+        if canvas.markers != markers {
+            canvas.markers = markers
         }
         canvas.needsDisplay = true
         if let t = jumpTarget {
@@ -233,17 +439,19 @@ final class HexCanvasView: NSView {
             if totalBytes != oldValue { invalidateIntrinsicContentSize(); needsDisplay = true }
         }
     }
-    var selectedOffset: Int? {
-        didSet { if selectedOffset != oldValue { needsDisplay = true } }
+    var selection: HexSelection? {
+        didSet { if selection != oldValue { needsDisplay = true } }
+    }
+    var markers: [HexMarker] = [] {
+        didSet { needsDisplay = true }
     }
     var addrLabel: ((Int) -> String) = { _ in "" }
     var byteAt: ((Int) -> UInt8?) = { _ in nil }
-    var onTap: ((Int) -> Void)? = nil
-    var onWrite: ((Int, UInt8) -> Void)? = nil
-    var onMoveSelection: ((Int) -> Void)? = nil
+    var onSelectionChanged: ((HexSelection) -> Void)? = nil
+    var onWrite: ((ClosedRange<Int>, UInt8) -> Void)? = nil
     /// Partial high nibble accumulator. While set, a hex digit was
-    /// pressed at `selectedOffset`; the next digit commits both
-    /// nibbles as the new byte and advances the selection.
+    /// pressed at the selection cursor; the next digit commits the
+    /// composed byte across the selection range and advances by 1.
     private var pendingNibble: UInt8? = nil {
         didSet { needsDisplay = true }
     }
@@ -296,6 +504,9 @@ final class HexCanvasView: NSView {
             .foregroundColor: NSColor.secondaryLabelColor,
         ]
 
+        let selRange = selection?.range
+        let cursor = selection?.cursor
+
         for row in firstRow..<lastRow {
             let y = CGFloat(row) * rowH
             let rowOffset = row * bytesPerRow
@@ -308,20 +519,24 @@ final class HexCanvasView: NSView {
                 let off = rowOffset + i
                 let cellX = hexAreaStart + CGFloat(i) * hexCellWidth
 
-                // Selection highlight
-                if let sel = selectedOffset, sel == off {
+                // Marker tint underneath everything else.
+                if let mc = markerColor(at: off) {
                     let rect = NSRect(x: cellX - 1, y: y,
                                       width: hexCellWidth, height: rowH - 1)
-                    NSColor.controlAccentColor.withAlphaComponent(0.35).setFill()
+                    mc.withAlphaComponent(0.18).setFill()
+                    rect.fill()
+                }
+                // Selection highlight: stronger for the cursor cell.
+                if let r = selRange, r.contains(off) {
+                    let rect = NSRect(x: cellX - 1, y: y,
+                                      width: hexCellWidth, height: rowH - 1)
+                    let alpha: CGFloat = (cursor == off) ? 0.5 : 0.3
+                    NSColor.controlAccentColor.withAlphaComponent(alpha).setFill()
                     rect.fill()
                 }
 
                 if off < totalBytes, let b = byteAt(off) {
-                    // While a high-nibble is buffered at the selected
-                    // offset, render the nibble being typed in
-                    // accent + the existing low nibble dimmed so the
-                    // user sees what they typed before the second key.
-                    if let high = pendingNibble, selectedOffset == off {
+                    if let high = pendingNibble, cursor == off {
                         let highStr = String(format: "%X", high)
                         let lowStr  = String(format: "%X", b & 0x0F)
                         let hiAttrs: [NSAttributedString.Key: Any] = [
@@ -350,6 +565,14 @@ final class HexCanvasView: NSView {
         }
     }
 
+    private func markerColor(at offset: Int) -> NSColor? {
+        // First marker wins. Markers are typically non-overlapping
+        // (BG1 tilemap vs BG12 charset) but if they ever intersect the
+        // earlier-listed marker takes the cell.
+        for m in markers where m.range.contains(offset) { return m.color }
+        return nil
+    }
+
     func scrollToOffset(_ offset: Int) {
         let row = offset / bytesPerRow
         let y = CGFloat(row) * rowHeight
@@ -362,24 +585,40 @@ final class HexCanvasView: NSView {
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
         let loc = convert(event.locationInWindow, from: nil)
-        guard let off = offsetAt(point: loc) else { return }
+        guard let off = offsetAt(point: loc, clamping: true) else { return }
         pendingNibble = nil
-        onTap?(off)
+        let extend = event.modifierFlags.contains(.shift)
+        if extend, let cur = selection {
+            updateSelection(HexSelection(anchor: cur.anchor, cursor: off))
+        } else {
+            updateSelection(.single(off))
+        }
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        let loc = convert(event.locationInWindow, from: nil)
+        guard let off = offsetAt(point: loc, clamping: true),
+              let cur = selection else { return }
+        updateSelection(HexSelection(anchor: cur.anchor, cursor: off))
     }
 
     override func keyDown(with event: NSEvent) {
-        guard let off = selectedOffset else { super.keyDown(with: event); return }
+        guard selection != nil else { super.keyDown(with: event); return }
+        let shift = event.modifierFlags.contains(.shift)
         switch event.keyCode {
-        case 0x7B:                                       // ←
-            advanceSelection(by: -1); pendingNibble = nil; return
-        case 0x7C:                                       // →
-            advanceSelection(by: 1);  pendingNibble = nil; return
-        case 0x7E:                                       // ↑
-            advanceSelection(by: -bytesPerRow); pendingNibble = nil; return
-        case 0x7D:                                       // ↓
-            advanceSelection(by: bytesPerRow);  pendingNibble = nil; return
+        case 0x7B: moveCursor(by: -1, extend: shift); pendingNibble = nil; return     // ←
+        case 0x7C: moveCursor(by:  1, extend: shift); pendingNibble = nil; return     // →
+        case 0x7E: moveCursor(by: -bytesPerRow, extend: shift); pendingNibble = nil; return // ↑
+        case 0x7D: moveCursor(by:  bytesPerRow, extend: shift); pendingNibble = nil; return // ↓
+        case 0x33:                                       // Backspace
+            // Convention: zero every byte in the selection range.
+            if let r = selection?.range { onWrite?(r, 0) }
+            pendingNibble = nil
+            return
         case 0x35:                                       // Esc
-            pendingNibble = nil; return
+            pendingNibble = nil
+            if let cur = selection { updateSelection(.single(cur.cursor)) }
+            return
         default:
             break
         }
@@ -387,11 +626,11 @@ final class HexCanvasView: NSView {
             super.keyDown(with: event); return
         }
         if let nibble = hexNibble(ch) {
-            if let high = pendingNibble {
+            if let high = pendingNibble, let r = selection?.range {
                 let value = (high << 4) | nibble
-                onWrite?(off, value)
+                onWrite?(r, value)
                 pendingNibble = nil
-                advanceSelection(by: 1)
+                moveCursor(by: 1, extend: false)
             } else {
                 pendingNibble = nibble
             }
@@ -410,22 +649,34 @@ final class HexCanvasView: NSView {
         }
     }
 
-    private func advanceSelection(by delta: Int) {
-        guard let cur = selectedOffset else { return }
-        let next = max(0, min(totalBytes - 1, cur + delta))
-        if next != cur {
-            selectedOffset = next
-            onMoveSelection?(next)
-            scrollToOffset(next)
-        }
+    private func moveCursor(by delta: Int, extend: Bool) {
+        guard let cur = selection else { return }
+        let next = max(0, min(totalBytes - 1, cur.cursor + delta))
+        let newSel = extend
+            ? HexSelection(anchor: cur.anchor, cursor: next)
+            : HexSelection.single(next)
+        updateSelection(newSel)
+        scrollToOffset(next)
     }
 
-    private func offsetAt(point p: NSPoint) -> Int? {
-        guard p.x >= hexAreaStart, p.x < hexAreaStart + hexAreaWidth else { return nil }
-        let row = Int(p.y / rowHeight)
-        let col = Int((p.x - hexAreaStart) / hexCellWidth)
-        let off = row * bytesPerRow + col
-        if off < 0 || off >= totalBytes { return nil }
+    private func updateSelection(_ sel: HexSelection) {
+        selection = sel
+        onSelectionChanged?(sel)
+    }
+
+    /// Map a local point to a byte offset. When `clamping` is true the
+    /// caller wants the closest valid offset (used by drag) — clicks
+    /// outside the hex area still snap to the nearest column.
+    private func offsetAt(point p: NSPoint, clamping: Bool = false) -> Int? {
+        let inside = p.x >= hexAreaStart && p.x < hexAreaStart + hexAreaWidth
+        if !inside, !clamping { return nil }
+        let col: Int = inside
+            ? Int((p.x - hexAreaStart) / hexCellWidth)
+            : (p.x < hexAreaStart ? 0 : bytesPerRow - 1)
+        let row = max(0, Int(p.y / rowHeight))
+        let off = row * bytesPerRow + max(0, min(bytesPerRow - 1, col))
+        if off < 0 { return 0 }
+        if off >= totalBytes { return totalBytes - 1 }
         return off
     }
 }
