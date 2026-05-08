@@ -111,6 +111,25 @@ final class Emulator {
         memoryNavRequest = nil
     }
 
+    /// Same pattern as `MemoryNavRequest` but routed at the VRAM
+    /// Viewer: select a tile by VRAM byte offset + bpp. Used by the
+    /// Tilemap Viewer's "Tile addr" row to drill into the actual
+    /// pixel data the cell points at.
+    struct VRAMTileRequest: Equatable {
+        let byteOffset: Int
+        let bppRaw: Int            // 2, 4, or 8
+        let nonce: Int
+    }
+    private(set) var vramTileRequest: VRAMTileRequest? = nil
+    private var vramTileNonce: Int = 0
+
+    func requestVRAMTile(byteOffset: Int, bpp: Int) {
+        vramTileNonce &+= 1
+        vramTileRequest = VRAMTileRequest(byteOffset: byteOffset & 0xFFFF,
+                                          bppRaw: bpp,
+                                          nonce: vramTileNonce)
+    }
+
     /// Decoded DMA transfer event surfaced from the libkintsuki ring.
     /// Most-recent first. Deduplicated on the C side by (src+dst+size)
     /// so a per-frame buffer push collapses to one entry whose

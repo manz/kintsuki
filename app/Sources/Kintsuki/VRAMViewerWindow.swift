@@ -18,6 +18,7 @@ struct VRAMViewerView: View {
     /// rebuilds the snapshot so the sidebar shows current sources
     /// without subscribing to every emulator @Published change.
     @State private var dmaTransfers: [Emulator.DMATransfer] = []
+    @State private var lastHandledTileNonce: Int = 0
 
     var body: some View {
         HSplitView {
@@ -44,7 +45,11 @@ struct VRAMViewerView: View {
                 .frame(minWidth: 240, idealWidth: 280, maxWidth: 360)
         }
         .frame(minWidth: 800, minHeight: 480)
-        .onAppear { rebuildSnapshot() }
+        .onAppear {
+            rebuildSnapshot()
+            handleTileRequest()
+        }
+        .onChange(of: emulator.vramTileRequest) { _, _ in handleTileRequest() }
         .onChange(of: emulator.running) { _, isRunning in
             if !isRunning { rebuildSnapshot() }
         }
@@ -259,6 +264,26 @@ struct VRAMViewerView: View {
                 }
             }
         }
+    }
+
+    /// Honour `Emulator.vramTileRequest`: switch bpp to match, snap
+    /// the selection to the requested tile (computed from byte
+    /// offset / tileBytes). Gated on the request's nonce so a tick
+    /// re-eval doesn't keep re-selecting.
+    private func handleTileRequest() {
+        guard let req = emulator.vramTileRequest else { return }
+        guard req.nonce != lastHandledTileNonce else { return }
+        lastHandledTileNonce = req.nonce
+        let newBpp: TileBpp
+        switch req.bppRaw {
+        case 2: newBpp = .bpp2
+        case 8: newBpp = .bpp8
+        default: newBpp = .bpp4
+        }
+        if bpp != newBpp { bpp = newBpp }
+        let tile = req.byteOffset / newBpp.tileBytes
+        selectedTile = tile
+        rebuildSnapshot()
     }
 
     /// VRAM byte range covered by the currently selected tile. Nil

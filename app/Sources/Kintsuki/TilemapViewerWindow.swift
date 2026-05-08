@@ -139,7 +139,9 @@ struct TilemapViewerView: View {
                 metaRow("Size", "8×8")
                 vramLinkRow(label: "Tilemap addr", byteOffset: cellByteOffset)
                 metaRow("Tile index", String(format: "$%03X", cell.tile))
-                vramLinkRow(label: "Tile addr", byteOffset: tileByteAddr)
+                vramTileLinkRow(label: "Tile addr",
+                                byteOffset: tileByteAddr,
+                                bpp: snap.bpp.rawValue)
                 metaRow("Palette idx", "\(cell.palette)")
                 metaRow("Palette addr", String(format: "$%02X", palBase))
                 flagRow("Horizontal mirror", cell.hflip)
@@ -278,6 +280,29 @@ struct TilemapViewerView: View {
         let lo = Int(busAddr & 0xFFFF)
         if lo < 0x8000 { return 0 }                  // not in ROM mapping
         return bank * 0x8000 + (lo - 0x8000)
+    }
+
+    /// Like `vramLinkRow` but routes the click at the VRAM Viewer
+    /// instead of the Memory Viewer: opens the window and selects
+    /// the tile at the given byte offset (tile_index = byte / bpp.tileBytes).
+    /// Used by the per-cell "Tile addr" link so the user lands on the
+    /// actual pixel data for the selected tilemap cell.
+    private func vramTileLinkRow(label: String, byteOffset: Int, bpp: Int) -> some View {
+        HStack {
+            Text(label).font(.caption).foregroundStyle(.secondary)
+                .frame(width: 110, alignment: .leading)
+            Button {
+                emulator.requestVRAMTile(byteOffset: byteOffset, bpp: bpp)
+                openWindow(id: "vram")
+            } label: {
+                Text(String(format: "$%04X.w", byteOffset >> 1))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(Color.accentColor)
+                    .underline()
+            }
+            .buttonStyle(.plain)
+            Spacer()
+        }
     }
 
     /// Address row that doubles as a link to the Memory Viewer's VRAM
