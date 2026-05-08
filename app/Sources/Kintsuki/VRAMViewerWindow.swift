@@ -9,10 +9,15 @@ import AppKit
 /// `@EnvironmentObject`) so opening the window doesn't tax the run loop.
 struct VRAMViewerView: View {
     let emulator: Emulator
+    @Environment(\.openWindow) private var openWindow
     @State private var bpp: TileBpp = .bpp4
     @State private var paletteIndex: Int = 0
     @State private var selectedTile: Int? = nil
     @State private var snapshot: VRAMSnapshot? = nil
+    /// Cached DMA transfers — re-pulled on the same 2 Hz tick that
+    /// rebuilds the snapshot so the sidebar shows current sources
+    /// without subscribing to every emulator @Published change.
+    @State private var dmaTransfers: [Emulator.DMATransfer] = []
 
     var body: some View {
         HSplitView {
@@ -99,6 +104,8 @@ struct VRAMViewerView: View {
                     selectedTileSection(snap)
                     Divider()
                     paletteSection(snap)
+                    Divider()
+                    dmaSourcesSection
                 } else {
                     Text("No data").foregroundStyle(.secondary)
                 }
@@ -200,8 +207,62 @@ struct VRAMViewerView: View {
         }
     }
 
+    /// Recent CPU→VRAM DMA transfers surfaced from the libkintsuki
+    /// ring. Each row is a link that opens the Memory Viewer focused
+    /// on the source WRAM/ROM offset; lets the user trace which
+    /// buffer fed which VRAM region without leaving this window.
+    @ViewBuilder
+    private var dmaSourcesSection: some View {
+        let xfers = dmaTransfers.filter { $0.isVRAMWrite }
+        VStack(alignment: .leading, spacing: 6) {
+            Text("VRAM DMA sources").font(.headline)
+            if xfers.isEmpty {
+                Text("(no transfers logged yet)")
+                    .font(.caption).foregroundStyle(.secondary)
+            } else {
+                ForEach(xfers.prefix(8)) { x in
+                    Button {
+                        let region: Emulator.MemRegion =
+                            (0x7E0000...0x7FFFFF).contains(x.srcAddr)
+                                ? .wram : .rom
+                        let off = region == .wram
+                            ? Int(x.srcAddr & 0x1FFFF)
+                            : romOffsetFor(busAddr: x.srcAddr)
+                        emulator.requestMemoryView(region: region, offset: off)
+                        openWindow(id: "memory")
+                    } label: {
+                        HStack {
+                            Text(String(format: "%06X", x.srcAddr))
+                                .font(.system(.caption, design: .monospaced))
+                                .foregroundStyle(Color.accentColor)
+                                .underline()
+                            Text(String(format: "→ $21%02X  %d B  ×%d",
+                                        x.dstReg, x.size, x.hits))
+                                .font(.system(.caption2, design: .monospaced))
+                                .foregroundStyle(.secondary)
+                            Spacer()
+                        }
+                    }
+                    .buttonStyle(.plain)
+                }
+            }
+        }
+    }
+
+    /// 24-bit bus addr → LoROM region offset (matches MemoryViewer's
+    /// `.rom` mapping: bank * 0x8000 + (addr & 0x7FFF)).
+    private func romOffsetFor(busAddr: UInt32) -> Int {
+        let bank = Int(busAddr >> 16) & 0x7F
+        let lo = Int(busAddr & 0xFFFF)
+        if lo < 0x8000 { return 0 }
+        return bank * 0x8000 + (lo - 0x8000)
+    }
+
     // ----- Snapshot derivation -----
     private func rebuildSnapshot() {
+        // Pull DMA log alongside the VRAM/CGRAM snapshot — same cadence,
+        // single touch of @State per refresh tick.
+        dmaTransfers = emulator.dmaTransfers()
         guard emulator.loadedROM != nil else {
             snapshot = nil
             return
