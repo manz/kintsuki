@@ -192,6 +192,19 @@ inline auto CPU::Channel::hdmaTransfer() -> void {
   dmaEnable = false;  //HDMA will stop active DMA mid-transfer
   if(!hdmaDoTransfer) return;
 
+  // kintsuki: per-line HDMA fire — host rings the (channel,
+  // scanline, dest reg) so the UI can paint a raster strip per
+  // channel.
+  {
+    typedef void (*KintsukiHdmaHook)(uint8_t, uint16_t, uint8_t);
+    extern KintsukiHdmaHook kintsukiHdmaHook;
+    if(kintsukiHdmaHook) {
+      kintsukiHdmaHook((uint8_t)id,
+                       (uint16_t)cpu.vcounter(),
+                       (uint8_t)targetAddress);
+    }
+  }
+
   static constexpr u32 lengths[8] = {1, 2, 2, 4, 4, 4, 2, 4};
   for(n2 index : range(lengths[transferMode])) {
     n24 address = !indirect ? sourceBank << 16 | hdmaAddress++ : indirectBank << 16 | indirectAddress++;

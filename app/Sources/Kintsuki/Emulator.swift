@@ -163,6 +163,22 @@ final class Emulator {
         }
     }
 
+    /// Per-scanline HDMA channel mask for the most recently completed
+    /// frame. Index = scanline; value = bitmask of channels that
+    /// fired on that line (bit 0 = channel 0). Returned array is
+    /// 320 entries long (covers NTSC 262 + PAL 312 with headroom).
+    func hdmaScanlineMask() -> [UInt8] {
+        guard let h = handle else { return Array(repeating: 0, count: 320) }
+        var buf = [UInt8](repeating: 0, count: 320)
+        let n = buf.withUnsafeMutableBufferPointer { ptr -> UInt32 in
+            kintsuki_hdma_scanline_mask(h, ptr.baseAddress, UInt32(ptr.count))
+        }
+        if n < 320 {
+            for i in Int(n)..<320 { buf[i] = 0 }
+        }
+        return buf
+    }
+
     func dmaTransfers() -> [DMATransfer] {
         guard let h = handle else { return [] }
         let cap = Int(kintsuki_dma_log_count(h))

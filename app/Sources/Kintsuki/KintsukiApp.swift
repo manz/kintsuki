@@ -58,6 +58,10 @@ struct KintsukiApp: App {
         Window("Memory Viewer", id: "memory") {
             MemoryViewerView(emulator: emulator)
         }
+
+        Window("HDMA Inspector", id: "hdma") {
+            HDMAInspectorView(emulator: emulator)
+        }
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Open ROM…") {
@@ -113,6 +117,8 @@ struct KintsukiApp: App {
                     .keyboardShortcut("v", modifiers: [.command, .shift])
                 Button("Memory Viewer") { toggleToolWindow("memory") }
                     .keyboardShortcut("m", modifiers: [.command, .shift])
+                Button("HDMA Inspector") { toggleToolWindow("hdma") }
+                    .keyboardShortcut("h", modifiers: [.command, .shift])
                 Button("Debugger") { toggleToolWindow("debugger") }
                     .keyboardShortcut("d", modifiers: [.command, .shift])
             }

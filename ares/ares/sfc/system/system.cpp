@@ -93,6 +93,16 @@ typedef void (*KintsukiDmaHook)(uint8_t channel,
 __attribute__((visibility("default")))
 KintsukiDmaHook kintsukiDmaHook = nullptr;
 
+// HDMA per-line hook. Fires inside Channel::hdmaTransfer once a
+// channel actually performs its scanline transfer; (channel,
+// vcounter, dst) lets the host build a per-channel scanline strip
+// for raster-effect debugging.
+typedef void (*KintsukiHdmaHook)(uint8_t channel,
+                                 uint16_t scanline,
+                                 uint8_t dst_reg);
+__attribute__((visibility("default")))
+KintsukiHdmaHook kintsukiHdmaHook = nullptr;
+
 auto System::load(Node::System& root, string name) -> bool {
   if(node) unload();
 

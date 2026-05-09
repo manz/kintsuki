@@ -342,6 +342,12 @@ uint32_t kintsuki_dma_log_snapshot(kintsuki_t*,
                                    uint32_t cap);
 void     kintsuki_dma_log_clear(kintsuki_t*);
 
+// Per-scanline HDMA channel mask for the most recently completed
+// frame (double-buffered). `out[i]` = bitmask of channels that fired
+// on scanline `i` (bit 0 = channel 0). Returns the number of bytes
+// written (min of `cap` and the internal scanline buffer size, 320).
+uint32_t kintsuki_hdma_scanline_mask(kintsuki_t*, uint8_t* out, uint32_t cap);
+
 #ifdef __cplusplus
 }
 #endif

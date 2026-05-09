@@ -25,6 +25,8 @@ namespace ares::SuperFamicom {
   typedef void (*KintsukiDmaHook)(uint8_t, uint8_t, uint8_t,
                                   uint32_t, uint8_t, uint16_t);
   extern KintsukiDmaHook kintsukiDmaHook;
+  typedef void (*KintsukiHdmaHook)(uint8_t, uint16_t, uint8_t);
+  extern KintsukiHdmaHook kintsukiHdmaHook;
 }
 
 // ---- Shadow callstack + .adbg label table -------------------------------
@@ -1023,6 +1025,40 @@ void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
 struct DmaHookInstaller {
   DmaHookInstaller() { ares::SuperFamicom::kintsukiDmaHook = &dmaHookFn; }
 } g_dmaHookInstaller;
+
+// HDMA per-line trace. Each scanline gets a bitmask of channels that
+// fired on it. Double-buffered: writes go into `current`, snapshot
+// reads from `latched` (last fully-captured frame). Switch-over fires
+// when the host's frame counter advances — a new frame's first hdma
+// fire triggers the swap.
+constexpr size_t kHdmaScanlines = 320;   // generous: NTSC 262, PAL 312
+uint8_t g_hdmaCurrent[kHdmaScanlines] = {};
+uint8_t g_hdmaLatched[kHdmaScanlines] = {};
+uint64_t g_hdmaCurrentFrame = 0;
+
+void hdmaHookFn(uint8_t channel, uint16_t scanline, uint8_t /*dst*/) {
+  uint64_t frame = g_handle ? g_handle->program->framesRendered : 0;
+  if(frame != g_hdmaCurrentFrame) {
+    // Frame just rolled over — latch what we accumulated and clear.
+    std::memcpy(g_hdmaLatched, g_hdmaCurrent, sizeof(g_hdmaCurrent));
+    std::memset(g_hdmaCurrent, 0, sizeof(g_hdmaCurrent));
+    g_hdmaCurrentFrame = frame;
+  }
+  if(scanline < kHdmaScanlines && channel < 8) {
+    g_hdmaCurrent[scanline] |= (uint8_t)(1u << channel);
+  }
+}
+
+struct HdmaHookInstaller {
+  HdmaHookInstaller() { ares::SuperFamicom::kintsukiHdmaHook = &hdmaHookFn; }
+} g_hdmaHookInstaller;
+}
+
+uint32_t kintsuki_hdma_scanline_mask(kintsuki_t* h, uint8_t* out, uint32_t cap) {
+  if(!h || !out || cap == 0) return 0;
+  uint32_t n = (uint32_t)((cap < kHdmaScanlines) ? cap : kHdmaScanlines);
+  std::memcpy(out, g_hdmaLatched, n);
+  return n;
 }
 
 uint32_t kintsuki_dma_log_count(kintsuki_t* h) {
