@@ -1,5 +1,7 @@
 # Build output
 build/
+build-debug/
+build-release/
 DerivedData/
 dist/
 *.o
