@@ -1300,8 +1300,23 @@ final class Emulator {
     /// useful when the patched ROM on disk has been rebuilt.
     func reloadROMFromDisk() {
         guard let url = loadedROM else { return }
+        // Tear down every async driver that touches ares state before
+        // we yank the ROM out from under it. Without this, a
+        // rewindTimer / pending tick fires kintsuki_run_frames mid
+        // kintsuki_load_rom and the app locks (or crashes) — Cmd+Shift+R
+        // landing on a rewind-held emulator was the reproducible case.
+        rewindHolding = false
+        rewindHoldResumeWork?.cancel()
+        rewindHoldResumeWork = nil
+        stopRewindTimer()
         stopRunLoop()
-        loadROM(url)
+        running = false
+        pendingBreakpointHaltId = nil
+        // Defer the actual load so any in-flight tick (Task hopped to
+        // main but not yet started) finishes before ares is rebooted.
+        DispatchQueue.main.async { [weak self] in
+            self?.loadROM(url)
+        }
     }
 
     /// Reserved name for the per-ROM autosave slot. Hidden from the
