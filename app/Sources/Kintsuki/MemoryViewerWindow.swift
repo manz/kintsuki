@@ -27,6 +27,7 @@ struct MemoryViewerView: View {
     @State private var bytesPerRow: Int = 16
     @State private var bytesPerRowInput: String = "16"
     @State private var jumpNonce: Int = 0
+    @State private var compact: Bool = false
 
     private static let bytesPerPage: Int = 256
 
@@ -38,6 +39,7 @@ struct MemoryViewerView: View {
                 HexCanvasRepresentable(
                     totalBytes: Int(region.size),
                     bytesPerRow: bytesPerRow,
+                    compact: compact,
                     selection: selection,
                     markers: markers,
                     jumpTarget: jumpTarget,
@@ -118,6 +120,9 @@ struct MemoryViewerView: View {
                     .frame(width: 38)
                     .onSubmit { commitBytesPerRow() }
             }
+            Toggle("Compact", isOn: $compact)
+                .toggleStyle(.checkbox)
+                .help("Tighter cell spacing — fits more bytes per window width")
             goToMenu
             Button("Refresh") { invalidate() }
                 .keyboardShortcut("r", modifiers: [.command, .option])
@@ -421,6 +426,7 @@ struct HexMarker: Identifiable, Equatable {
 struct HexCanvasRepresentable: NSViewRepresentable {
     let totalBytes: Int
     let bytesPerRow: Int
+    let compact: Bool
     let selection: HexSelection?
     let markers: [HexMarker]
     let jumpTarget: Int?
@@ -456,6 +462,7 @@ struct HexCanvasRepresentable: NSViewRepresentable {
         canvas.onSelectionChanged = onSelectionChanged
         canvas.onWrite = onWrite
         canvas.bytesPerRow = bytesPerRow
+        canvas.compact = compact
         canvas.totalBytes = totalBytes
         canvas.selection = selection
         canvas.markers = markers
@@ -472,6 +479,10 @@ struct HexCanvasRepresentable: NSViewRepresentable {
         canvas.onWrite = onWrite
         if canvas.bytesPerRow != bytesPerRow {
             canvas.bytesPerRow = bytesPerRow
+            applyCanvasFrame(scroll: scroll, canvas: canvas)
+        }
+        if canvas.compact != compact {
+            canvas.compact = compact
             applyCanvasFrame(scroll: scroll, canvas: canvas)
         }
         if canvas.totalBytes != totalBytes {
@@ -541,10 +552,18 @@ final class HexCanvasView: NSView {
             if bytesPerRow != oldValue { invalidateIntrinsicContentSize(); needsDisplay = true }
         }
     }
+    /// Compact mode shrinks the per-byte cell (22 → 16 px) so a 16-wide
+    /// row fits in ~256 px instead of ~352. Useful at narrow window
+    /// widths or when the user wants a denser hex view.
+    var compact: Bool = false {
+        didSet {
+            if compact != oldValue { invalidateIntrinsicContentSize(); needsDisplay = true }
+        }
+    }
     private let font: NSFont = .monospacedSystemFont(ofSize: 12, weight: .regular)
     var rowHeight: CGFloat { ceil(font.boundingRectForFont.height) + 2 }
     private var addrWidth: CGFloat = 80
-    private var hexCellWidth: CGFloat = 22
+    private var hexCellWidth: CGFloat { compact ? 16 : 22 }
     private var hexAreaStart: CGFloat { addrWidth + 8 }
     private var hexAreaWidth: CGFloat { hexCellWidth * CGFloat(bytesPerRow) }
     private var asciiStart: CGFloat { hexAreaStart + hexAreaWidth + 12 }
