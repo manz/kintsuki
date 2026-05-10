@@ -108,6 +108,23 @@ inline auto CPU::Channel::transfer(n24 addressA, n2 index) -> void {
 inline auto CPU::Channel::dmaRun() -> void {
   if(!dmaEnable) return;
 
+  // kintsuki: fire dma hook once per channel run BEFORE the transfer
+  // loop. Host (libkintsuki) rings the (id, direction, mode, src,
+  // dst, size) tuple so the Memory Viewer can mark which WRAM/ROM
+  // ranges fed each VRAM region.
+  {
+    typedef void (*KintsukiDmaHook)(uint8_t, uint8_t, uint8_t,
+                                    uint32_t, uint8_t, uint16_t);
+    extern KintsukiDmaHook kintsukiDmaHook;
+    if(kintsukiDmaHook) {
+      kintsukiDmaHook((uint8_t)id, (uint8_t)direction,
+                      (uint8_t)transferMode,
+                      ((uint32_t)sourceBank << 16) | (uint32_t)sourceAddress,
+                      (uint8_t)targetAddress,
+                      (uint16_t)transferSize);
+    }
+  }
+
   step(8);
   edge();
 
@@ -174,6 +191,19 @@ inline auto CPU::Channel::hdmaTransfer() -> void {
   if(!hdmaActive()) return;
   dmaEnable = false;  //HDMA will stop active DMA mid-transfer
   if(!hdmaDoTransfer) return;
+
+  // kintsuki: per-line HDMA fire — host rings the (channel,
+  // scanline, dest reg) so the UI can paint a raster strip per
+  // channel.
+  {
+    typedef void (*KintsukiHdmaHook)(uint8_t, uint16_t, uint8_t);
+    extern KintsukiHdmaHook kintsukiHdmaHook;
+    if(kintsukiHdmaHook) {
+      kintsukiHdmaHook((uint8_t)id,
+                       (uint16_t)cpu.vcounter(),
+                       (uint8_t)targetAddress);
+    }
+  }
 
   static constexpr u32 lengths[8] = {1, 2, 2, 4, 4, 4, 2, 4};
   for(n2 index : range(lengths[transferMode])) {

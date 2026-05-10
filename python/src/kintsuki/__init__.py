@@ -353,6 +353,37 @@ class Emu:
     def callstack_clear(self) -> None:
         _native.lib.kintsuki_callstack_clear(self._handle)
 
+    # ----------------------------------------------------------------- DMA log
+    def dma_transfers(self, max_entries: int = 64) -> list[dict]:
+        """Snapshot the DMA transfer ring (most-recent first). Each
+        entry is dict-shaped: ``src_addr`` (24-bit), ``size``,
+        ``channel``, ``direction`` (0=CPU→PPU, 1=PPU→CPU), ``mode``
+        (0..7), ``dst_reg`` (PPU $21XX low byte), ``hits``,
+        ``last_frame``. Deduplication on (src+dst+size) happens on
+        the C side, so a per-frame buffer push collapses to one
+        entry whose ``hits`` count grows."""
+        cap = max_entries
+        buf = (_native.DmaEvent * cap)()
+        n = _native.lib.kintsuki_dma_log_snapshot(self._handle, buf, cap)
+        out: list[dict] = []
+        for i in range(n):
+            e = buf[i]
+            out.append({
+                "src_addr":   int(e.src_addr),
+                "size":       int(e.size),
+                "channel":    int(e.channel),
+                "direction":  int(e.direction),
+                "mode":       int(e.mode),
+                "dst_reg":    int(e.dst_reg),
+                "vram_addr":  int(e.vram_addr),
+                "hits":       int(e.hits),
+                "last_frame": int(e.last_frame),
+            })
+        return out
+
+    def dma_log_clear(self) -> None:
+        _native.lib.kintsuki_dma_log_clear(self._handle)
+
     # -------------------------------------------------------------- Run/step
     def run_frames(self, n: int) -> None:
         _native.lib.kintsuki_run_frames(self._handle, n)

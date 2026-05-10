@@ -95,14 +95,31 @@ targets:
           fi
           export PATH="$(dirname "$CMAKE"):$PATH"
           REPO="$SRCROOT/.."
-          if [ ! -d "$REPO/build" ]; then
-            "$CMAKE" -S "$REPO" -B "$REPO/build" -G Ninja \
+          # Per-config out-of-tree build dir so Debug + Release dylibs
+          # don't stomp on each other when the user flips schemes.
+          # CONFIGURATION is "Debug" or "Release" set by Xcode.
+          CFG_LOWER=$(echo "$CONFIGURATION" | tr '[:upper:]' '[:lower:]')
+          BUILD_DIR="$REPO/build-$CFG_LOWER"
+          # Map Xcode CONFIGURATION → cmake build type. We deliberately
+          # use RelWithDebInfo for Debug: the dylib needs LTO/-O so the
+          # nall OBJECT library's main.cpp.o gets dead-stripped (it
+          # references nall::main(Arguments) which only executables
+          # provide, breaking the link in pure -O0/-DDEBUG builds).
+          # Debug info stays in either case so Instruments / lldb
+          # still resolve symbols.
+          case "$CONFIGURATION" in
+            Release) CMAKE_TYPE=Release ;;
+            *)       CMAKE_TYPE=RelWithDebInfo ;;
+          esac
+          if [ ! -d "$BUILD_DIR" ]; then
+            "$CMAKE" -S "$REPO" -B "$BUILD_DIR" -G Ninja \
               -DCMAKE_C_COMPILER=/usr/bin/clang \
-              -DCMAKE_CXX_COMPILER=/usr/bin/clang++
+              -DCMAKE_CXX_COMPILER=/usr/bin/clang++ \
+              -DCMAKE_BUILD_TYPE=$CMAKE_TYPE
           fi
-          "$CMAKE" --build "$REPO/build" --target kintsuki
+          "$CMAKE" --build "$BUILD_DIR" --target kintsuki
           mkdir -p "$SRCROOT/Vendor"
-          cp "$REPO/build/ares/target-kintsuki/libkintsuki.dylib" "$SRCROOT/Vendor/"
+          cp "$BUILD_DIR/ares/target-kintsuki/libkintsuki.dylib" "$SRCROOT/Vendor/"
           # ares System/ pak (boards.bml + ipl.rom) lives next to the dylib
           # so the bundle copy phase ships it as a Resource.
           rsync -a --delete "$REPO/ares/ares/System/" "$SRCROOT/Vendor/System/"
@@ -145,3 +162,36 @@ targets:
           /usr/bin/codesign --force --sign "$IDENTITY" \
              --entitlements "$BUILT_PRODUCTS_DIR/$TARGET_NAME.app.xcent" \
              "$TARGET_BUILD_DIR/$WRAPPER_NAME" || true
+
+# Two explicit schemes so Xcode's menu always shows both. Defining a
+# `schemes:` block suppresses xcodegen's auto-generated default, so we
+# spell out a Debug variant alongside the Release one.
+schemes:
+  Kintsuki (Debug):
+    build:
+      targets:
+        Kintsuki: all
+    run:
+      config: Debug
+    test:
+      config: Debug
+    profile:
+      config: Debug
+    analyze:
+      config: Debug
+    archive:
+      config: Debug
+  Kintsuki (Release):
+    build:
+      targets:
+        Kintsuki: all
+    run:
+      config: Release
+    test:
+      config: Release
+    profile:
+      config: Release
+    analyze:
+      config: Release
+    archive:
+      config: Release

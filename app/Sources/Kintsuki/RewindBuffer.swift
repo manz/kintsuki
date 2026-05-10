@@ -211,6 +211,10 @@ final class RewindBuffer {
     private var scratch: Data
     private var xorWorkspace: Data
     private var compressedWorkspace: Data
+    /// Reuse buffers for `withMaterialized(at:)`. Sized lazily on first
+    /// call. Borrowed via closure; never escape so a single pair is fine.
+    private var matDecompressBuf: Data
+    private var matResultBuf: Data
 
     init(capacity: Int, keyframeInterval: Int = 60,
          initialSlotBytes: Int = 512 * 1024) {
@@ -224,6 +228,8 @@ final class RewindBuffer {
         self.scratch = Data(count: initialSlotBytes)
         self.xorWorkspace = Data(count: initialSlotBytes)
         self.compressedWorkspace = Data(count: initialSlotBytes + 64)
+        self.matDecompressBuf = Data(count: initialSlotBytes)
+        self.matResultBuf = Data(count: initialSlotBytes)
         // Pre-allocate every ring slot so push/evict mutate in place.
         self.ring = Array(repeating: nil, count: capacity)
     }
@@ -310,6 +316,78 @@ final class RewindBuffer {
 
     // MARK: Reconstruction
 
+    /// Materialize frame `i` into reusable workspace buffers and hand
+    /// the bytes to `body` via a borrowed pointer. Avoids the per-call
+    /// `Data(count:)` allocation in `materialize(at:)` (decompress out +
+    /// xor result, ≈ 800 KB / call). Closure must consume bytes
+    /// synchronously — buffers are reused on the next call.
+    func withMaterialized<R>(at i: Int,
+                             _ body: (UnsafeRawBufferPointer) -> R) -> R? {
+        guard i >= 0, i < ringSize else { return nil }
+        switch entry(at: i) {
+        case .keyframe(let h):
+            return keyframePool.withBytes(of: h) { body($0) }
+        case .delta(let kfLogical, let compressed):
+            let kfArrayIdx = kfLogical - firstLogicalIdx
+            guard kfArrayIdx >= 0, kfArrayIdx < ringSize,
+                  case .keyframe(let kh) = entry(at: kfArrayIdx) else {
+                return nil
+            }
+            // Read prefix to size the decompress destination.
+            let header = compressed.prefix(4).withUnsafeBytes { raw -> UInt32 in
+                raw.bindMemory(to: UInt32.self)[0]
+            }.littleEndian
+            let uncompressedSize = Int(header & 0x7FFF_FFFF)
+            let isRaw = (header & 0x8000_0000) != 0
+            // Grow workspaces if a delta this large hasn't been seen yet.
+            if matDecompressBuf.count < uncompressedSize {
+                matDecompressBuf = Data(count: uncompressedSize)
+            }
+            if matResultBuf.count < uncompressedSize {
+                matResultBuf = Data(count: uncompressedSize)
+            }
+            let payload = compressed.suffix(from: 4)
+            // Decompress into matDecompressBuf without re-allocating.
+            matDecompressBuf.withUnsafeMutableBytes { dstRaw in
+                payload.withUnsafeBytes { srcRaw in
+                    let dst = dstRaw.bindMemory(to: UInt8.self).baseAddress!
+                    let src = srcRaw.bindMemory(to: UInt8.self).baseAddress!
+                    if isRaw {
+                        memcpy(dst, src, min(payload.count, uncompressedSize))
+                    } else {
+                        _ = compression_decode_buffer(dst, uncompressedSize,
+                                                      src, payload.count, nil,
+                                                      COMPRESSION_LZ4)
+                    }
+                }
+            }
+            // XOR keyframe ^ diff into matResultBuf.
+            return keyframePool.withBytes(of: kh) { baseRaw -> R in
+                let n = min(uncompressedSize, baseRaw.count)
+                matResultBuf.withUnsafeMutableBytes { dstRaw in
+                    matDecompressBuf.withUnsafeBytes { diffRaw in
+                        let dstU64 = dstRaw.bindMemory(to: UInt64.self)
+                        let aU64   = baseRaw.bindMemory(to: UInt64.self)
+                        let bU64   = diffRaw.bindMemory(to: UInt64.self)
+                        let words  = n / 8
+                        for j in 0..<words {
+                            dstU64[j] = aU64[j] ^ bU64[j]
+                        }
+                        let aBytes = baseRaw.bindMemory(to: UInt8.self)
+                        let bBytes = diffRaw.bindMemory(to: UInt8.self)
+                        let dBytes = dstRaw.bindMemory(to: UInt8.self)
+                        for j in (words * 8)..<n {
+                            dBytes[j] = aBytes[j] ^ bBytes[j]
+                        }
+                    }
+                }
+                return matResultBuf.withUnsafeBytes { full in
+                    body(UnsafeRawBufferPointer(rebasing: full[..<uncompressedSize]))
+                }
+            }
+        }
+    }
+
     func materialize(at i: Int) -> Data? {
         guard i >= 0, i < ringSize else { return nil }
         switch entry(at: i) {
@@ -324,6 +402,28 @@ final class RewindBuffer {
             let base = keyframePool.bytes(for: kh)
             let diff = decompress(compressed)
             return xor(base, diff)
+        }
+    }
+
+    /// Drop the `n` most-recent entries without materializing them.
+    /// O(n) accounting + pool releases; no LZ4 decompress, no XOR. Use
+    /// this when the caller only cares about reaching a target frame
+    /// — pair with `materialize(at:)` on the new last index.
+    func dropLast(_ n: Int) {
+        var k = min(max(0, n), ringSize)
+        while k > 0 {
+            let lastIdx = ringSize - 1
+            let lastSlot = slotIndex(at: lastIdx)
+            switch ring[lastSlot]! {
+            case .keyframe(let h):
+                bytes -= h.length
+                keyframePool.release(h)
+            case .delta(_, let compressed):
+                bytes -= compressed.count
+            }
+            ring[lastSlot] = nil
+            ringSize -= 1
+            k -= 1
         }
     }
 
@@ -474,6 +574,79 @@ final class RewindBuffer {
     }
 }
 
+
+// MARK: - Serialization (crash recovery)
+
+extension RewindBuffer {
+    /// One ring entry, exposed as a value type so external persistence
+    /// code (crash dumps) can preserve the keyframe/delta distinction
+    /// without round-tripping through `materialize` per frame.
+    enum SerializedFrame {
+        case keyframe(bytes: Data)
+        /// `kfIndex` refers to a position within the same serialized
+        /// frame list (0..<frames.count), not the original logical id —
+        /// re-keyed at serialization time so the file is self-contained.
+        case delta(kfIndex: Int, compressed: Data)
+    }
+
+    /// Snapshot every retained frame in ring order. Keyframes carry their
+    /// raw bytes (sliced from the pool). Deltas carry the file-relative
+    /// index of their owning keyframe + the original LZ4-compressed XOR
+    /// payload, ready for direct round-trip.
+    func serializedFrames() -> [SerializedFrame] {
+        var out: [SerializedFrame] = []
+        out.reserveCapacity(ringSize)
+        for i in 0..<ringSize {
+            switch entry(at: i) {
+            case .keyframe(let h):
+                out.append(.keyframe(bytes: keyframePool.bytes(for: h)))
+            case .delta(let kfLogical, let compressed):
+                let kfIdx = kfLogical - firstLogicalIdx
+                out.append(.delta(kfIndex: kfIdx, compressed: compressed))
+            }
+        }
+        return out
+    }
+
+    /// Rebuild a buffer from a serialized frame list. The new buffer's
+    /// logical-id space starts at 0 — `firstLogicalIdx == 0` and each
+    /// delta's kfIndex doubles as its logical id. Capacity must be at
+    /// least `frames.count`; pass the original capacity to keep the
+    /// post-restore ring size identical to the dump.
+    convenience init(restoring frames: [SerializedFrame],
+                     capacity: Int,
+                     keyframeInterval: Int = 60,
+                     initialSlotBytes: Int = 512 * 1024) {
+        precondition(capacity >= frames.count,
+                     "capacity must be >= frames.count")
+        self.init(capacity: capacity,
+                  keyframeInterval: keyframeInterval,
+                  initialSlotBytes: initialSlotBytes)
+        for (i, frame) in frames.enumerated() {
+            switch frame {
+            case .keyframe(let bytes):
+                let h = keyframePool.acquire(copyingFrom: bytes)
+                ring[slotIndex(at: i)] = .keyframe(h)
+                bytes_inc(by: h.length)
+            case .delta(let kfIndex, let compressed):
+                ring[slotIndex(at: i)] = .delta(keyframeLogical: kfIndex,
+                                                compressed: compressed)
+                bytes_inc(by: compressed.count)
+            }
+            ringSize_inc()
+        }
+        // Logical id space matches the file-relative indexes since we
+        // built it fresh: firstLogicalIdx remains 0, pushedSoFar reflects
+        // how many entries the ring currently holds (so the next push
+        // won't accidentally re-promote a delta slot to a keyframe).
+        pushedSoFar = frames.count
+    }
+
+    // Tiny mutators so the convenience init can update private state
+    // without exposing the fields publicly.
+    private func bytes_inc(by n: Int) { bytes += n }
+    private func ringSize_inc() { ringSize += 1 }
+}
 
 // MARK: - Free helpers
 

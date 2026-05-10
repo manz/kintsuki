@@ -21,6 +21,12 @@
 // file scope (outside extern "C") so the C++ name mangling matches.
 namespace ares::SuperFamicom {
   extern volatile bool kintsukiBailRequested;
+  extern volatile bool kintsukiHaltRequested;
+  typedef void (*KintsukiDmaHook)(uint8_t, uint8_t, uint8_t,
+                                  uint32_t, uint8_t, uint16_t);
+  extern KintsukiDmaHook kintsukiDmaHook;
+  typedef void (*KintsukiHdmaHook)(uint8_t, uint16_t, uint8_t);
+  extern KintsukiHdmaHook kintsukiHdmaHook;
 }
 
 // ---- Shadow callstack + .adbg label table -------------------------------
@@ -424,6 +430,9 @@ struct CCallback {
   kintsuki_cb_t fn;
   void* userdata;
   bool active;
+  bool halt;       // when true, raise kintsukiBailRequested on hit so the
+                   // scheduler returns to the host loop at the next safe
+                   // boundary — host then pauses the run loop.
 };
 
 enum { CB_EXEC = 0, CB_READ = 1, CB_WRITE = 2 };
@@ -463,6 +472,18 @@ auto cFire(std::vector<CCallback>& list, uint32_t addr, uint8_t value) -> void {
     if(!cb.active) continue;
     if(addr < cb.lo || addr > cb.hi) continue;
     cb.fn(addr, value, cb.userdata);
+    // Halting breakpoints raise both flags:
+    //   - `kintsukiBailRequested` (one-shot): the CPU's exec hook
+    //     yields the scheduler immediately so cpu.r.pc.d still points
+    //     at the BP address.
+    //   - `kintsukiHaltRequested` (sticky): `Program::runFrames`
+    //     breaks out of its outer loop instead of resuming the CPU
+    //     coroutine and running past the BP. Cleared explicitly by
+    //     the host on resume — see `Emulator.togglePause`.
+    if(cb.halt) {
+      ares::SuperFamicom::kintsukiBailRequested = true;
+      ares::SuperFamicom::kintsukiHaltRequested = true;
+    }
   }
 }
 
@@ -503,13 +524,23 @@ auto pickPages(int kind) -> uint8_t* {
 
 }  // namespace
 
+int kintsuki_add_callback_ex(kintsuki_t* h, int kind, uint32_t lo, uint32_t hi,
+                             int halt,
+                             kintsuki_cb_t fn, void* userdata);
+
 int kintsuki_add_callback(kintsuki_t* h, int kind, uint32_t lo, uint32_t hi,
                           kintsuki_cb_t fn, void* userdata) {
+  return kintsuki_add_callback_ex(h, kind, lo, hi, 0, fn, userdata);
+}
+
+int kintsuki_add_callback_ex(kintsuki_t* h, int kind, uint32_t lo, uint32_t hi,
+                             int halt,
+                             kintsuki_cb_t fn, void* userdata) {
   (void)h;
   auto* list = pickList(kind);
   auto* pages = pickPages(kind);
   if(!list || !pages || !fn) return 0;
-  list->push_back({lo, hi, fn, userdata, true});
+  list->push_back({lo, hi, fn, userdata, true, halt != 0});
   markCPages(pages, lo, hi, +1);
   if(kind == CB_EXEC)  ares::SuperFamicom::execHook      = &cOnExec;
   if(kind == CB_READ)  ares::SuperFamicom::memReadHook   = &cOnRead;
@@ -748,8 +779,31 @@ namespace {
 volatile bool g_stepHit = false;
 ares::SuperFamicom::ExecHook g_prevExecHook = nullptr;
 
+// Step semantics: advance the CPU exactly one user-visible instruction.
+// execHook fires immediately before each instruction dispatch.
+//
+// Two cases:
+// 1. Stepping from a vanilla pause: the coroutine is between main()
+//    iterations. First execHook fire is the instruction the user wants
+//    to step over — let it run; bail on the second fire (next instr).
+// 2. Stepping from a bail-yielded halt (BP, prior step): the coroutine
+//    is suspended INSIDE main(), just past the bail check, with PC
+//    pointing at the about-to-execute instruction. Resuming runs that
+//    instruction as a side-effect of unwinding, before any new
+//    execHook fires. Count THAT as the user's step and bail on the
+//    very first fire so we don't accidentally step two instructions.
+volatile bool g_stepFromHalt = false;
+
 void stepHook(uint32_t pc) {
   (void)pc;
+  if(g_stepFromHalt) {
+    ares::SuperFamicom::kintsukiBailRequested = true;
+    return;
+  }
+  if(g_stepHit) {
+    ares::SuperFamicom::kintsukiBailRequested = true;
+    return;
+  }
   g_stepHit = true;
 }
 }  // namespace
@@ -759,8 +813,15 @@ void kintsuki_step(kintsuki_t* h) {
   g_prevExecHook = ares::SuperFamicom::execHook;
   ares::SuperFamicom::execHook = &stepHook;
   g_stepHit = false;
+  // Detect "resuming from halt" so stepHook can compensate for the
+  // free instruction the coroutine unwinds before it returns to main().
+  g_stepFromHalt = ares::SuperFamicom::kintsukiHaltRequested;
+  ares::SuperFamicom::kintsukiHaltRequested = false;
+  ares::SuperFamicom::kintsukiBailRequested = false;
   ares::SuperFamicom::system.run();
   ares::SuperFamicom::execHook = g_prevExecHook;
+  ares::SuperFamicom::kintsukiBailRequested = false;
+  g_stepFromHalt = false;
 }
 
 
@@ -898,6 +959,266 @@ int kintsuki_lookup_source(kintsuki_t* h, uint32_t addr,
   if(out_line)   *out_line   = line;
   if(out_column) *out_column = column;
   return 1;
+}
+
+// ---- DMA transfer log ---------------------------------------------------
+// Captures each Channel::dmaRun call, deduplicating by (src, dst, size)
+// so a game that re-pushes the same buffer every frame collapses to a
+// single entry. Recent-first ordering: when an existing entry is hit
+// again we move it to slot 0 and bump its hit count, otherwise we
+// insert at slot 0 and evict the oldest. Bounded to 64 entries.
+namespace {
+struct DmaLogEntry {
+  uint32_t src_addr;     // 24-bit
+  uint16_t size;
+  uint8_t  channel;
+  uint8_t  direction;
+  uint8_t  mode;
+  uint8_t  dst_reg;
+  uint16_t vram_addr;    // VMADDR at DMA fire (word address)
+  uint32_t hits;
+  uint64_t last_frame;
+};
+constexpr size_t kDmaLogCap = 64;
+DmaLogEntry g_dmaLog[kDmaLogCap] = {};
+size_t g_dmaLogSize = 0;
+
+void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
+               uint32_t src, uint8_t dst, uint16_t size) {
+  // Capture VMADDR (word) at the moment the DMA fires — gives the
+  // user the actual VRAM destination, not just "we wrote something
+  // through VMDATA". Read from the live performance PPU; the
+  // CGRAM/OAM equivalents could be added later if needed.
+  uint16_t vramAddr = (uint16_t)ares::SuperFamicom::ppuPerformanceImpl.vram.address;
+  // Dedupe key now includes vram_addr so two transfers to different
+  // VRAM regions through the same VMDATA register don't collapse.
+  for(size_t i = 0; i < g_dmaLogSize; i++) {
+    auto& e = g_dmaLog[i];
+    if(e.src_addr == src && e.dst_reg == dst && e.size == size
+       && e.vram_addr == vramAddr) {
+      e.hits += 1;
+      e.last_frame = (g_handle ? g_handle->program->framesRendered : 0);
+      if(i > 0) {
+        DmaLogEntry tmp = e;
+        for(size_t j = i; j > 0; j--) g_dmaLog[j] = g_dmaLog[j - 1];
+        g_dmaLog[0] = tmp;
+      }
+      return;
+    }
+  }
+  size_t insertCount = (g_dmaLogSize < kDmaLogCap) ? g_dmaLogSize : kDmaLogCap - 1;
+  for(size_t j = insertCount; j > 0; j--) g_dmaLog[j] = g_dmaLog[j - 1];
+  g_dmaLog[0] = DmaLogEntry{
+    .src_addr = src,
+    .size = size,
+    .channel = channel,
+    .direction = direction,
+    .mode = mode,
+    .dst_reg = dst,
+    .vram_addr = vramAddr,
+    .hits = 1,
+    .last_frame = (g_handle ? g_handle->program->framesRendered : 0),
+  };
+  if(g_dmaLogSize < kDmaLogCap) g_dmaLogSize++;
+}
+
+struct DmaHookInstaller {
+  DmaHookInstaller() { ares::SuperFamicom::kintsukiDmaHook = &dmaHookFn; }
+} g_dmaHookInstaller;
+
+// HDMA per-line trace. Each scanline gets a bitmask of channels that
+// fired on it. Double-buffered: writes go into `current`, snapshot
+// reads from `latched` (last fully-captured frame). Switch-over fires
+// when the host's frame counter advances — a new frame's first hdma
+// fire triggers the swap.
+constexpr size_t kHdmaScanlines = 320;   // generous: NTSC 262, PAL 312
+uint8_t g_hdmaCurrent[kHdmaScanlines] = {};
+uint8_t g_hdmaLatched[kHdmaScanlines] = {};
+uint64_t g_hdmaCurrentFrame = 0;
+
+void hdmaHookFn(uint8_t channel, uint16_t scanline, uint8_t /*dst*/) {
+  uint64_t frame = g_handle ? g_handle->program->framesRendered : 0;
+  if(frame != g_hdmaCurrentFrame) {
+    // Frame just rolled over — latch what we accumulated and clear.
+    std::memcpy(g_hdmaLatched, g_hdmaCurrent, sizeof(g_hdmaCurrent));
+    std::memset(g_hdmaCurrent, 0, sizeof(g_hdmaCurrent));
+    g_hdmaCurrentFrame = frame;
+  }
+  if(scanline < kHdmaScanlines && channel < 8) {
+    g_hdmaCurrent[scanline] |= (uint8_t)(1u << channel);
+  }
+}
+
+struct HdmaHookInstaller {
+  HdmaHookInstaller() { ares::SuperFamicom::kintsukiHdmaHook = &hdmaHookFn; }
+} g_hdmaHookInstaller;
+}
+
+uint32_t kintsuki_hdma_scanline_mask(kintsuki_t* h, uint8_t* out, uint32_t cap) {
+  if(!h || !out || cap == 0) return 0;
+  uint32_t n = (uint32_t)((cap < kHdmaScanlines) ? cap : kHdmaScanlines);
+  std::memcpy(out, g_hdmaLatched, n);
+  return n;
+}
+
+uint32_t kintsuki_dma_log_count(kintsuki_t* h) {
+  if(!h) return 0;
+  return (uint32_t)g_dmaLogSize;
+}
+
+uint32_t kintsuki_dma_log_snapshot(kintsuki_t* h,
+                                   kintsuki_dma_event_t* out,
+                                   uint32_t cap) {
+  if(!h || !out || cap == 0) return 0;
+  uint32_t n = (uint32_t)((g_dmaLogSize < cap) ? g_dmaLogSize : cap);
+  for(uint32_t i = 0; i < n; i++) {
+    auto& e = g_dmaLog[i];
+    out[i].src_addr = e.src_addr;
+    out[i].size = e.size;
+    out[i].channel = e.channel;
+    out[i].direction = e.direction;
+    out[i].mode = e.mode;
+    out[i].dst_reg = e.dst_reg;
+    out[i].vram_addr = e.vram_addr;
+    out[i].hits = e.hits;
+    out[i].last_frame = e.last_frame;
+  }
+  return n;
+}
+
+void kintsuki_dma_log_clear(kintsuki_t* h) {
+  if(!h) return;
+  g_dmaLogSize = 0;
+}
+
+// ---- Label enumeration --------------------------------------------------
+
+uint32_t kintsuki_label_count(kintsuki_t* h) {
+  if(!h) return 0;
+  return (uint32_t)g_labels.sortedLabels.size();
+}
+
+uint32_t kintsuki_label_snapshot(kintsuki_t* h,
+                                 kintsuki_label_entry_t* out,
+                                 uint32_t cap) {
+  if(!h || !out || cap == 0) return 0;
+  uint32_t total = (uint32_t)g_labels.sortedLabels.size();
+  uint32_t n = total < cap ? total : cap;
+  for(uint32_t i = 0; i < n; i++) {
+    const auto& kv = g_labels.sortedLabels[i];
+    out[i].addr = kv.first;
+    out[i].name = kv.second.c_str();
+  }
+  return n;
+}
+
+// ---- Disassemble-at -----------------------------------------------------
+// Length lookup for WDC65816 opcodes. Each entry encodes (base length |
+// flags). Base length is the low 4 bits (1..4). Flag bit 4 = +1 if M=0
+// (16-bit accumulator immediate). Flag bit 5 = +1 if X=0 (16-bit index
+// immediate). M-extending opcodes: ORA/AND/EOR/ADC/BIT/LDA/CMP/SBC #imm
+// (09,29,49,69,89,A9,C9,E9). X-extending: LDY/LDX/CPY/CPX #imm
+// (A0,A2,C0,E0). Order matches the 65816 opcode matrix.
+namespace {
+constexpr uint8_t LEN_M = 0x10;
+constexpr uint8_t LEN_X = 0x20;
+
+const uint8_t kInstLen[256] = {
+  /* 00 */ 2, 2, 2, 2, 2, 2, 2, 2, 1, 2|LEN_M, 1, 1, 3, 3, 3, 4,
+  /* 10 */ 2, 2, 2, 2, 2, 2, 2, 2, 1, 3, 1, 1, 3, 3, 3, 4,
+  /* 20 */ 3, 2, 4, 2, 2, 2, 2, 2, 1, 2|LEN_M, 1, 1, 3, 3, 3, 4,
+  /* 30 */ 2, 2, 2, 2, 2, 2, 2, 2, 1, 3, 1, 1, 3, 3, 3, 4,
+  /* 40 */ 1, 2, 2, 2, 3, 2, 2, 2, 1, 2|LEN_M, 1, 1, 3, 3, 3, 4,
+  /* 50 */ 2, 2, 2, 2, 3, 2, 2, 2, 1, 3, 1, 1, 4, 3, 3, 4,
+  /* 60 */ 1, 2, 3, 2, 2, 2, 2, 2, 1, 2|LEN_M, 1, 1, 3, 3, 3, 4,
+  /* 70 */ 2, 2, 2, 2, 2, 2, 2, 2, 1, 3, 1, 1, 3, 3, 3, 4,
+  /* 80 */ 2, 2, 3, 2, 2, 2, 2, 2, 1, 2|LEN_M, 1, 1, 3, 3, 3, 4,
+  /* 90 */ 2, 2, 2, 2, 2, 2, 2, 2, 1, 3, 1, 1, 3, 3, 3, 4,
+  /* A0 */ 2|LEN_X, 2, 2|LEN_X, 2, 2, 2, 2, 2, 1, 2|LEN_M, 1, 1, 3, 3, 3, 4,
+  /* B0 */ 2, 2, 2, 2, 2, 2, 2, 2, 1, 3, 1, 1, 3, 3, 3, 4,
+  /* C0 */ 2|LEN_X, 2, 2, 2, 2, 2, 2, 2, 1, 2|LEN_M, 1, 1, 3, 3, 3, 4,
+  /* D0 */ 2, 2, 2, 2, 2, 2, 2, 2, 1, 3, 1, 1, 3, 3, 3, 4,
+  /* E0 */ 2|LEN_X, 2, 2, 2, 2, 2, 2, 2, 1, 2|LEN_M, 1, 1, 3, 3, 3, 4,
+  /* F0 */ 2, 2, 2, 2, 3, 2, 2, 2, 1, 3, 1, 1, 3, 3, 3, 4,
+};
+
+uint8_t inst_length_for(uint8_t opcode, bool m_flag, bool x_flag) {
+  uint8_t e = kInstLen[opcode];
+  uint8_t len = e & 0x0F;
+  if((e & LEN_M) && !m_flag) len += 1;
+  if((e & LEN_X) && !x_flag) len += 1;
+  return len;
+}
+}  // namespace
+
+uint32_t kintsuki_disassemble_at_ex(kintsuki_t* h, uint32_t pc, uint32_t count,
+                                    int e_override, int m_override, int x_override,
+                                    kintsuki_disasm_line_t* out);
+
+uint32_t kintsuki_disassemble_at(kintsuki_t* h, uint32_t pc, uint32_t count,
+                                 kintsuki_disasm_line_t* out) {
+  return kintsuki_disassemble_at_ex(h, pc, count, -1, -1, -1, out);
+}
+
+uint32_t kintsuki_disassemble_at_ex(kintsuki_t* h, uint32_t pc, uint32_t count,
+                                    int e_override, int m_override, int x_override,
+                                    kintsuki_disasm_line_t* out) {
+  if(!h || !out || count == 0) return 0;
+  auto& cpu = ares::SuperFamicom::cpu;
+  bool e = e_override < 0 ? cpu.r.e   : (e_override != 0);
+  bool m = m_override < 0 ? cpu.r.p.m : (m_override != 0);
+  bool x = x_override < 0 ? cpu.r.p.x : (x_override != 0);
+  uint32_t addr = pc & 0xFFFFFF;
+  uint32_t produced = 0;
+  for(uint32_t i = 0; i < count; i++) {
+    out[i].pc = addr;
+    nall::string s = cpu.disassembleInstruction(addr, e, m, x);
+    const char* sp = (const char*)s.data();
+    size_t sl = s.size();
+    if(sl >= sizeof(out[i].text)) sl = sizeof(out[i].text) - 1;
+    std::memcpy(out[i].text, sp, sl);
+    out[i].text[sl] = 0;
+    // Trim trailing whitespace ares pads to column 31.
+    while(sl > 0 && (out[i].text[sl-1] == ' ' || out[i].text[sl-1] == '\t')) {
+      out[i].text[--sl] = 0;
+    }
+    uint8_t opcode = ares::SuperFamicom::cpu.readDisassembler(addr);
+    uint8_t len = inst_length_for(opcode, m, x);
+    out[i].length = len;
+    // Resolve the static control-flow target (JSR/JSL/JMP/Bxx/BRL).
+    // Indirect/indexed jumps return 0xFFFFFFFF — propagate that as the
+    // sentinel so the UI can disable double-click-to-follow there.
+    uint32_t tgt = resolveControlFlowTarget(addr);
+    out[i].target = tgt;
+    if(tgt != 0xFFFFFFFFu && g_labels.byAddr.size() > 0) {
+      if(const char* name = g_labels.lookup(tgt)) {
+        // Append " -> name" — same annotation the tracer emits, lets
+        // the disassembly view read as a control-flow log.
+        size_t avail = sizeof(out[i].text) - sl - 1;
+        if(avail > 6) {
+          int wrote = std::snprintf(out[i].text + sl, avail, " -> %s", name);
+          if(wrote > 0) sl += (size_t)wrote;
+        }
+      }
+    }
+    produced++;
+    // REP/SEP track M/X flag flips so subsequent disassembly stays accurate
+    // across `rep #$30` boundaries — the live table assumes flags don't
+    // change, but the user typically wants to see ~20 instructions ahead.
+    if(opcode == 0xC2 || opcode == 0xE2) {
+      uint8_t imm = ares::SuperFamicom::cpu.readDisassembler((addr + 1) & 0xFFFFFF);
+      if(opcode == 0xC2) {
+        if(imm & 0x20) m = false;
+        if(imm & 0x10) x = false;
+      } else {
+        if(imm & 0x20) m = true;
+        if(imm & 0x10) x = true;
+      }
+    }
+    // Advance PC. SNES wraps in-bank for instructions; we follow that.
+    addr = (addr & 0xFF0000) | ((addr + len) & 0xFFFF);
+  }
+  return produced;
 }
 
 }  // extern "C"

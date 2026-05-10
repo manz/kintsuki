@@ -71,6 +71,38 @@ auto System::run() -> void {
 __attribute__((visibility("default")))
 volatile bool kintsukiBailRequested = false;
 
+// Sticky halt flag — once raised, `Program::runFrames` breaks out of
+// its inner `system.run()` loop instead of spinning the CPU coroutine
+// forward to the next frame boundary. Used by halting breakpoints so
+// the host stops AT the BP address rather than wherever the frame
+// happened to end. Cleared explicitly by the host on resume.
+__attribute__((visibility("default")))
+volatile bool kintsukiHaltRequested = false;
+
+// DMA dispatch hook. Channel::dmaRun fires this once per channel
+// before the transfer loop with (channel id, direction, mode,
+// 24-bit src, PPU register low byte, length). Host installs a
+// callback to ring-log transfers — used for "what fed VRAM at the
+// BG tilemap range" guesses inside the Memory Viewer.
+typedef void (*KintsukiDmaHook)(uint8_t channel,
+                                uint8_t direction,
+                                uint8_t mode,
+                                uint32_t src_addr,
+                                uint8_t dst_reg,
+                                uint16_t size);
+__attribute__((visibility("default")))
+KintsukiDmaHook kintsukiDmaHook = nullptr;
+
+// HDMA per-line hook. Fires inside Channel::hdmaTransfer once a
+// channel actually performs its scanline transfer; (channel,
+// vcounter, dst) lets the host build a per-channel scanline strip
+// for raster-effect debugging.
+typedef void (*KintsukiHdmaHook)(uint8_t channel,
+                                 uint16_t scanline,
+                                 uint8_t dst_reg);
+__attribute__((visibility("default")))
+KintsukiHdmaHook kintsukiHdmaHook = nullptr;
+
 auto System::load(Node::System& root, string name) -> bool {
   if(node) unload();
 

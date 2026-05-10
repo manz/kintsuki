@@ -169,6 +169,14 @@ void        kintsuki_press(kintsuki_t*, int port, int button, int pressed);
 // Callbacks. Returns 1-based id, 0 on failure. Pass id back to remove.
 int         kintsuki_add_callback(kintsuki_t*, int kind, uint32_t lo, uint32_t hi,
                                   kintsuki_cb_t fn, void* userdata);
+// Same as `kintsuki_add_callback`, but when `halt` is non-zero the
+// scheduler is asked to bail out at the next safe instruction boundary
+// after the callback fires — turning a tracing callback into a real
+// breakpoint that pauses the host. The callback still runs first, so
+// hit counters / inspector UI updates land before execution stops.
+int         kintsuki_add_callback_ex(kintsuki_t*, int kind, uint32_t lo, uint32_t hi,
+                                     int halt,
+                                     kintsuki_cb_t fn, void* userdata);
 void        kintsuki_remove_callback(kintsuki_t*, int kind, int id);
 
 // ---- Shadow callstack ----------------------------------------------------
@@ -225,6 +233,23 @@ int          kintsuki_lookup_source(kintsuki_t*, uint32_t addr,
 int          kintsuki_lookup_symbol_addr(kintsuki_t*, const char* name,
                                          uint32_t* out_addr);
 
+// Number of labels currently loaded from .adbg. 0 when no .adbg is
+// loaded. Used to size buffers passed to `kintsuki_label_snapshot`.
+uint32_t     kintsuki_label_count(kintsuki_t*);
+
+// Snapshot the loaded label table into `out`, sorted by 24-bit address
+// ascending. Each `name` pointer borrows from .adbg-owned storage and
+// stays valid until the next `kintsuki_load_adbg`/`kintsuki_clear_adbg`
+// call. Returns the number of entries actually written
+// (min of `cap` and `kintsuki_label_count`).
+typedef struct {
+  uint32_t    addr;   // 24-bit
+  const char* name;
+} kintsuki_label_entry_t;
+uint32_t     kintsuki_label_snapshot(kintsuki_t*,
+                                     kintsuki_label_entry_t* out,
+                                     uint32_t cap);
+
 // Formatted execution tracer. Wraps an exec callback that disassembles
 // the instruction at PC + dumps CPU registers, producing one Mesen-
 // style line per exec event in [lo,hi]. Single tracer per emulator —
@@ -259,6 +284,69 @@ typedef struct {
 void        kintsuki_tracer_set_ranges(kintsuki_t*,
                                        const kintsuki_trace_range_t* ranges,
                                        uint32_t count);
+
+// ---- Disassemble-at -----------------------------------------------------
+// Render `count` consecutive 65816 instructions starting at `pc` (24-bit)
+// into `out`. Each entry holds the source PC, the byte length, and the
+// formatted line text. Uses the live CPU's E/M/X register flags as the
+// initial state and tracks REP/SEP flips through the disassembled stream
+// so a `rep #$30` advance into 16-bit immediates stays correctly sized.
+// Returns the number of entries actually produced.
+typedef struct kintsuki_disasm_line_t {
+  uint32_t pc;       // 24-bit
+  uint8_t  length;   // 1..4 bytes
+  uint8_t  _pad[3];
+  // Static control-flow target for JMP/JML/JSR/JSL/Bxx/BRL when it can
+  // be resolved without runtime register state. 0xFFFFFFFF when the
+  // instruction is non-branching or its target depends on registers
+  // (indirect/indexed). UI can use this for "double-click to follow".
+  uint32_t target;
+  char     text[128];
+} kintsuki_disasm_line_t;
+
+uint32_t kintsuki_disassemble_at(kintsuki_t*, uint32_t pc, uint32_t count,
+                                 kintsuki_disasm_line_t* out);
+
+// Same as `kintsuki_disassemble_at` but with explicit overrides for the
+// initial E/M/X register flags. Pass -1 for any flag you want sourced
+// from the live CPU state (the default behaviour). Use this when
+// disassembling far from the current PC — at a fresh symbol the live
+// M/X may not reflect what the call site actually expects (caller is
+// either guessing a sane default like M=0,X=0 or reading flags from
+// a previous trace / .adbg annotation).
+uint32_t kintsuki_disassemble_at_ex(kintsuki_t*, uint32_t pc, uint32_t count,
+                                    int e_override, int m_override, int x_override,
+                                    kintsuki_disasm_line_t* out);
+
+// ---- DMA transfer log ---------------------------------------------------
+// Captures every Channel::dmaRun fire. Deduplicates by (src + dst + size)
+// — if a game re-pushes the same buffer every frame the entry's hit
+// count bumps instead of growing the log. Most-recent at index 0.
+// Bounded to 64 entries on the host side.
+typedef struct kintsuki_dma_event_t {
+  uint32_t src_addr;     // 24-bit
+  uint16_t size;
+  uint8_t  channel;
+  uint8_t  direction;    // 0 = A->B (CPU->PPU), 1 = B->A
+  uint8_t  mode;         // transferMode (0..7)
+  uint8_t  dst_reg;      // PPU register low byte ($21XX)
+  uint16_t vram_addr;    // VMADDR at fire (word address); meaningful
+                         // only when dst_reg == 0x18 / 0x19
+  uint32_t hits;
+  uint64_t last_frame;
+} kintsuki_dma_event_t;
+
+uint32_t kintsuki_dma_log_count(kintsuki_t*);
+uint32_t kintsuki_dma_log_snapshot(kintsuki_t*,
+                                   kintsuki_dma_event_t* out,
+                                   uint32_t cap);
+void     kintsuki_dma_log_clear(kintsuki_t*);
+
+// Per-scanline HDMA channel mask for the most recently completed
+// frame (double-buffered). `out[i]` = bitmask of channels that fired
+// on scanline `i` (bit 0 = channel 0). Returns the number of bytes
+// written (min of `cap` and the internal scanline buffer size, 320).
+uint32_t kintsuki_hdma_scanline_mask(kintsuki_t*, uint8_t* out, uint32_t cap);
 
 #ifdef __cplusplus
 }
