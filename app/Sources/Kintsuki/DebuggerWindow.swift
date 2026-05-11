@@ -104,6 +104,10 @@ struct DebuggerView: View {
         }
         .onChange(of: emulator.breakpoints) { _, _ in rebuildLines() }
         .onChange(of: emulator.crashBacktrace) { _, _ in rebuildLines() }
+        .onChange(of: emulator.disasmNavRequest) { _, req in
+            handleDisasmNav(req)
+        }
+        .onAppear { handleDisasmNav(emulator.disasmNavRequest) }
         // (refreshTick is bumped *by* rebuildLines to force the LazyVStack
         // to re-anchor; calling rebuildLines from its own onChange would
         // recurse, so the scroll-side handlers below depend on
@@ -230,6 +234,17 @@ struct DebuggerView: View {
         displayPC = navStack[target]
         cursorPC = navStack[target]
         rebuildLines()
+    }
+
+    @State private var lastHandledDisasmNonce: Int = 0
+
+    /// Honour an `Emulator.disasmNavRequest` exactly once per nonce.
+    /// Used by external panels (Labels, Bookmarks, DMA caller) to jump
+    /// the disasm view without owning a binding into `displayPC`.
+    private func handleDisasmNav(_ req: Emulator.DisasmNavRequest?) {
+        guard let req, req.nonce != lastHandledDisasmNonce else { return }
+        lastHandledDisasmNonce = req.nonce
+        pushNav(req.pc)
     }
 
     /// Push `addr` onto the navigation stack and focus it. Truncates

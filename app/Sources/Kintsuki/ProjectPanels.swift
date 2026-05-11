@@ -7,6 +7,7 @@ import AppKit
 /// reverse without touching the assembly source.
 struct ProjectLabelsView: View {
     @Bindable var emulator: Emulator
+    @Environment(\.openWindow) private var openWindow
     @State private var labels: [Emulator.ProjectLabel] = []
     @State private var search: String = ""
     @State private var editingAddr: UInt32? = nil
@@ -70,21 +71,39 @@ struct ProjectLabelsView: View {
     private var table: some View {
         Table(filtered) {
             TableColumn("Addr") { L in
-                Button {
-                    let region: Emulator.MemRegion =
-                        (0x7E0000...0x7FFFFF).contains(L.addr) ? .wram : .rom
-                    let off = region == .wram
-                        ? Int(L.addr & 0x1FFFF)
-                        : Int(emulator.projectBusToRom(L.addr) ?? L.addr)
-                    emulator.requestMemoryView(region: region, offset: off)
-                } label: {
-                    Text(String(format: "$%06X", L.addr))
-                        .font(.system(.body, design: .monospaced))
-                        .foregroundStyle(Color.accentColor)
+                HStack(spacing: 4) {
+                    // Primary click → open Debugger at this PC. Labels
+                    // are code-flavoured by default (function entries,
+                    // jump targets); the disasm view is the natural
+                    // landing spot. The small memory glyph next to it
+                    // still routes to the Memory Viewer for data labels.
+                    Button {
+                        emulator.requestDisasmView(pc: L.addr)
+                        openWindow(id: "debugger")
+                    } label: {
+                        Text(String(format: "$%06X", L.addr))
+                            .font(.system(.body, design: .monospaced))
+                            .foregroundStyle(Color.accentColor)
+                    }
+                    .buttonStyle(.plain)
+                    Button {
+                        let region: Emulator.MemRegion =
+                            (0x7E0000...0x7FFFFF).contains(L.addr) ? .wram : .rom
+                        let off = region == .wram
+                            ? Int(L.addr & 0x1FFFF)
+                            : Int(emulator.projectBusToRom(L.addr) ?? L.addr)
+                        emulator.requestMemoryView(region: region, offset: off)
+                        openWindow(id: "memory")
+                    } label: {
+                        Image(systemName: "memorychip")
+                            .foregroundStyle(.secondary)
+                            .font(.caption)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Open in Memory Viewer")
                 }
-                .buttonStyle(.plain)
             }
-            .width(min: 80, ideal: 90)
+            .width(min: 110, ideal: 120)
             TableColumn("Name") { L in
                 if editingAddr == L.addr {
                     TextField("name", text: $draftName)

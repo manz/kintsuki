@@ -170,6 +170,25 @@ final class Emulator {
     private(set) var memoryNavRequest: MemoryNavRequest? = nil
     private var memoryNavNonce: Int = 0
 
+    /// Cross-window disasm navigation request — e.g. Labels panel asks
+    /// the Debugger to focus on a given PC. Mirrors the memory request
+    /// pattern: nonce bumps so a second click on the same PC still
+    /// re-jumps the disasm scroller.
+    struct DisasmNavRequest: Equatable {
+        let pc: UInt32
+        let nonce: Int
+    }
+    private(set) var disasmNavRequest: DisasmNavRequest? = nil
+    private var disasmNavNonce: Int = 0
+
+    /// Hand the Debugger a focus request. Pair with
+    /// `openWindow(id: "debugger")` so the window exists before
+    /// the request arrives.
+    func requestDisasmView(pc: UInt32) {
+        disasmNavNonce &+= 1
+        disasmNavRequest = DisasmNavRequest(pc: pc & 0xFFFFFF, nonce: disasmNavNonce)
+    }
+
     /// Hand the Memory Viewer a focus request. Pair with
     /// `openWindow(id: "memory")` from the caller to make sure the
     /// window exists before the request is delivered.
