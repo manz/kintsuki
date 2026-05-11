@@ -584,6 +584,7 @@ final class Emulator {
         projectIsOpen = true
         projectDir = dir
         projectRefreshStats()
+        projectReinstallBreakpoints()
         NSLog("kintsuki: project attached at \(dir.path)")
     }
 
@@ -677,6 +678,174 @@ final class Emulator {
             return nil
         }
         return (String(cString: p), off)
+    }
+
+    // ---- Project: labels overlay (slice 2) -----------------------------
+
+    struct ProjectLabel: Identifiable, Hashable {
+        let addr: UInt32        // 24-bit
+        var name: String
+        var type: String
+        var comment: String
+        var m: Int8             // -1 = unset, 0/1
+        var x: Int8
+        var e: Int8
+        var id: UInt32 { addr }
+    }
+
+    /// Upsert an overlay label at `addr`. Pass empty strings / nil flags
+    /// to leave columns unset. Refreshes stats so the UI badge updates.
+    func projectLabelSet(addr: UInt32, name: String = "",
+                         type: String = "", comment: String = "",
+                         m: Int? = nil, x: Int? = nil, e: Int? = nil) {
+        guard let h = handle, projectIsOpen else { return }
+        let mi: Int32 = m.map(Int32.init) ?? -1
+        let xi: Int32 = x.map(Int32.init) ?? -1
+        let ei: Int32 = e.map(Int32.init) ?? -1
+        _ = name.withCString { np in
+            type.withCString { tp in
+                comment.withCString { cp in
+                    kintsuki_project_label_set(h, addr & 0xFFFFFF,
+                                               name.isEmpty ? nil : np,
+                                               type.isEmpty ? nil : tp,
+                                               comment.isEmpty ? nil : cp,
+                                               mi, xi, ei)
+                }
+            }
+        }
+        projectRefreshStats()
+    }
+
+    func projectLabelGet(addr: UInt32) -> ProjectLabel? {
+        guard let h = handle, projectIsOpen else { return nil }
+        var raw = kintsuki_project_label_t()
+        guard kintsuki_project_label_get(h, addr & 0xFFFFFF, &raw) != 0 else { return nil }
+        return ProjectLabel(
+            addr: raw.addr,
+            name: raw.name.map { String(cString: $0) } ?? "",
+            type: raw.type.map { String(cString: $0) } ?? "",
+            comment: raw.comment.map { String(cString: $0) } ?? "",
+            m: raw.m, x: raw.x, e: raw.e)
+    }
+
+    func projectLabelClear(addr: UInt32) {
+        guard let h = handle, projectIsOpen else { return }
+        kintsuki_project_label_clear(h, addr & 0xFFFFFF)
+    }
+
+    /// All overlay labels, address-ascending. Pointers in the C struct
+    /// are copied to Swift strings, so the returned values outlive the
+    /// next mutation (unlike the raw C ABI contract).
+    func projectLabels() -> [ProjectLabel] {
+        guard let h = handle, projectIsOpen else { return [] }
+        let cap = kintsuki_project_label_count(h)
+        if cap == 0 { return [] }
+        var buf = [kintsuki_project_label_t](repeating: kintsuki_project_label_t(),
+                                              count: Int(cap))
+        let n = buf.withUnsafeMutableBufferPointer { p -> UInt32 in
+            kintsuki_project_label_snapshot(h, p.baseAddress, UInt32(p.count))
+        }
+        return (0..<Int(n)).map { i in
+            let r = buf[i]
+            return ProjectLabel(
+                addr: r.addr,
+                name: r.name.map { String(cString: $0) } ?? "",
+                type: r.type.map { String(cString: $0) } ?? "",
+                comment: r.comment.map { String(cString: $0) } ?? "",
+                m: r.m, x: r.x, e: r.e)
+        }
+    }
+
+    // ---- Project: bookmarks (slice 4) ----------------------------------
+
+    struct ProjectBookmark: Identifiable, Hashable {
+        var name: String
+        var addr: UInt32
+        var view: String
+        var comment: String
+        var id: String { name }
+    }
+
+    func projectBookmarkSet(name: String, addr: UInt32,
+                            view: String = "", comment: String = "") {
+        guard let h = handle, projectIsOpen, !name.isEmpty else { return }
+        _ = name.withCString { np in
+            view.withCString { vp in
+                comment.withCString { cp in
+                    kintsuki_project_bookmark_set(h, np, addr & 0xFFFFFF, vp, cp)
+                }
+            }
+        }
+    }
+
+    func projectBookmarkClear(name: String) {
+        guard let h = handle, projectIsOpen else { return }
+        name.withCString { kintsuki_project_bookmark_clear(h, $0) }
+    }
+
+    func projectBookmarks() -> [ProjectBookmark] {
+        guard let h = handle, projectIsOpen else { return [] }
+        let cap = kintsuki_project_bookmark_count(h)
+        if cap == 0 { return [] }
+        var buf = [kintsuki_project_bookmark_t](
+            repeating: kintsuki_project_bookmark_t(), count: Int(cap))
+        let n = buf.withUnsafeMutableBufferPointer { p -> UInt32 in
+            kintsuki_project_bookmark_snapshot(h, p.baseAddress, UInt32(p.count))
+        }
+        return (0..<Int(n)).map { i in
+            let r = buf[i]
+            return ProjectBookmark(
+                name: r.name.map { String(cString: $0) } ?? "",
+                addr: r.addr,
+                view: r.view.map { String(cString: $0) } ?? "",
+                comment: r.comment.map { String(cString: $0) } ?? "")
+        }
+    }
+
+    // ---- Project: breakpoint persistence (slice 4) ---------------------
+
+    /// Rewrite the project's BP records from the live ``breakpoints``
+    /// list. Cheap (clear + walk). Called on every add/remove while a
+    /// project is open so close→reopen survives the entire BP set.
+    fileprivate func projectSyncBreakpoints() {
+        guard let h = handle, projectIsOpen else { return }
+        kintsuki_project_bp_clear(h)
+        for bp in breakpoints {
+            _ = kintsuki_project_bp_add(
+                h, UInt8(bp.kind.rawValue),
+                bp.lo, bp.hi,
+                bp.halt ? 1 : 0, /*enabled=*/1,
+                nil)
+        }
+    }
+
+    /// Walk the open project's BP records and install a live callback
+    /// for each enabled entry. Called once from `projectOpen` so users
+    /// land on a session with their previous BPs already armed.
+    fileprivate func projectReinstallBreakpoints() {
+        guard let h = handle, projectIsOpen else { return }
+        let n = kintsuki_project_bp_count(h)
+        if n == 0 { return }
+        var buf = [kintsuki_project_bp_t](
+            repeating: kintsuki_project_bp_t(), count: Int(n))
+        let written = buf.withUnsafeMutableBufferPointer { p -> UInt32 in
+            kintsuki_project_bp_snapshot(h, p.baseAddress, UInt32(p.count))
+        }
+        for i in 0..<Int(written) {
+            let r = buf[i]
+            if r.enabled == 0 { continue }
+            // Skip dup-installs: if a session-local BP already covers
+            // the same range + kind, leave it alone.
+            let already = breakpoints.contains { b in
+                b.kind.rawValue == Int(r.kind)
+                && b.lo == r.addr_lo && b.hi == r.addr_hi
+                && b.halt == (r.halt != 0)
+            }
+            if already { continue }
+            guard let kind = BreakKind(rawValue: Int(r.kind)) else { continue }
+            addBreakpoint(kind: kind, lo: r.addr_lo, hi: r.addr_hi,
+                          halt: r.halt != 0)
+        }
     }
 
     /// Bulk-dump map.bin into a Data buffer. Empty when no project open.
@@ -1784,6 +1953,7 @@ final class Emulator {
             h, Int32(kind.rawValue), lo, hi, halt ? 1 : 0,
             Self.breakCallback, opaque))
         breakpoints.append(bp)
+        projectSyncBreakpoints()
     }
 
     func removeBreakpoint(_ bp: Breakpoint) {
@@ -1793,6 +1963,7 @@ final class Emulator {
         silentHits.removeValue(forKey: bp.id)
         silentLastHit.removeValue(forKey: bp.id)
         breakpoints.removeAll { $0.id == bp.id }
+        projectSyncBreakpoints()
     }
 
     // ----- Framebuffer ------------------------------------------------------
@@ -1914,10 +2085,27 @@ final class Emulator {
 
     /// Exact-address label lookup. Cheaper than `containingLabel` when
     /// the caller wants to know "is this PC the start of a routine?".
+    /// Project overlay wins over .adbg — renaming in the labels panel
+    /// shadows the source-of-truth symbol.
     func exactLabel(at pc: UInt32) -> String? {
+        if projectIsOpen,
+           let lbl = projectLabelGet(addr: pc),
+           !lbl.name.isEmpty {
+            return lbl.name
+        }
         guard let h = handle else { return nil }
         guard let p = kintsuki_lookup_label(h, pc) else { return nil }
         return String(cString: p)
+    }
+
+    /// Project-overlay label at exactly `pc`, ignoring .adbg. Used by
+    /// the disasm view to badge entry rows with a purple tag distinct
+    /// from the .adbg blue tag.
+    func projectExactLabel(at pc: UInt32) -> String? {
+        guard projectIsOpen,
+              let lbl = projectLabelGet(addr: pc),
+              !lbl.name.isEmpty else { return nil }
+        return lbl.name
     }
 
     /// `.adbg` source-line lookup. Returns `(file, line, column)` when

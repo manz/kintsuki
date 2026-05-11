@@ -444,6 +444,24 @@ struct DebuggerView: View {
                         (line.pc >> 16) & 0xFF, line.pc & 0xFFFF))
                 .foregroundStyle(.secondary)
                 .frame(width: 80, alignment: .leading)
+            // Entry-label badge. Project overlay (purple) wins over
+            // .adbg (blue). Helps the disasm read as IDA-style "Name:"
+            // separators without breaking the row-per-instruction layout.
+            if let projName = emulator.projectExactLabel(at: line.pc) {
+                Text(projName)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(Color.purple)
+                    .padding(.horizontal, 4).padding(.vertical, 0)
+                    .background(Color.purple.opacity(0.12), in: Capsule())
+                    .padding(.trailing, 6)
+            } else if let adbgName = emulator.exactLabel(at: line.pc) {
+                Text(adbgName)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.blue)
+                    .padding(.horizontal, 4).padding(.vertical, 0)
+                    .background(Color.blue.opacity(0.10), in: Capsule())
+                    .padding(.trailing, 6)
+            }
             // Disassembly
             Text(line.text)
                 .lineLimit(1)

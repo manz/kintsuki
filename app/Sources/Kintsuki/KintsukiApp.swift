@@ -62,6 +62,14 @@ struct KintsukiApp: App {
         Window("HDMA Inspector", id: "hdma") {
             HDMAInspectorView(emulator: emulator)
         }
+
+        Window("Project Labels", id: "labels") {
+            ProjectLabelsView(emulator: emulator)
+        }
+
+        Window("Project Bookmarks", id: "bookmarks") {
+            ProjectBookmarksView(emulator: emulator)
+        }
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Open ROM…") {
@@ -121,6 +129,10 @@ struct KintsukiApp: App {
                     .keyboardShortcut("h", modifiers: [.command, .shift])
                 Button("Debugger") { toggleToolWindow("debugger") }
                     .keyboardShortcut("d", modifiers: [.command, .shift])
+                Button("Project Labels") { toggleToolWindow("labels") }
+                    .keyboardShortcut("l", modifiers: [.command, .shift])
+                Button("Project Bookmarks") { toggleToolWindow("bookmarks") }
+                    .keyboardShortcut("b", modifiers: [.command, .shift])
             }
             CommandMenu("Project") {
                 if emulator.projectIsOpen, let dir = emulator.projectDir {
