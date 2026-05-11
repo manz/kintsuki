@@ -18,6 +18,82 @@ final class Emulator {
     private(set) var cpuState = CpuState()
     private(set) var breakpoints: [Breakpoint] = []
 
+    // ---- Project file (kintsuki project, slices 1-5) -------------------
+    /// True while a `.kintsuki/` directory is attached to the loaded ROM.
+    private(set) var projectIsOpen: Bool = false
+    /// Filesystem location of the open project, or nil when none.
+    private(set) var projectDir: URL?
+    /// Last-snapshot summary counters; refreshed by ``projectRefreshStats``
+    /// and after every project_* mutation.
+    private(set) var projectStats: ProjectStats? = nil
+    /// Cached `map.bin` byte array. Pulled on demand by viewers via
+    /// ``projectMapDump()``; the viewer keeps its own copy. Empty when
+    /// no project is open.
+
+    struct ProjectStats: Equatable {
+        var total: UInt32 = 0
+        var classified: UInt32 = 0
+        var code: UInt32 = 0
+        var data: UInt32 = 0
+        var userSticky: UInt32 = 0
+        /// classified / total as a percentage in [0, 100].
+        var pctClassified: Double {
+            total == 0 ? 0 : Double(classified) * 100 / Double(total)
+        }
+    }
+
+    /// Byte-class enum mirroring `KINTSUKI_BYTE_*`. Swift-side so views
+    /// can switch over it without dragging the C constants in directly.
+    enum ByteClass: UInt8 {
+        case unknown  = 0
+        case code     = 1
+        case data     = 2
+        case pointer  = 3
+        case string   = 4
+        case graphics = 5
+        case tilemap  = 6
+        case palette  = 7
+        case audio    = 8
+
+        /// Conventional colour for inspector overlays. Tuned to read at
+        /// 12pt cell-fill alpha (~0.3) against the system table bg.
+        var overlayColor: NSColor {
+            switch self {
+            case .unknown:  return .clear
+            case .code:     return NSColor.systemBlue
+            case .data:     return NSColor.systemOrange
+            case .pointer:  return NSColor.systemTeal
+            case .string:   return NSColor.systemGreen
+            case .graphics: return NSColor.systemPurple
+            case .tilemap:  return NSColor.systemPink
+            case .palette:  return NSColor.systemYellow
+            case .audio:    return NSColor.systemBrown
+            }
+        }
+        /// Short label for the right-click "Mark as…" menu + status pill.
+        var label: String {
+            switch self {
+            case .unknown:  return "Unknown"
+            case .code:     return "Code"
+            case .data:     return "Data"
+            case .pointer:  return "Pointer"
+            case .string:   return "String"
+            case .graphics: return "Graphics"
+            case .tilemap:  return "Tilemap"
+            case .palette:  return "Palette"
+            case .audio:    return "Audio"
+            }
+        }
+        static let allUserMarkable: [ByteClass] = [
+            .code, .data, .pointer, .string, .graphics, .tilemap,
+            .palette, .audio, .unknown,
+        ]
+    }
+    /// Bit 7 of a `map.bin` byte. Set ⇒ the entry was hand-marked by
+    /// the user and survives auto-reclassification.
+    static let projectUserStickyBit: UInt8 = 0x80
+    static let projectClassMask: UInt8 = 0x7F
+
     /// Set by ContentView once SwiftData's ModelContext is available.
     /// Use `setModelContext(_:)` rather than assigning directly — it
     /// pumps any auto-load that fired before the context was ready.
@@ -146,6 +222,10 @@ final class Emulator {
         let vramAddr: UInt16
         let hits: UInt32
         let lastFrame: UInt64
+        /// Caller PC at the moment the DMA fired (top of shadow callstack,
+        /// or live PC when none). Lets viewers answer "who pushed this
+        /// buffer?" without spinning the tracer.
+        let callerPc: UInt32     // 24-bit
         var id: UInt64 {
             (UInt64(srcAddr) << 32) | (UInt64(vramAddr) << 16) | UInt64(size)
         }
@@ -200,7 +280,8 @@ final class Emulator {
                                    dstReg: e.dst_reg,
                                    vramAddr: e.vram_addr,
                                    hits: e.hits,
-                                   lastFrame: e.last_frame))
+                                   lastFrame: e.last_frame,
+                                   callerPc: e.caller_pc))
         }
         return out
     }
@@ -473,6 +554,140 @@ final class Emulator {
                   + "(tried .sfc.adbg, .adbg, .ips.adbg)")
         }
         startRunLoop()
+        // Auto-attach a sibling `.kintsuki/` directory if one exists.
+        // Matches the .adbg auto-load above: power-users mark their work
+        // up alongside the ROM and expect the project to follow on next
+        // launch without manual fuss.
+        let projectGuess = url.deletingPathExtension().appendingPathExtension("kintsuki")
+        if FileManager.default.fileExists(atPath: projectGuess.path) {
+            projectOpen(at: projectGuess)
+        } else {
+            projectIsOpen = false
+            projectDir = nil
+            projectStats = nil
+        }
+    }
+
+    // ---- Project lifecycle --------------------------------------------
+
+    /// Attach (or create) a `.kintsuki/` project directory next to the
+    /// loaded ROM. The directory will be created on first open. Refreshes
+    /// stats on success. Logs + returns silently on failure (typically:
+    /// no ROM loaded, directory unwritable).
+    func projectOpen(at dir: URL) {
+        guard let h = handle else { return }
+        let ok = dir.path.withCString { kintsuki_project_open(h, $0) }
+        guard ok != 0 else {
+            NSLog("kintsuki: project open failed for \(dir.path)")
+            return
+        }
+        projectIsOpen = true
+        projectDir = dir
+        projectRefreshStats()
+        NSLog("kintsuki: project attached at \(dir.path)")
+    }
+
+    /// Create a fresh project directory next to the loaded ROM and
+    /// attach. No-op when no ROM is loaded.
+    func projectCreateForLoadedROM() {
+        guard let rom = loadedROM else { return }
+        let dir = rom.deletingPathExtension().appendingPathExtension("kintsuki")
+        projectOpen(at: dir)
+    }
+
+    /// Detach the current project without explicit save (autosave runs
+    /// every N frames via `kintsuki_run_frames` already).
+    func projectClose() {
+        guard let h = handle else { return }
+        kintsuki_project_close(h)
+        projectIsOpen = false
+        projectDir = nil
+        projectStats = nil
+    }
+
+    /// Force a flush. Cheap when nothing is dirty.
+    @discardableResult
+    func projectSave() -> Bool {
+        guard let h = handle else { return false }
+        let ok = kintsuki_project_save(h)
+        return ok != 0
+    }
+
+    /// Get/set the autosave interval in emulator-frames. 0 disables.
+    func projectAutosave(_ frames: UInt32? = nil) -> UInt32 {
+        guard let h = handle else { return 0 }
+        if let f = frames {
+            kintsuki_project_set_autosave(h, f)
+        }
+        return kintsuki_project_get_autosave(h)
+    }
+
+    /// Pull the latest counters into ``projectStats``. Cheap (single
+    /// FFI call). Call after any mutation that should bump the UI.
+    func projectRefreshStats() {
+        guard let h = handle, projectIsOpen else {
+            projectStats = nil
+            return
+        }
+        var raw = kintsuki_project_stats_t()
+        if kintsuki_project_stats(h, &raw) != 0 {
+            projectStats = ProjectStats(total: raw.total,
+                                        classified: raw.classified,
+                                        code: raw.code,
+                                        data: raw.data,
+                                        userSticky: raw.user_sticky)
+        }
+    }
+
+    /// Single-byte classify lookup at a ROM offset. Returns nil when no
+    /// project is open or offset is out of range. The high bit is the
+    /// user-sticky flag; viewers strip it via ``projectClassMask``.
+    func projectClassify(romOffset: UInt32) -> UInt8 {
+        guard let h = handle, projectIsOpen else { return 0 }
+        return kintsuki_project_classify(h, romOffset)
+    }
+
+    /// Map a 24-bit CPU bus address to a ROM offset, or nil if the
+    /// address isn't in ROM (WRAM, SRAM, system regs, ...).
+    func projectBusToRom(_ busAddr: UInt32) -> UInt32? {
+        guard let h = handle, projectIsOpen else { return nil }
+        var out: UInt32 = 0
+        return kintsuki_project_bus_to_rom(h, busAddr & 0xFFFFFF, &out) != 0
+            ? out : nil
+    }
+
+    /// Mark a ROM range. ``userSticky`` protects the mark from auto-
+    /// reclassification.
+    func projectMark(romOffset: UInt32, length: UInt32,
+                     cls: ByteClass, userSticky: Bool = true) {
+        guard let h = handle, projectIsOpen else { return }
+        _ = kintsuki_project_mark(h, romOffset, length,
+                                  kintsuki_byte_class_t(UInt32(cls.rawValue)),
+                                  userSticky ? 1 : 0)
+        projectRefreshStats()
+    }
+
+    /// Resolve a 24-bit PC to "(label, bytes-into-routine)" using the
+    /// loaded `.adbg`. Nil when no label precedes the address. The
+    /// label name borrows from .adbg-owned storage; safe to copy out.
+    func lookupLabelContaining(addr: UInt32) -> (String, UInt32)? {
+        guard let h = handle else { return nil }
+        var off: UInt32 = 0
+        guard let p = kintsuki_lookup_label_containing(h, addr & 0xFFFFFF, &off) else {
+            return nil
+        }
+        return (String(cString: p), off)
+    }
+
+    /// Bulk-dump map.bin into a Data buffer. Empty when no project open.
+    func projectMapDump() -> Data {
+        guard let h = handle, projectIsOpen,
+              let total = projectStats?.total, total > 0 else { return Data() }
+        var buf = [UInt8](repeating: 0, count: Int(total))
+        let written = buf.withUnsafeMutableBufferPointer { p -> UInt32 in
+            kintsuki_project_map_dump(h, p.baseAddress, UInt32(p.count))
+        }
+        return Data(buf.prefix(Int(written)))
     }
 
     func clearRecents() {

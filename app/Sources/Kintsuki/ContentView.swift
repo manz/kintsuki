@@ -1,10 +1,13 @@
 import SwiftUI
 import SwiftData
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @Environment(Emulator.self) var emulator
     @Environment(\.modelContext) private var modelContext
     @Binding var showStateBrowser: Bool
+
+    private static let romExtensions: Set<String> = ["sfc", "smc"]
 
     var body: some View {
         HStack(spacing: 0) {
@@ -49,6 +52,20 @@ struct ContentView: View {
                                         .padding(.horizontal, 6).padding(.vertical, 2)
                                         .background(.black.opacity(0.4), in: Capsule())
                                 }
+                                if emulator.projectIsOpen,
+                                   let s = emulator.projectStats,
+                                   let dir = emulator.projectDir {
+                                    Text(String(format: "%@ · %.0f%%",
+                                                dir.deletingPathExtension().lastPathComponent,
+                                                s.pctClassified))
+                                        .font(.system(.caption, design: .monospaced))
+                                        .foregroundStyle(.white)
+                                        .padding(.horizontal, 6).padding(.vertical, 2)
+                                        .background(Color.purple.opacity(0.55), in: Capsule())
+                                        .help("Kintsuki project attached. "
+                                              + "\(s.classified)/\(s.total) bytes classified, "
+                                              + "\(s.userSticky) user-marked.")
+                                }
                             }
                             .padding(8)
                         }
@@ -58,6 +75,24 @@ struct ContentView: View {
             }
         }
         .onAppear { emulator.setModelContext(modelContext) }
+        .onOpenURL { url in
+            // Finder "Open With" / `open -a Kintsuki rom.sfc` lands here
+            // via NSApplication's openURLs after CFBundleDocumentTypes
+            // claims .sfc/.smc.
+            if Self.romExtensions.contains(url.pathExtension.lowercased()) {
+                emulator.loadROM(url)
+            }
+        }
+        .onDrop(of: [.fileURL], isTargeted: nil) { providers in
+            guard let provider = providers.first else { return false }
+            _ = provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url, Self.romExtensions.contains(url.pathExtension.lowercased()) else {
+                    return
+                }
+                DispatchQueue.main.async { emulator.loadROM(url) }
+            }
+            return true
+        }
         .sheet(isPresented: $showStateBrowser) {
             if let url = emulator.loadedROM {
                 SaveStateBrowserView(romPath: url.path)
