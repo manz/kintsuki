@@ -263,18 +263,12 @@ struct VRAMViewerView: View {
                         .buttonStyle(.plain)
                         Spacer(minLength: 4)
                         // Caller PC (slice 3 / UI slice 6): jump to the
-                        // routine that pushed this buffer. Drops the
-                        // user one click away from the call site in the
-                        // memory viewer (and in a future disasm view).
+                        // routine that pushed this buffer. Lands in the
+                        // Debugger — DMA callers are always code, the
+                        // disasm view is the natural surface.
                         Button {
-                            let region: Emulator.MemRegion =
-                                (0x7E0000...0x7FFFFF).contains(x.callerPc)
-                                    ? .wram : .rom
-                            let off = region == .wram
-                                ? Int(x.callerPc & 0x1FFFF)
-                                : romOffsetFor(busAddr: x.callerPc)
-                            emulator.requestMemoryView(region: region, offset: off)
-                            openWindow(id: "memory")
+                            emulator.requestDisasmView(pc: x.callerPc)
+                            openWindow(id: "debugger")
                         } label: {
                             HStack(spacing: 2) {
                                 Image(systemName: "arrow.uturn.left")
