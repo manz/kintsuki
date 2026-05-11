@@ -384,6 +384,80 @@ class Emu:
     def dma_log_clear(self) -> None:
         _native.lib.kintsuki_dma_log_clear(self._handle)
 
+    # ----------------------------------------------------------------- Project
+    def project_open(self, dir: str | os.PathLike[str]) -> None:
+        """Attach a kintsuki project to the currently-loaded ROM. ``dir``
+        is the ``.kintsuki/`` directory next to the ROM — created on first
+        open. While attached, every executed PC marks its byte as Code in
+        ``map.bin``, and every DMA fire marks its source range by destination
+        class (Graphics/Palette/...). Slice 1: map.bin only — labels,
+        bookmarks, notes come in later slices.
+
+        Raises ``RuntimeError`` if no ROM is loaded or the directory cannot
+        be created."""
+        encoded = os.fsencode(dir)
+        if not _native.lib.kintsuki_project_open(self._handle, encoded):
+            raise RuntimeError(f"failed to open project: {os.fspath(dir)}")
+
+    def project_close(self) -> None:
+        """Detach project without saving. No-op when none open."""
+        _native.lib.kintsuki_project_close(self._handle)
+
+    def project_save(self) -> bool:
+        """Flush dirty state (map.bin, project.toml, manifest.bml) to disk.
+        Returns False if no project is open."""
+        return bool(_native.lib.kintsuki_project_save(self._handle))
+
+    def project_is_open(self) -> bool:
+        return bool(_native.lib.kintsuki_project_is_open(self._handle))
+
+    def project_classify(self, rom_offset: int) -> int:
+        """Return the raw byte stored at ``rom_offset`` in ``map.bin``:
+        the low 7 bits are the byte class (see ``BYTE_*`` constants),
+        bit 7 is the user-sticky flag. 0 if no project open or offset
+        out of range."""
+        return int(_native.lib.kintsuki_project_classify(self._handle, rom_offset))
+
+    def project_bus_to_rom(self, bus_addr: int) -> int | None:
+        """Convert a 24-bit CPU bus address to a ROM offset using the
+        active cart mapper. Returns ``None`` for non-ROM addresses."""
+        out = ctypes.c_uint32(0)
+        ok = _native.lib.kintsuki_project_bus_to_rom(
+            self._handle, bus_addr & 0xFFFFFF, ctypes.byref(out))
+        return int(out.value) if ok else None
+
+    def project_mark(self, rom_offset: int, length: int,
+                     cls: int, *, user_sticky: bool = False) -> int:
+        """Mark ``length`` bytes starting at ``rom_offset`` with class
+        ``cls`` (use ``_native.BYTE_CODE`` etc.). When ``user_sticky``
+        is True, the mark is protected from auto-reclassification."""
+        return int(_native.lib.kintsuki_project_mark(
+            self._handle, rom_offset, length, cls, 1 if user_sticky else 0))
+
+    def project_map_dump(self) -> bytes:
+        """Bulk snapshot of ``map.bin``. Returns the full byte array
+        (one byte per ROM byte, class | sticky bit)."""
+        stats = self.project_stats()
+        if stats is None or stats["total"] == 0:
+            return b""
+        n = stats["total"]
+        buf = (ctypes.c_uint8 * n)()
+        written = _native.lib.kintsuki_project_map_dump(self._handle, buf, n)
+        return bytes(buf[:written])
+
+    def project_stats(self) -> dict | None:
+        """Summary counters for the open project, or ``None`` if none open."""
+        s = _native.ProjectStats()
+        if not _native.lib.kintsuki_project_stats(self._handle, ctypes.byref(s)):
+            return None
+        return {
+            "total":       int(s.total),
+            "classified":  int(s.classified),
+            "code":        int(s.code),
+            "data":        int(s.data),
+            "user_sticky": int(s.user_sticky),
+        }
+
     # -------------------------------------------------------------- Run/step
     def run_frames(self, n: int) -> None:
         _native.lib.kintsuki_run_frames(self._handle, n)

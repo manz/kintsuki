@@ -348,6 +348,87 @@ void     kintsuki_dma_log_clear(kintsuki_t*);
 // written (min of `cap` and the internal scanline buffer size, 320).
 uint32_t kintsuki_hdma_scanline_mask(kintsuki_t*, uint8_t* out, uint32_t cap);
 
+// ---- Project file -------------------------------------------------------
+// Persistent reversing state attached to the currently-loaded ROM. The
+// project lives in a `.kintsuki/` directory next to the ROM. Slice 1 ships
+// the byte-classification map (`map.bin`); labels/bookmarks/notes are
+// reserved slots filled by later slices.
+//
+// Lifecycle: call `project_open` after `load_rom`. The project handle is
+// owned by the kintsuki_t instance and torn down on `destroy` or on the
+// next `project_open`/`project_close`. ROM size + sha256 must match what
+// was recorded on first creation, otherwise open fails.
+//
+// While a project is open the emulator auto-populates `map.bin`:
+//   - every executed PC marks its bytes as KINTSUKI_BYTE_CODE,
+//   - every DMA fire marks its source range based on the destination PPU
+//     register ($2118/9 -> GRAPHICS, $2122 -> PALETTE, etc.),
+// unless the bytes are already user-sticky.
+//
+// Saves are explicit — call `project_save` before quitting. No autosave.
+
+typedef enum {
+  KINTSUKI_BYTE_UNKNOWN  = 0,
+  KINTSUKI_BYTE_CODE     = 1,
+  KINTSUKI_BYTE_DATA     = 2,
+  KINTSUKI_BYTE_POINTER  = 3,
+  KINTSUKI_BYTE_STRING   = 4,
+  KINTSUKI_BYTE_GRAPHICS = 5,
+  KINTSUKI_BYTE_TILEMAP  = 6,
+  KINTSUKI_BYTE_PALETTE  = 7,
+  KINTSUKI_BYTE_AUDIO    = 8,
+} kintsuki_byte_class_t;
+
+// User-sticky flag: OR'd into the byte stored in map.bin to mark a class as
+// user-set, protecting it from auto-reclassification. Mask off when reading
+// the base class.
+#define KINTSUKI_BYTE_USER_STICKY 0x80
+#define KINTSUKI_BYTE_CLASS_MASK  0x7F
+
+// Returns 1 on success, 0 on failure (no ROM loaded, dir unwritable, sha
+// mismatch on reload). On first open the directory is created.
+int  kintsuki_project_open (kintsuki_t*, const char* dir);
+// Closes without saving. Safe to call when no project is open.
+void kintsuki_project_close(kintsuki_t*);
+// Persist dirty state to disk. Returns 1 on success.
+int  kintsuki_project_save (kintsuki_t*);
+// 1 if a project is currently open.
+int  kintsuki_project_is_open(kintsuki_t*);
+
+// Single-byte classify at a ROM offset (NOT a bus address — caller is
+// expected to have run `kintsuki_project_bus_to_rom` first when starting
+// from a CPU bus address). Returns the raw byte value (class | sticky).
+// 0 if no project open or offset out of range.
+uint8_t kintsuki_project_classify(kintsuki_t*, uint32_t rom_offset);
+
+// Convert a CPU bus 24-bit address to a ROM offset using the active
+// cartridge mapper. Returns 1 + fills `out_offset` on hit, 0 if the
+// address is not in ROM. Used by viewers that work in bus addresses.
+int  kintsuki_project_bus_to_rom(kintsuki_t*, uint32_t bus_addr, uint32_t* out_offset);
+
+// Mark a ROM range. `user_sticky` non-zero sets the sticky bit so auto-
+// reclassification will not overwrite. Passing `cls == UNKNOWN` with
+// `user_sticky=1` clears any existing classification + clears the sticky
+// flag (use this to "un-mark" a region). Returns bytes actually written
+// (clamped to map.bin size).
+uint32_t kintsuki_project_mark(kintsuki_t*, uint32_t rom_offset, uint32_t len,
+                               kintsuki_byte_class_t cls, int user_sticky);
+
+// Bulk dump of map.bin to caller buffer. Returns bytes written (min of
+// `cap` and ROM size). 0 if no project open.
+uint32_t kintsuki_project_map_dump(kintsuki_t*, uint8_t* out, uint32_t cap);
+
+// Summary counters for inspector header.
+typedef struct {
+  uint32_t total;       // ROM size in bytes
+  uint32_t classified;  // bytes with class != UNKNOWN
+  uint32_t code;
+  uint32_t data;
+  uint32_t user_sticky; // bytes the user has hand-marked
+} kintsuki_project_stats_t;
+
+int kintsuki_project_stats(kintsuki_t*, kintsuki_project_stats_t* out);
+
 #ifdef __cplusplus
 }
 #endif

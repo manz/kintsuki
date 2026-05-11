@@ -7,6 +7,7 @@
 #include <sfc/sfc.hpp>
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 using namespace nall;
@@ -36,6 +37,25 @@ struct Program : ares::Platform {
 
   // ROM lifecycle
   auto loadRom(const char* path) -> bool;
+
+  // ROM introspection — populated by `loadRom`. Empty / zero / false when
+  // no ROM is loaded.
+  auto romBytes() const -> const uint8_t* { return romData.empty() ? nullptr : romData.data(); }
+  auto romSize()  const -> uint32_t       { return (uint32_t)romData.size(); }
+  // sha256 of the ROM *post copier-header-strip but pre IPS patch*. Used
+  // by the project file to lock a project to a pristine ROM identity even
+  // when the user is running with a patch applied.
+  auto romPristineSha() const -> const std::string& { return romPristineSha256; }
+  // true => HiROM mapper, false => LoROM. ExHiROM not currently supported
+  // by detectRom; falls through to HiROM here.
+  auto romIsHiRom() const -> bool { return romHiRom; }
+  // Full cart manifest in BML form — authoritative bus map, including
+  // coprocessor mappings (SA-1, GSU, SDD-1, ...). Empty when no ROM is
+  // loaded. The project file stores this verbatim so a project can be
+  // reopened against a different binary revision without re-running
+  // detection. Pointer borrows from Program-owned storage; valid until
+  // the next `loadRom`.
+  auto romManifest() const -> const std::string& { return cartManifestStr; }
   auto bootRom() -> bool;
   auto runFrames(u32 n) -> void;
   auto softReset() -> void;
@@ -95,6 +115,9 @@ struct Program : ares::Platform {
 private:
   // ROM image + cart pak built at load_rom().
   std::vector<uint8_t> romData;
+  std::string romPristineSha256;  // hex digest, lowercase
+  bool        romHiRom = false;
+  std::string cartManifestStr;  // std::string mirror of cartManifest for C++ consumers
   string cartManifest;
   std::shared_ptr<vfs::directory> cartPak;
 

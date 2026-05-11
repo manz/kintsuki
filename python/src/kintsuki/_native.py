@@ -293,5 +293,41 @@ _bind("kintsuki_add_callback", c_int, [HANDLE, c_int, c_uint32, c_uint32, CALLBA
 _bind("kintsuki_remove_callback", None, [HANDLE, c_int, c_int])
 
 
+# Project file (slice 1: map.bin classification).
+class ProjectStats(Structure):
+    _fields_ = [
+        ("total",       c_uint32),
+        ("classified",  c_uint32),
+        ("code",        c_uint32),
+        ("data",        c_uint32),
+        ("user_sticky", c_uint32),
+    ]
+
+
+# Byte class constants (must match KINTSUKI_BYTE_* in kintsuki.h).
+BYTE_UNKNOWN  = 0
+BYTE_CODE     = 1
+BYTE_DATA     = 2
+BYTE_POINTER  = 3
+BYTE_STRING   = 4
+BYTE_GRAPHICS = 5
+BYTE_TILEMAP  = 6
+BYTE_PALETTE  = 7
+BYTE_AUDIO    = 8
+BYTE_USER_STICKY = 0x80
+BYTE_CLASS_MASK  = 0x7F
+
+
+_bind("kintsuki_project_open",       c_int,     [HANDLE, c_char_p])
+_bind("kintsuki_project_close",      None,      [HANDLE])
+_bind("kintsuki_project_save",       c_int,     [HANDLE])
+_bind("kintsuki_project_is_open",    c_int,     [HANDLE])
+_bind("kintsuki_project_classify",   c_uint8,   [HANDLE, c_uint32])
+_bind("kintsuki_project_bus_to_rom", c_int,     [HANDLE, c_uint32, POINTER(c_uint32)])
+_bind("kintsuki_project_mark",       c_uint32,  [HANDLE, c_uint32, c_uint32, c_int, c_int])
+_bind("kintsuki_project_map_dump",   c_uint32,  [HANDLE, POINTER(c_uint8), c_uint32])
+_bind("kintsuki_project_stats",      c_int,     [HANDLE, POINTER(ProjectStats)])
+
+
 # Re-exports for convenience.
 lib = _lib

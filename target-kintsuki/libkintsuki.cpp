@@ -7,6 +7,7 @@
 #include "program.hpp"
 #include "kintsuki.h"
 #include "adbg.hpp"
+#include "project.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -36,6 +37,11 @@ namespace {
 constexpr size_t kCallstackCap = 256;
 std::deque<kintsuki_call_frame_t> g_callstack;
 kintsuki::AdbgLabels g_labels;
+// Project file (slice 1): persistent reversing state. Declared up here so
+// kintsuki_destroy (file-order above the body where g_project is used)
+// can reset it. Hooks fire only when non-null — single null-check on the
+// hot path.
+std::unique_ptr<kintsuki::Project> g_project;
 // Last label string emitted by the tracer as a `; --- name ---\n` header.
 // Compared by pointer (AdbgLabels storage owns stable const char*). Reset
 // to nullptr on tracer_start, load_adbg, clear_adbg, destroy.
@@ -96,6 +102,7 @@ void kintsuki_destroy(kintsuki_t* h) {
   g_callstack.clear();
   g_labels.clear();
   g_tracer_last_label = nullptr;
+  g_project.reset();
   delete h;
   g_handle = nullptr;
   kintsukiProgram = nullptr;
@@ -493,6 +500,7 @@ auto cFire(std::vector<CCallback>& list, uint32_t addr, uint8_t value) -> void {
 void tracerOnExec(uint32_t pc);
 
 void cOnExec(uint32_t pc) {
+  if(g_project) g_project->note_exec(pc, 1);
   tracerOnExec(pc);
   if(g_cExecPages[(pc & 0xffffff) >> 8] == 0) return;
   cFire(g_cExec, pc, 0);
@@ -985,6 +993,10 @@ size_t g_dmaLogSize = 0;
 
 void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
                uint32_t src, uint8_t dst, uint16_t size) {
+  // Project-file auto-classification: tag the ROM source range by the
+  // destination PPU register class (graphics/palette/...) — no-op when
+  // no project is open.
+  if(g_project) g_project->note_dma(src, size, dst);
   // Capture VMADDR (word) at the moment the DMA fires — gives the
   // user the actual VRAM destination, not just "we wrote something
   // through VMDATA". Read from the live performance PPU; the
@@ -1219,6 +1231,94 @@ uint32_t kintsuki_disassemble_at_ex(kintsuki_t* h, uint32_t pc, uint32_t count,
     addr = (addr & 0xFF0000) | ((addr + len) & 0xFFFF);
   }
   return produced;
+}
+
+// ---- Project file -------------------------------------------------------
+
+int kintsuki_project_open(kintsuki_t* h, const char* dir) {
+  if(!h || !dir) return 0;
+  if(!h->program) return 0;
+  if(h->program->romSize() == 0) {
+    std::fprintf(stderr, "kintsuki_project_open: no ROM loaded\n");
+    return 0;
+  }
+  g_project.reset();
+  g_project = kintsuki::Project::open(
+    dir,
+    h->program->romPristineSha(),
+    h->program->romSize(),
+    h->program->romManifest(),
+    h->program->romIsHiRom());
+  if(!g_project) return 0;
+  // Ensure execHook is wired so note_exec fires even without user CBs.
+  if(!ares::SuperFamicom::execHook) ares::SuperFamicom::execHook = &cOnExec;
+  return 1;
+}
+
+void kintsuki_project_close(kintsuki_t* h) {
+  (void)h;
+  g_project.reset();
+}
+
+int kintsuki_project_save(kintsuki_t* h) {
+  (void)h;
+  if(!g_project) return 0;
+  return g_project->save() ? 1 : 0;
+}
+
+int kintsuki_project_is_open(kintsuki_t* h) {
+  (void)h;
+  return g_project ? 1 : 0;
+}
+
+uint8_t kintsuki_project_classify(kintsuki_t* h, uint32_t rom_offset) {
+  (void)h;
+  if(!g_project) return 0;
+  auto cls = (uint8_t)g_project->classify(rom_offset);
+  if(g_project->is_user_sticky(rom_offset)) cls |= KINTSUKI_BYTE_USER_STICKY;
+  return cls;
+}
+
+int kintsuki_project_bus_to_rom(kintsuki_t* h, uint32_t bus_addr, uint32_t* out_offset) {
+  (void)h;
+  if(!g_project || !out_offset) return 0;
+  int64_t off = g_project->bus_to_rom_offset(bus_addr);
+  if(off < 0) return 0;
+  *out_offset = (uint32_t)off;
+  return 1;
+}
+
+uint32_t kintsuki_project_mark(kintsuki_t* h, uint32_t rom_offset, uint32_t len,
+                               kintsuki_byte_class_t cls, int user_sticky) {
+  (void)h;
+  if(!g_project || len == 0) return 0;
+  auto kcls = (kintsuki::ByteClass)((uint8_t)cls & 0x7F);
+  if(user_sticky) g_project->mark_user(rom_offset, len, kcls);
+  else            g_project->mark_auto(rom_offset, len, kcls);
+  return len;
+}
+
+uint32_t kintsuki_project_map_dump(kintsuki_t* h, uint8_t* out, uint32_t cap) {
+  if(!h || !out || cap == 0 || !g_project) return 0;
+  uint32_t total = g_project->stats().total;
+  uint32_t n = (cap < total) ? cap : total;
+  for(uint32_t i = 0; i < n; i++) {
+    out[i] = (uint8_t)g_project->classify(i);
+    if(g_project->is_user_sticky(i)) out[i] |= KINTSUKI_BYTE_USER_STICKY;
+  }
+  return n;
+}
+
+int kintsuki_project_stats(kintsuki_t* h, kintsuki_project_stats_t* out) {
+  (void)h;
+  if(!g_project || !out) return 0;
+  auto s = g_project->stats();
+  out->total       = s.total;
+  out->classified  = s.classified;
+  out->code        = s.code;
+  out->data        = s.data;
+  out->user_sticky = s.user_sticky;
+  return 1;
 }
 
 }  // extern "C"
