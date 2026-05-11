@@ -18,6 +18,7 @@ not byte-for-byte coverage (which depends on the exact program path).
 from __future__ import annotations
 
 from kintsuki import Emu
+from kintsuki import _native
 from kintsuki._native import (
     BYTE_CLASS_MASK,
     BYTE_CODE,
@@ -267,6 +268,37 @@ def test_project_bookmarks_and_breakpoints_persist(assemble_rom, tmp_path):
 
         emu.project_bookmark_clear("Reset")
         assert "Reset" not in {b["name"] for b in emu.project_bookmarks()}
+
+
+def test_project_autosave_writes_without_explicit_save(assemble_rom, tmp_path):
+    """Slice 5: autosave (default 60 frames) flushes dirty marks during
+    run_frames without an explicit project_save call."""
+    rom = assemble_rom("test_dma_log.s")
+    project_dir = tmp_path / "p.kintsuki"
+
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        emu.project_open(project_dir)
+        assert emu.project_autosave() == 60  # default
+
+        # Make a manual mark so something is dirty.
+        emu.project_mark(0x1234, 4, _native.BYTE_DATA, user_sticky=True)
+
+        map_path = project_dir / "map.bin"
+        assert not map_path.exists(), "nothing written yet (no run + no save)"
+
+        # Tight interval so the test doesn't have to run 60 frames.
+        emu.project_autosave(2)
+        emu.run_frames(3)
+        assert map_path.exists(), "autosave should have flushed map.bin"
+
+        # Disable + new dirty + run -> file should NOT be re-touched.
+        original_mtime = map_path.stat().st_mtime_ns
+        emu.project_autosave(0)
+        emu.project_mark(0x5678, 4, _native.BYTE_CODE, user_sticky=True)
+        emu.run_frames(5)
+        assert map_path.stat().st_mtime_ns == original_mtime, \
+            "autosave=0 should leave map.bin alone"
 
 
 def test_project_mark_dump_roundtrip(assemble_rom, tmp_path):

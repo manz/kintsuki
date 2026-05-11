@@ -329,6 +329,8 @@ _bind("kintsuki_project_bus_to_rom", c_int,     [HANDLE, c_uint32, POINTER(c_uin
 _bind("kintsuki_project_mark",       c_uint32,  [HANDLE, c_uint32, c_uint32, c_int, c_int])
 _bind("kintsuki_project_map_dump",   c_uint32,  [HANDLE, POINTER(c_uint8), c_uint32])
 _bind("kintsuki_project_stats",      c_int,     [HANDLE, POINTER(ProjectStats)])
+_bind("kintsuki_project_set_autosave", None,    [HANDLE, c_uint32])
+_bind("kintsuki_project_get_autosave", c_uint32, [HANDLE])
 
 
 class ProjectLabel(Structure):

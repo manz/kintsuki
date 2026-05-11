@@ -42,6 +42,15 @@ kintsuki::AdbgLabels g_labels;
 // can reset it. Hooks fire only when non-null — single null-check on the
 // hot path.
 std::unique_ptr<kintsuki::Project> g_project;
+// Autosave (slice 5): when non-zero, kintsuki_run_frames flushes the
+// project to disk every Nth call-frame if anything is dirty. We count
+// frames *requested* (the `n` arg to run_frames), not framesRendered —
+// test ROMs that STP immediately never advance vblank, so a "frames
+// rendered" clock would silently disable autosave for them. 0 disables.
+// Default 60 = ~1s NTSC.
+uint32_t g_projectAutosaveFrames = 60;
+uint64_t g_projectFrameClock     = 0;  // accumulated frames-requested
+uint64_t g_projectLastSaveFrame  = 0;
 // Last label string emitted by the tracer as a `; --- name ---\n` header.
 // Compared by pointer (AdbgLabels storage owns stable const char*). Reset
 // to nullptr on tracer_start, load_adbg, clear_adbg, destroy.
@@ -144,7 +153,20 @@ uint32_t kintsuki_inject_sram(kintsuki_t* h, const uint8_t* data, uint32_t len) 
   return h->program->injectSram(data, len);
 }
 
-void kintsuki_run_frames(kintsuki_t* h, uint32_t n) { if(h) h->program->runFrames(n); }
+void kintsuki_run_frames(kintsuki_t* h, uint32_t n) {
+  if(!h) return;
+  h->program->runFrames(n);
+  // Autosave: debounced flush. Project::save() is a no-op when nothing
+  // is dirty, so the cost when idle is one comparison + one method call
+  // per autosave window. Disable by setting interval to 0.
+  if(g_project && g_projectAutosaveFrames > 0) {
+    g_projectFrameClock += n;
+    if(g_projectFrameClock >= g_projectLastSaveFrame + g_projectAutosaveFrames) {
+      g_project->save();
+      g_projectLastSaveFrame = g_projectFrameClock;
+    }
+  }
+}
 uint64_t kintsuki_frame_count(kintsuki_t* h) { return h ? h->program->framesRendered : 0; }
 
 uint8_t kintsuki_read_u8(kintsuki_t* h, uint32_t addr) { return h ? h->program->memRead(addr) : 0; }
@@ -1274,12 +1296,16 @@ int kintsuki_project_open(kintsuki_t* h, const char* dir) {
   if(!g_project) return 0;
   // Ensure execHook is wired so note_exec fires even without user CBs.
   if(!ares::SuperFamicom::execHook) ares::SuperFamicom::execHook = &cOnExec;
+  g_projectFrameClock    = 0;
+  g_projectLastSaveFrame = 0;
   return 1;
 }
 
 void kintsuki_project_close(kintsuki_t* h) {
   (void)h;
   g_project.reset();
+  g_projectFrameClock    = 0;
+  g_projectLastSaveFrame = 0;
 }
 
 int kintsuki_project_save(kintsuki_t* h) {
@@ -1329,6 +1355,16 @@ uint32_t kintsuki_project_map_dump(kintsuki_t* h, uint8_t* out, uint32_t cap) {
     if(g_project->is_user_sticky(i)) out[i] |= KINTSUKI_BYTE_USER_STICKY;
   }
   return n;
+}
+
+void kintsuki_project_set_autosave(kintsuki_t* h, uint32_t frames) {
+  (void)h;
+  g_projectAutosaveFrames = frames;
+}
+
+uint32_t kintsuki_project_get_autosave(kintsuki_t* h) {
+  (void)h;
+  return g_projectAutosaveFrames;
 }
 
 int kintsuki_project_stats(kintsuki_t* h, kintsuki_project_stats_t* out) {

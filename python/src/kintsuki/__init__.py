@@ -412,6 +412,16 @@ class Emu:
     def project_is_open(self) -> bool:
         return bool(_native.lib.kintsuki_project_is_open(self._handle))
 
+    def project_autosave(self, frames: int | None = None) -> int:
+        """Get/set the autosave interval in emulator frames. ``None``
+        reads the current value; non-None writes. ``0`` disables
+        autosave entirely (rely on explicit ``project_save``). Default
+        60 (~1s NTSC). Cheap when nothing is dirty — the save call is
+        a no-op."""
+        if frames is not None:
+            _native.lib.kintsuki_project_set_autosave(self._handle, int(frames))
+        return int(_native.lib.kintsuki_project_get_autosave(self._handle))
+
     def project_classify(self, rom_offset: int) -> int:
         """Return the raw byte stored at ``rom_offset`` in ``map.bin``:
         the low 7 bits are the byte class (see ``BYTE_*`` constants),

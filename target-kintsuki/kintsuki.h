@@ -434,6 +434,13 @@ typedef struct {
 
 int kintsuki_project_stats(kintsuki_t*, kintsuki_project_stats_t* out);
 
+// Autosave: when non-zero, `kintsuki_run_frames` flushes the project
+// every Nth completed frame if anything is dirty. Saves are debounced
+// (no fsync storm when nothing changed). Default 60 frames (~1s NTSC).
+// Set to 0 to disable and rely on explicit `kintsuki_project_save`.
+void kintsuki_project_set_autosave(kintsuki_t*, uint32_t frames);
+uint32_t kintsuki_project_get_autosave(kintsuki_t*);
+
 // ---- Labels overlay (slice 2) ------------------------------------------
 // Per-address user metadata layered on top of the loaded `.adbg`. Labels
 // here win over .adbg labels at the same address — used for renaming
