@@ -371,5 +371,43 @@ _bind("kintsuki_project_dma_prov_for_range", c_uint32, [HANDLE, c_uint32, c_uint
                                                        POINTER(ProjectDmaProv), c_uint32])
 
 
+class ProjectBookmark(Structure):
+    _fields_ = [
+        ("addr",    c_uint32),
+        ("name",    c_char_p),
+        ("view",    c_char_p),
+        ("comment", c_char_p),
+    ]
+
+
+_bind("kintsuki_project_bookmark_set",      c_int,    [HANDLE, c_char_p, c_uint32, c_char_p, c_char_p])
+_bind("kintsuki_project_bookmark_clear",    None,     [HANDLE, c_char_p])
+_bind("kintsuki_project_bookmark_count",    c_uint32, [HANDLE])
+_bind("kintsuki_project_bookmark_snapshot", c_uint32, [HANDLE, POINTER(ProjectBookmark), c_uint32])
+
+
+class ProjectBp(Structure):
+    _fields_ = [
+        ("kind",    c_uint8),
+        ("halt",    c_uint8),
+        ("enabled", c_uint8),
+        ("_pad",    c_uint8),
+        ("addr_lo", c_uint32),
+        ("addr_hi", c_uint32),
+        ("comment", c_char_p),
+    ]
+
+
+BP_EXEC  = 0
+BP_READ  = 1
+BP_WRITE = 2
+
+_bind("kintsuki_project_bp_add",      c_int,    [HANDLE, c_uint8, c_uint32, c_uint32, c_int, c_int, c_char_p])
+_bind("kintsuki_project_bp_remove",   None,     [HANDLE, c_uint32])
+_bind("kintsuki_project_bp_clear",    None,     [HANDLE])
+_bind("kintsuki_project_bp_count",    c_uint32, [HANDLE])
+_bind("kintsuki_project_bp_snapshot", c_uint32, [HANDLE, POINTER(ProjectBp), c_uint32])
+
+
 # Re-exports for convenience.
 lib = _lib

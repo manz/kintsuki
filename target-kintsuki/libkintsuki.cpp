@@ -1461,4 +1461,103 @@ uint32_t kintsuki_project_dma_prov_for_range(kintsuki_t* h,
   return n;
 }
 
+// ---- Bookmarks ---------------------------------------------------------
+
+int kintsuki_project_bookmark_set(kintsuki_t* h, const char* name, uint32_t addr,
+                                  const char* view, const char* comment) {
+  (void)h;
+  if(!g_project || !name) return 0;
+  kintsuki::Project::Bookmark b{};
+  b.addr    = addr & 0xFFFFFF;
+  b.name    = name;
+  if(view)    b.view    = view;
+  if(comment) b.comment = comment;
+  g_project->set_bookmark(b);
+  return 1;
+}
+
+void kintsuki_project_bookmark_clear(kintsuki_t* h, const char* name) {
+  (void)h;
+  if(!g_project || !name) return;
+  g_project->clear_bookmark(name);
+}
+
+uint32_t kintsuki_project_bookmark_count(kintsuki_t* h) {
+  (void)h;
+  return g_project ? g_project->bookmark_count() : 0;
+}
+
+uint32_t kintsuki_project_bookmark_snapshot(kintsuki_t* h,
+                                            kintsuki_project_bookmark_t* out,
+                                            uint32_t cap) {
+  (void)h;
+  if(!g_project || !out || cap == 0) return 0;
+  uint32_t total = g_project->bookmark_count();
+  uint32_t n = total < cap ? total : cap;
+  for(uint32_t i = 0; i < n; i++) {
+    const auto* b = g_project->bookmark_at(i);
+    if(!b) { n = i; break; }
+    out[i].addr    = b->addr;
+    out[i].name    = b->name.c_str();
+    out[i].view    = b->view.c_str();
+    out[i].comment = b->comment.c_str();
+  }
+  return n;
+}
+
+// ---- Breakpoints -------------------------------------------------------
+
+int kintsuki_project_bp_add(kintsuki_t* h, uint8_t kind,
+                            uint32_t addr_lo, uint32_t addr_hi,
+                            int halt, int enabled, const char* comment) {
+  (void)h;
+  if(!g_project) return 0;
+  kintsuki::Project::Breakpoint bp{};
+  bp.kind    = (kintsuki::Project::BpKind)(kind & 0x3);
+  bp.halt    = halt != 0;
+  bp.enabled = enabled != 0;
+  bp.addr_lo = addr_lo & 0xFFFFFF;
+  bp.addr_hi = addr_hi & 0xFFFFFF;
+  if(comment) bp.comment = comment;
+  g_project->add_breakpoint(bp);
+  return 1;
+}
+
+void kintsuki_project_bp_remove(kintsuki_t* h, uint32_t index) {
+  (void)h;
+  if(!g_project) return;
+  g_project->remove_breakpoint(index);
+}
+
+void kintsuki_project_bp_clear(kintsuki_t* h) {
+  (void)h;
+  if(!g_project) return;
+  g_project->clear_breakpoints();
+}
+
+uint32_t kintsuki_project_bp_count(kintsuki_t* h) {
+  (void)h;
+  return g_project ? g_project->breakpoint_count() : 0;
+}
+
+uint32_t kintsuki_project_bp_snapshot(kintsuki_t* h, kintsuki_project_bp_t* out,
+                                      uint32_t cap) {
+  (void)h;
+  if(!g_project || !out || cap == 0) return 0;
+  uint32_t total = g_project->breakpoint_count();
+  uint32_t n = total < cap ? total : cap;
+  for(uint32_t i = 0; i < n; i++) {
+    const auto* bp = g_project->breakpoint_at(i);
+    if(!bp) { n = i; break; }
+    out[i].kind    = (uint8_t)bp->kind;
+    out[i].halt    = bp->halt ? 1 : 0;
+    out[i].enabled = bp->enabled ? 1 : 0;
+    out[i]._pad    = 0;
+    out[i].addr_lo = bp->addr_lo;
+    out[i].addr_hi = bp->addr_hi;
+    out[i].comment = bp->comment.c_str();
+  }
+  return n;
+}
+
 }  // extern "C"

@@ -534,6 +534,76 @@ class Emu:
             })
         return out
 
+    # ---- Bookmarks ----------------------------------------------------
+    def project_bookmark_set(self, name: str, addr: int,
+                             *, view: str = "", comment: str = "") -> None:
+        ok = _native.lib.kintsuki_project_bookmark_set(
+            self._handle, name.encode("utf-8"), addr & 0xFFFFFF,
+            view.encode("utf-8") if view else b"",
+            comment.encode("utf-8") if comment else b"")
+        if not ok:
+            raise RuntimeError("no project open")
+
+    def project_bookmark_clear(self, name: str) -> None:
+        _native.lib.kintsuki_project_bookmark_clear(self._handle, name.encode("utf-8"))
+
+    def project_bookmarks(self) -> list[dict]:
+        n = int(_native.lib.kintsuki_project_bookmark_count(self._handle))
+        if n == 0:
+            return []
+        buf = (_native.ProjectBookmark * n)()
+        written = int(_native.lib.kintsuki_project_bookmark_snapshot(self._handle, buf, n))
+        out: list[dict] = []
+        for i in range(written):
+            b = buf[i]
+            out.append({
+                "name":    b.name.decode("utf-8") if b.name else "",
+                "addr":    int(b.addr),
+                "view":    b.view.decode("utf-8") if b.view else "",
+                "comment": b.comment.decode("utf-8") if b.comment else "",
+            })
+        return out
+
+    # ---- Breakpoints --------------------------------------------------
+    def project_bp_add(self, kind: int, addr_lo: int, addr_hi: int,
+                       *, halt: bool = True, enabled: bool = True,
+                       comment: str = "") -> None:
+        """Persist a BP record. Does NOT install a live callback —
+        frontends walk ``project_breakpoints()`` on attach and call
+        ``add_callback(..., halt=...)`` for each enabled entry."""
+        ok = _native.lib.kintsuki_project_bp_add(
+            self._handle, int(kind),
+            addr_lo & 0xFFFFFF, addr_hi & 0xFFFFFF,
+            1 if halt else 0, 1 if enabled else 0,
+            comment.encode("utf-8") if comment else b"")
+        if not ok:
+            raise RuntimeError("no project open")
+
+    def project_bp_remove(self, index: int) -> None:
+        _native.lib.kintsuki_project_bp_remove(self._handle, int(index))
+
+    def project_bp_clear(self) -> None:
+        _native.lib.kintsuki_project_bp_clear(self._handle)
+
+    def project_breakpoints(self) -> list[dict]:
+        n = int(_native.lib.kintsuki_project_bp_count(self._handle))
+        if n == 0:
+            return []
+        buf = (_native.ProjectBp * n)()
+        written = int(_native.lib.kintsuki_project_bp_snapshot(self._handle, buf, n))
+        out: list[dict] = []
+        for i in range(written):
+            bp = buf[i]
+            out.append({
+                "kind":    int(bp.kind),
+                "halt":    bool(bp.halt),
+                "enabled": bool(bp.enabled),
+                "addr_lo": int(bp.addr_lo),
+                "addr_hi": int(bp.addr_hi),
+                "comment": bp.comment.decode("utf-8") if bp.comment else "",
+            })
+        return out
+
     def project_labels(self) -> list[dict]:
         """All overlay labels, address-ascending. Empty list when no
         project is open."""

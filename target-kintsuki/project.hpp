@@ -150,6 +150,41 @@ public:
   // and is valid until the next mutation (set_label/clear_label/close).
   const Label* label_at(uint32_t index) const;
 
+  // ---- Bookmarks (slice 4) ---------------------------------------------
+  // Named view targets. `view` is a free-form short string: "rom",
+  // "wram", "vram", "cgram", "oam", or anything the frontend defines.
+  struct Bookmark {
+    uint32_t    addr;    // 24-bit (or 16-bit if view is wram/vram/etc.)
+    std::string name;
+    std::string view;
+    std::string comment;
+  };
+  void set_bookmark(const Bookmark& b);        // upsert by name
+  void clear_bookmark(const std::string& name);
+  const Bookmark* get_bookmark(const std::string& name) const;
+  uint32_t bookmark_count() const;
+  const Bookmark* bookmark_at(uint32_t index) const;  // index in insertion order
+
+  // ---- Breakpoints (slice 4) -------------------------------------------
+  // Persistent BPs. Auto-install is the frontend's job — the project
+  // only stores records (frontends call kintsuki_add_callback_ex with
+  // each entry on attach). Saving is dirty-tracked separately so the
+  // file is only rewritten when records change.
+  enum class BpKind : uint8_t { Exec = 0, Read = 1, Write = 2 };
+  struct Breakpoint {
+    BpKind      kind;
+    bool        halt;
+    bool        enabled;
+    uint32_t    addr_lo;   // 24-bit, inclusive
+    uint32_t    addr_hi;   // 24-bit, inclusive
+    std::string comment;
+  };
+  void add_breakpoint(const Breakpoint& bp);
+  void remove_breakpoint(uint32_t index);
+  void clear_breakpoints();
+  uint32_t breakpoint_count() const;
+  const Breakpoint* breakpoint_at(uint32_t index) const;
+
   // Record live processor flags at a code entry point. Called from the
   // shadow-callstack JSR/JSL hook so cold-cache disasm at any reached
   // function knows the caller's M/X/E. Skipped silently when no project

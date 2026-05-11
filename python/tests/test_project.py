@@ -211,6 +211,64 @@ def test_project_dma_provenance_roundtrip(assemble_rom, tmp_path):
         assert len(emu.project_dma_provenance()) == len(prov_all)
 
 
+def test_project_bookmarks_and_breakpoints_persist(assemble_rom, tmp_path):
+    """Slice 4: bookmarks + breakpoints round-trip through disk."""
+    from kintsuki._native import BP_EXEC, BP_READ
+
+    rom = assemble_rom("test_dma_log.s")
+    project_dir = tmp_path / "p.kintsuki"
+
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        emu.project_open(project_dir)
+
+        emu.project_bookmark_set("Reset", 0x00FFFC, view="rom",
+                                 comment="cold boot vector")
+        emu.project_bookmark_set("Player", 0x7E0100, view="wram",
+                                 comment="player struct")
+        # Upsert: same name overwrites.
+        emu.project_bookmark_set("Player", 0x7E0200, view="wram")
+
+        emu.project_bp_add(BP_EXEC, 0x008000, 0x008000,
+                           halt=True, comment="reset trap")
+        emu.project_bp_add(BP_READ, 0x7E0100, 0x7E01FF, halt=False)
+
+        emu.project_save()
+        emu.project_close()
+
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        emu.project_open(project_dir)
+
+        bms = emu.project_bookmarks()
+        names = {b["name"]: b for b in bms}
+        assert "Reset"  in names and "Player" in names
+        assert names["Reset"]["addr"]  == 0x00FFFC
+        assert names["Player"]["addr"] == 0x7E0200  # upsert took
+        assert names["Player"]["view"] == "wram"
+
+        bps = emu.project_breakpoints()
+        assert len(bps) == 2
+        assert bps[0]["kind"] == BP_EXEC
+        assert bps[0]["halt"] is True
+        assert bps[0]["comment"] == "reset trap"
+        assert bps[1]["kind"] == BP_READ
+        assert bps[1]["addr_hi"] == 0x7E01FF
+        assert bps[1]["halt"] is False
+
+        assert (project_dir / "bookmarks.tsv").exists()
+        assert (project_dir / "breakpoints.tsv").exists()
+
+        # Remove by index, clear all.
+        emu.project_bp_remove(0)
+        assert len(emu.project_breakpoints()) == 1
+        emu.project_bp_clear()
+        assert emu.project_breakpoints() == []
+
+        emu.project_bookmark_clear("Reset")
+        assert "Reset" not in {b["name"] for b in emu.project_bookmarks()}
+
+
 def test_project_mark_dump_roundtrip(assemble_rom, tmp_path):
     rom = assemble_rom("test_dma_log.s")
     with Emu() as emu:

@@ -149,6 +149,11 @@ struct Project::Impl {
   std::map<uint32_t, Project::Label> labels;  // sorted by addr
   std::vector<Project::DmaProv> dma_prov;     // append-only, deduped
   bool dma_prov_dirty = false;
+  // Bookmarks: ordered by insertion, indexed by name for upsert.
+  std::vector<Project::Bookmark> bookmarks;
+  bool bookmarks_dirty = false;
+  std::vector<Project::Breakpoint> breakpoints;
+  bool breakpoints_dirty = false;
 
   // Resolve bus -> rom offset for LoROM / HiROM. Returns -1 on non-ROM
   // address. ExHiROM + coprocessors not yet supported (slice 1 limitation
@@ -261,6 +266,45 @@ std::unique_ptr<Project> Project::open(const std::string& dir,
     }
   }
 
+  // bookmarks.tsv — named view targets.
+  {
+    std::ifstream f(im.dir / "bookmarks.tsv");
+    std::string line;
+    while(std::getline(f, line)) {
+      if(line.empty() || line[0] == '#') continue;
+      auto fields = splitTab(line);
+      if(fields.size() < 2) continue;
+      Project::Bookmark b{};
+      b.name = fields[0];
+      b.addr = (uint32_t)std::strtoul(fields[1].c_str(), nullptr, 16);
+      if(fields.size() > 2) b.view    = fields[2];
+      if(fields.size() > 3) b.comment = fields[3];
+      im.bookmarks.push_back(b);
+    }
+  }
+
+  // breakpoints.tsv — persistent BP records.
+  {
+    std::ifstream f(im.dir / "breakpoints.tsv");
+    std::string line;
+    while(std::getline(f, line)) {
+      if(line.empty() || line[0] == '#') continue;
+      auto fields = splitTab(line);
+      if(fields.size() < 5) continue;
+      Project::Breakpoint bp{};
+      const auto& k = fields[0];
+      bp.kind = (k == "read")  ? Project::BpKind::Read
+              : (k == "write") ? Project::BpKind::Write
+              :                  Project::BpKind::Exec;
+      bp.addr_lo = (uint32_t)std::strtoul(fields[1].c_str(), nullptr, 16);
+      bp.addr_hi = (uint32_t)std::strtoul(fields[2].c_str(), nullptr, 16);
+      bp.halt    = (fields[3] == "1");
+      bp.enabled = (fields[4] == "1");
+      if(fields.size() > 5) bp.comment = fields[5];
+      im.breakpoints.push_back(bp);
+    }
+  }
+
   // labels.tsv — overlay table. Missing file is fine (empty overlay).
   {
     std::ifstream f(im.dir / "labels.tsv");
@@ -308,6 +352,40 @@ bool Project::save() {
 
   // map.bin
   if(!writeFile(im.dir / "map.bin", im.map.data(), im.map.size())) return false;
+
+  // bookmarks.tsv
+  if(im.bookmarks_dirty) {
+    std::ostringstream o;
+    o << "# name\taddr\tview\tcomment\n";
+    for(auto& b : im.bookmarks) {
+      char addrBuf[12];
+      std::snprintf(addrBuf, sizeof(addrBuf), "%06X", b.addr & 0xFFFFFF);
+      o << b.name << '\t' << addrBuf << '\t' << b.view << '\t' << b.comment << '\n';
+    }
+    auto s = o.str();
+    if(!writeFile(im.dir / "bookmarks.tsv", s.data(), s.size())) return false;
+    im.bookmarks_dirty = false;
+  }
+
+  // breakpoints.tsv
+  if(im.breakpoints_dirty) {
+    std::ostringstream o;
+    o << "# kind\taddr_lo\taddr_hi\thalt\tenabled\tcomment\n";
+    for(auto& bp : im.breakpoints) {
+      const char* k = bp.kind == Project::BpKind::Read ? "read"
+                    : bp.kind == Project::BpKind::Write ? "write"
+                    : "exec";
+      char loBuf[12], hiBuf[12];
+      std::snprintf(loBuf, sizeof(loBuf), "%06X", bp.addr_lo & 0xFFFFFF);
+      std::snprintf(hiBuf, sizeof(hiBuf), "%06X", bp.addr_hi & 0xFFFFFF);
+      o << k << '\t' << loBuf << '\t' << hiBuf << '\t'
+        << (bp.halt ? '1' : '0') << '\t'
+        << (bp.enabled ? '1' : '0') << '\t' << bp.comment << '\n';
+    }
+    auto s = o.str();
+    if(!writeFile(im.dir / "breakpoints.tsv", s.data(), s.size())) return false;
+    im.breakpoints_dirty = false;
+  }
 
   // dma_log.tsv — provenance log; re-write when entries changed.
   if(im.dma_prov_dirty) {
@@ -430,6 +508,74 @@ Project::Stats Project::stats() const {
 
 bool Project::loaded_matches_pristine() const {
   return impl_->loaded_matches_pristine;
+}
+
+// ---- Bookmarks ---------------------------------------------------------
+
+void Project::set_bookmark(const Bookmark& b) {
+  auto& im = *impl_;
+  for(auto& it : im.bookmarks) {
+    if(it.name == b.name) { it = b; im.bookmarks_dirty = true; im.dirty = true; return; }
+  }
+  im.bookmarks.push_back(b);
+  im.bookmarks_dirty = true;
+  im.dirty = true;
+}
+
+void Project::clear_bookmark(const std::string& name) {
+  auto& im = *impl_;
+  auto& v = im.bookmarks;
+  for(auto it = v.begin(); it != v.end(); ++it) {
+    if(it->name == name) { v.erase(it); im.bookmarks_dirty = true; im.dirty = true; return; }
+  }
+}
+
+const Project::Bookmark* Project::get_bookmark(const std::string& name) const {
+  for(auto& b : impl_->bookmarks) if(b.name == name) return &b;
+  return nullptr;
+}
+
+uint32_t Project::bookmark_count() const {
+  return (uint32_t)impl_->bookmarks.size();
+}
+
+const Project::Bookmark* Project::bookmark_at(uint32_t index) const {
+  auto& v = impl_->bookmarks;
+  return index < v.size() ? &v[index] : nullptr;
+}
+
+// ---- Breakpoints -------------------------------------------------------
+
+void Project::add_breakpoint(const Breakpoint& bp) {
+  auto& im = *impl_;
+  im.breakpoints.push_back(bp);
+  im.breakpoints_dirty = true;
+  im.dirty = true;
+}
+
+void Project::remove_breakpoint(uint32_t index) {
+  auto& im = *impl_;
+  if(index >= im.breakpoints.size()) return;
+  im.breakpoints.erase(im.breakpoints.begin() + index);
+  im.breakpoints_dirty = true;
+  im.dirty = true;
+}
+
+void Project::clear_breakpoints() {
+  auto& im = *impl_;
+  if(im.breakpoints.empty()) return;
+  im.breakpoints.clear();
+  im.breakpoints_dirty = true;
+  im.dirty = true;
+}
+
+uint32_t Project::breakpoint_count() const {
+  return (uint32_t)impl_->breakpoints.size();
+}
+
+const Project::Breakpoint* Project::breakpoint_at(uint32_t index) const {
+  auto& v = impl_->breakpoints;
+  return index < v.size() ? &v[index] : nullptr;
 }
 
 // ---- DMA provenance -----------------------------------------------------

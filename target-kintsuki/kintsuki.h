@@ -501,6 +501,53 @@ uint32_t kintsuki_project_dma_prov_for_range(kintsuki_t*,
                                              kintsuki_project_dma_prov_t* out,
                                              uint32_t cap);
 
+// ---- Bookmarks (slice 4) -----------------------------------------------
+typedef struct {
+  uint32_t    addr;
+  const char* name;
+  const char* view;     // free-form short string
+  const char* comment;
+} kintsuki_project_bookmark_t;
+
+int  kintsuki_project_bookmark_set(kintsuki_t*, const char* name, uint32_t addr,
+                                   const char* view, const char* comment);
+void kintsuki_project_bookmark_clear(kintsuki_t*, const char* name);
+uint32_t kintsuki_project_bookmark_count(kintsuki_t*);
+uint32_t kintsuki_project_bookmark_snapshot(kintsuki_t*,
+                                            kintsuki_project_bookmark_t* out,
+                                            uint32_t cap);
+
+// ---- Breakpoints (slice 4) ---------------------------------------------
+// Persistent records only — the project does NOT auto-install live BPs
+// on attach. The frontend walks the snapshot at project_open time and
+// re-calls kintsuki_add_callback_ex(...) for each enabled record, then
+// drives removal through the existing callback handle if the user
+// toggles the BP off.
+typedef enum {
+  KINTSUKI_PROJECT_BP_EXEC  = 0,
+  KINTSUKI_PROJECT_BP_READ  = 1,
+  KINTSUKI_PROJECT_BP_WRITE = 2,
+} kintsuki_project_bp_kind_t;
+
+typedef struct {
+  uint8_t  kind;
+  uint8_t  halt;
+  uint8_t  enabled;
+  uint8_t  _pad;
+  uint32_t addr_lo;     // inclusive
+  uint32_t addr_hi;     // inclusive
+  const char* comment;
+} kintsuki_project_bp_t;
+
+int kintsuki_project_bp_add(kintsuki_t*, uint8_t kind,
+                            uint32_t addr_lo, uint32_t addr_hi,
+                            int halt, int enabled, const char* comment);
+void kintsuki_project_bp_remove(kintsuki_t*, uint32_t index);
+void kintsuki_project_bp_clear(kintsuki_t*);
+uint32_t kintsuki_project_bp_count(kintsuki_t*);
+uint32_t kintsuki_project_bp_snapshot(kintsuki_t*, kintsuki_project_bp_t* out,
+                                      uint32_t cap);
+
 #ifdef __cplusplus
 }
 #endif
