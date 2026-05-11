@@ -378,6 +378,7 @@ class Emu:
                 "vram_addr":  int(e.vram_addr),
                 "hits":       int(e.hits),
                 "last_frame": int(e.last_frame),
+                "caller_pc":  int(e.caller_pc),
             })
         return out
 
@@ -497,6 +498,41 @@ class Emu:
 
     def project_label_clear(self, addr: int) -> None:
         _native.lib.kintsuki_project_label_clear(self._handle, addr & 0xFFFFFF)
+
+    def project_dma_provenance(self,
+                               rom_range: tuple[int, int] | None = None,
+                               ) -> list[dict]:
+        """All DMA provenance entries (slice 3) — (src_rom, size, dst_reg,
+        caller_pc) deduplicated tuples plus hit count + last frame. Pass
+        ``rom_range=(offset, length)`` to filter to entries overlapping
+        that range — the "who uploads this tile?" viewer lookup."""
+        if rom_range is not None:
+            off, length = rom_range
+            # First pass with a generous cap; if filled, retry with the
+            # actual count to avoid truncation.
+            cap = max(8, int(_native.lib.kintsuki_project_dma_prov_count(self._handle)))
+            buf = (_native.ProjectDmaProv * cap)()
+            n = int(_native.lib.kintsuki_project_dma_prov_for_range(
+                self._handle, off, length, buf, cap))
+        else:
+            n_total = int(_native.lib.kintsuki_project_dma_prov_count(self._handle))
+            if n_total == 0:
+                return []
+            buf = (_native.ProjectDmaProv * n_total)()
+            n = int(_native.lib.kintsuki_project_dma_prov_snapshot(
+                self._handle, buf, n_total))
+        out: list[dict] = []
+        for i in range(n):
+            p = buf[i]
+            out.append({
+                "src_rom":    int(p.src_rom),
+                "size":       int(p.size),
+                "dst_reg":    int(p.dst_reg),
+                "caller_pc":  int(p.caller_pc),
+                "hits":       int(p.hits),
+                "last_frame": int(p.last_frame),
+            })
+        return out
 
     def project_labels(self) -> list[dict]:
         """All overlay labels, address-ascending. Empty list when no

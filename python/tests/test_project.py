@@ -168,6 +168,49 @@ def test_project_entry_flags_auto_seeded(assemble_rom, tmp_path):
                 assert v is None or v in (0, 1), f"bad {f}={v} at {L['addr']:#x}"
 
 
+def test_project_dma_provenance_roundtrip(assemble_rom, tmp_path):
+    """Slice 3: DMA fires are recorded against (src_rom, caller_pc) and
+    survive a save+reload. The test ROM DMAs from $7E:9000 (WRAM, non-
+    ROM) so no provenance entry should be created — provenance is ROM-
+    source only. Manual mark stays the only signal."""
+    rom = assemble_rom("test_dma_log.s")
+    project_dir = tmp_path / "p.kintsuki"
+
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        emu.project_open(project_dir)
+        # Drain the runtime DMA log first so we don't see stale entries.
+        emu.dma_log_clear()
+
+        for _ in range(60):
+            emu.run_frames(1)
+            if emu.get_state().stp:
+                break
+
+        # Runtime log now carries caller_pc.
+        for x in emu.dma_transfers():
+            assert "caller_pc" in x
+            assert isinstance(x["caller_pc"], int)
+            assert 0 <= x["caller_pc"] <= 0xFFFFFF
+
+        # Project-side provenance only captures ROM-source DMAs. WRAM
+        # source ($7E9000) skips persistence — list may be empty.
+        prov_all = emu.project_dma_provenance()
+        for e in prov_all:
+            assert "src_rom" in e and "caller_pc" in e and "hits" in e
+
+        emu.project_save()
+        emu.project_close()
+
+    # If anything was persisted, dma_log.tsv exists; either way reopen
+    # without crashing.
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        emu.project_open(project_dir)
+        # Round-trip count matches.
+        assert len(emu.project_dma_provenance()) == len(prov_all)
+
+
 def test_project_mark_dump_roundtrip(assemble_rom, tmp_path):
     rom = assemble_rom("test_dma_log.s")
     with Emu() as emu:

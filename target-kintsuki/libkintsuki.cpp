@@ -995,6 +995,7 @@ struct DmaLogEntry {
   uint16_t vram_addr;    // VMADDR at DMA fire (word address)
   uint32_t hits;
   uint64_t last_frame;
+  uint32_t caller_pc;    // 24-bit; top of shadow callstack at fire time
 };
 constexpr size_t kDmaLogCap = 64;
 DmaLogEntry g_dmaLog[kDmaLogCap] = {};
@@ -1002,21 +1003,31 @@ size_t g_dmaLogSize = 0;
 
 void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
                uint32_t src, uint8_t dst, uint16_t size) {
+  // Caller PC: top of the shadow callstack (the most recently entered
+  // routine), falling back to live cpu.r.pc.d if no JSR/JSL is on the
+  // stack yet (cold boot, IRQ context). 24-bit.
+  uint32_t callerPc = g_callstack.empty()
+    ? ((uint32_t)ares::SuperFamicom::cpu.r.pc.d & 0xFFFFFF)
+    : (g_callstack.back().target_pc & 0xFFFFFF);
   // Project-file auto-classification: tag the ROM source range by the
   // destination PPU register class (graphics/palette/...) — no-op when
   // no project is open.
-  if(g_project) g_project->note_dma(src, size, dst);
+  if(g_project) {
+    uint64_t frame = g_handle ? g_handle->program->framesRendered : 0;
+    g_project->note_dma(src, size, dst);
+    g_project->note_dma_provenance(src, size, dst, callerPc, frame);
+  }
   // Capture VMADDR (word) at the moment the DMA fires — gives the
   // user the actual VRAM destination, not just "we wrote something
   // through VMDATA". Read from the live performance PPU; the
   // CGRAM/OAM equivalents could be added later if needed.
   uint16_t vramAddr = (uint16_t)ares::SuperFamicom::ppuPerformanceImpl.vram.address;
-  // Dedupe key now includes vram_addr so two transfers to different
-  // VRAM regions through the same VMDATA register don't collapse.
+  // Dedupe key now includes vram_addr + caller_pc so two transfers from
+  // different callers (or to different VRAM regions) don't collapse.
   for(size_t i = 0; i < g_dmaLogSize; i++) {
     auto& e = g_dmaLog[i];
     if(e.src_addr == src && e.dst_reg == dst && e.size == size
-       && e.vram_addr == vramAddr) {
+       && e.vram_addr == vramAddr && e.caller_pc == callerPc) {
       e.hits += 1;
       e.last_frame = (g_handle ? g_handle->program->framesRendered : 0);
       if(i > 0) {
@@ -1039,6 +1050,7 @@ void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
     .vram_addr = vramAddr,
     .hits = 1,
     .last_frame = (g_handle ? g_handle->program->framesRendered : 0),
+    .caller_pc = callerPc,
   };
   if(g_dmaLogSize < kDmaLogCap) g_dmaLogSize++;
 }
@@ -1103,6 +1115,7 @@ uint32_t kintsuki_dma_log_snapshot(kintsuki_t* h,
     out[i].vram_addr = e.vram_addr;
     out[i].hits = e.hits;
     out[i].last_frame = e.last_frame;
+    out[i].caller_pc = e.caller_pc;
   }
   return n;
 }
@@ -1398,6 +1411,53 @@ uint32_t kintsuki_project_label_snapshot(kintsuki_t* h,
     out[i].x       = L->x;
     out[i].e       = L->e;
   }
+  return n;
+}
+
+// ---- DMA provenance -----------------------------------------------------
+
+namespace {
+void copyProv(kintsuki_project_dma_prov_t& dst,
+              const kintsuki::Project::DmaProv& src) {
+  dst.src_rom    = src.src_rom;
+  dst.size       = src.size;
+  dst.dst_reg    = src.dst_reg;
+  dst._pad       = 0;
+  dst.caller_pc  = src.caller_pc;
+  dst.hits       = src.hits;
+  dst.last_frame = src.last_frame;
+}
+}  // namespace
+
+uint32_t kintsuki_project_dma_prov_count(kintsuki_t* h) {
+  (void)h;
+  return g_project ? g_project->dma_prov_count() : 0;
+}
+
+uint32_t kintsuki_project_dma_prov_snapshot(kintsuki_t* h,
+                                            kintsuki_project_dma_prov_t* out,
+                                            uint32_t cap) {
+  (void)h;
+  if(!g_project || !out || cap == 0) return 0;
+  uint32_t total = g_project->dma_prov_count();
+  uint32_t n = total < cap ? total : cap;
+  for(uint32_t i = 0; i < n; i++) {
+    const auto* p = g_project->dma_prov_at(i);
+    if(!p) { n = i; break; }
+    copyProv(out[i], *p);
+  }
+  return n;
+}
+
+uint32_t kintsuki_project_dma_prov_for_range(kintsuki_t* h,
+                                             uint32_t rom_offset, uint32_t len,
+                                             kintsuki_project_dma_prov_t* out,
+                                             uint32_t cap) {
+  (void)h;
+  if(!g_project || !out || cap == 0) return 0;
+  std::vector<kintsuki::Project::DmaProv> tmp(cap);
+  uint32_t n = g_project->dma_prov_for_range(rom_offset, len, tmp.data(), cap);
+  for(uint32_t i = 0; i < n; i++) copyProv(out[i], tmp[i]);
   return n;
 }
 

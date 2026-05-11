@@ -147,6 +147,8 @@ struct Project::Impl {
 
   std::vector<uint8_t> map;  // size == rom_size
   std::map<uint32_t, Project::Label> labels;  // sorted by addr
+  std::vector<Project::DmaProv> dma_prov;     // append-only, deduped
+  bool dma_prov_dirty = false;
 
   // Resolve bus -> rom offset for LoROM / HiROM. Returns -1 on non-ROM
   // address. ExHiROM + coprocessors not yet supported (slice 1 limitation
@@ -240,6 +242,25 @@ std::unique_ptr<Project> Project::open(const std::string& dir,
     im.map.assign(rom_size, 0);
   }
 
+  // dma_log.tsv — provenance log. Missing file fine.
+  {
+    std::ifstream f(im.dir / "dma_log.tsv");
+    std::string line;
+    while(std::getline(f, line)) {
+      if(line.empty() || line[0] == '#') continue;
+      auto fields = splitTab(line);
+      if(fields.size() < 6) continue;
+      Project::DmaProv p{};
+      p.src_rom    = (uint32_t)std::strtoul(fields[0].c_str(), nullptr, 16);
+      p.size       = (uint16_t)std::strtoul(fields[1].c_str(), nullptr, 0);
+      p.dst_reg    = (uint8_t) std::strtoul(fields[2].c_str(), nullptr, 16);
+      p.caller_pc  = (uint32_t)std::strtoul(fields[3].c_str(), nullptr, 16);
+      p.hits       = (uint32_t)std::strtoul(fields[4].c_str(), nullptr, 0);
+      p.last_frame = (uint64_t)std::strtoull(fields[5].c_str(), nullptr, 0);
+      im.dma_prov.push_back(p);
+    }
+  }
+
   // labels.tsv — overlay table. Missing file is fine (empty overlay).
   {
     std::ifstream f(im.dir / "labels.tsv");
@@ -287,6 +308,27 @@ bool Project::save() {
 
   // map.bin
   if(!writeFile(im.dir / "map.bin", im.map.data(), im.map.size())) return false;
+
+  // dma_log.tsv — provenance log; re-write when entries changed.
+  if(im.dma_prov_dirty) {
+    std::ostringstream o;
+    o << "# src_rom\tsize\tdst_reg\tcaller_pc\thits\tlast_frame\n";
+    for(auto& p : im.dma_prov) {
+      char addrBuf[24], cpBuf[16], dstBuf[8];
+      std::snprintf(addrBuf, sizeof(addrBuf), "%06X", p.src_rom & 0xFFFFFF);
+      std::snprintf(cpBuf,   sizeof(cpBuf),   "%06X", p.caller_pc & 0xFFFFFF);
+      std::snprintf(dstBuf,  sizeof(dstBuf),  "%02X", p.dst_reg);
+      o << addrBuf << '\t'
+        << p.size << '\t'
+        << dstBuf << '\t'
+        << cpBuf  << '\t'
+        << p.hits << '\t'
+        << p.last_frame << '\n';
+    }
+    auto s = o.str();
+    if(!writeFile(im.dir / "dma_log.tsv", s.data(), s.size())) return false;
+    im.dma_prov_dirty = false;
+  }
 
   // labels.tsv — only re-write when the overlay actually changed. Sorted
   // by addr (the std::map iteration order already gives us this).
@@ -388,6 +430,66 @@ Project::Stats Project::stats() const {
 
 bool Project::loaded_matches_pristine() const {
   return impl_->loaded_matches_pristine;
+}
+
+// ---- DMA provenance -----------------------------------------------------
+
+void Project::note_dma_provenance(uint32_t src_addr_24, uint16_t size,
+                                  uint8_t dst_reg, uint32_t caller_pc,
+                                  uint64_t frame) {
+  auto& im = *impl_;
+  int64_t rom = im.busToRom(src_addr_24);
+  if(rom < 0) return;  // non-ROM source (WRAM, SRAM, ...) — skip
+  uint32_t src = (uint32_t)rom;
+  caller_pc &= 0xFFFFFF;
+  // Dedupe on (src, size, dst_reg, caller_pc). Linear scan — slice 3
+  // expects O(few hundred) entries per project; if it bites, swap for
+  // a hash-set keyed by the same tuple.
+  for(auto& e : im.dma_prov) {
+    if(e.src_rom == src && e.size == size && e.dst_reg == dst_reg
+       && e.caller_pc == caller_pc) {
+      e.hits += 1;
+      e.last_frame = frame;
+      im.dma_prov_dirty = true;
+      im.dirty = true;
+      return;
+    }
+  }
+  DmaProv p{};
+  p.src_rom   = src;
+  p.size      = size;
+  p.dst_reg   = dst_reg;
+  p.caller_pc = caller_pc;
+  p.hits      = 1;
+  p.last_frame = frame;
+  im.dma_prov.push_back(p);
+  im.dma_prov_dirty = true;
+  im.dirty = true;
+}
+
+uint32_t Project::dma_prov_count() const {
+  return (uint32_t)impl_->dma_prov.size();
+}
+
+const Project::DmaProv* Project::dma_prov_at(uint32_t index) const {
+  auto& v = impl_->dma_prov;
+  if(index >= v.size()) return nullptr;
+  return &v[index];
+}
+
+uint32_t Project::dma_prov_for_range(uint32_t rom_offset, uint32_t len,
+                                     DmaProv* out, uint32_t cap) const {
+  if(!out || cap == 0) return 0;
+  uint32_t end = rom_offset + len;
+  uint32_t n = 0;
+  for(auto& e : impl_->dma_prov) {
+    uint32_t a = e.src_rom;
+    uint32_t b = a + e.size;
+    if(b <= rom_offset || a >= end) continue;
+    if(n >= cap) break;
+    out[n++] = e;
+  }
+  return n;
 }
 
 // ---- Labels overlay -----------------------------------------------------

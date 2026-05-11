@@ -92,6 +92,31 @@ public:
   // marks the source range. Called from existing DMA event hook.
   void note_dma(uint32_t src_addr_24, uint16_t size, uint8_t dst_reg);
 
+  // DMA provenance (slice 3). Records "who pushed this buffer" — keyed
+  // by (src_rom_offset, dst_reg, caller_pc). Deduplicated; repeated
+  // fires bump a hit counter. Persisted as `dma_log.tsv` on save.
+  void note_dma_provenance(uint32_t src_addr_24, uint16_t size,
+                           uint8_t dst_reg, uint32_t caller_pc,
+                           uint64_t frame);
+
+  struct DmaProv {
+    uint32_t src_rom;     // ROM offset of transfer source (-1 if non-ROM
+                          // -> we store 0xFFFFFFFF and skip persisting)
+    uint16_t size;
+    uint8_t  dst_reg;
+    uint8_t  _pad;
+    uint32_t caller_pc;   // 24-bit
+    uint32_t hits;
+    uint64_t last_frame;
+  };
+  uint32_t dma_prov_count() const;
+  const DmaProv* dma_prov_at(uint32_t index) const;
+  // Query helper: all provenance entries whose source range overlaps
+  // [rom_offset, rom_offset+len). Linear scan — slice 3 expects O(few
+  // hundred) entries; promote to an interval-tree index if it bites.
+  uint32_t dma_prov_for_range(uint32_t rom_offset, uint32_t len,
+                              DmaProv* out, uint32_t cap) const;
+
   // Exec-driven code marking. Called from cpu exec callback at PC.
   void note_exec(uint32_t pc_24, uint8_t insn_len);
 

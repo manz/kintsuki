@@ -334,6 +334,11 @@ typedef struct kintsuki_dma_event_t {
                          // only when dst_reg == 0x18 / 0x19
   uint32_t hits;
   uint64_t last_frame;
+  // Caller PC at the moment DMA fired. Sourced from the top of the
+  // shadow callstack (deepest live JSR/JSL target), falling back to the
+  // live cpu.r.pc.d if the callstack is empty. Lets viewers answer
+  // "who pushed this VRAM block?" without a separate trace.
+  uint32_t caller_pc;    // 24-bit
 } kintsuki_dma_event_t;
 
 uint32_t kintsuki_dma_log_count(kintsuki_t*);
@@ -469,6 +474,32 @@ uint32_t kintsuki_project_label_count(kintsuki_t*);
 uint32_t kintsuki_project_label_snapshot(kintsuki_t*,
                                          kintsuki_project_label_t* out,
                                          uint32_t cap);
+
+// ---- DMA provenance (slice 3) ------------------------------------------
+// Per (src_rom, size, dst_reg, caller_pc) record: who pushed which buffer
+// where, and how often. Auto-populated from every DMA fire while a
+// project is open. Persisted as `dma_log.tsv` on save.
+
+typedef struct {
+  uint32_t src_rom;     // ROM offset of source bytes
+  uint16_t size;
+  uint8_t  dst_reg;
+  uint8_t  _pad;
+  uint32_t caller_pc;   // 24-bit
+  uint32_t hits;
+  uint64_t last_frame;
+} kintsuki_project_dma_prov_t;
+
+uint32_t kintsuki_project_dma_prov_count(kintsuki_t*);
+uint32_t kintsuki_project_dma_prov_snapshot(kintsuki_t*,
+                                            kintsuki_project_dma_prov_t* out,
+                                            uint32_t cap);
+// Filter to entries overlapping `[rom_offset, rom_offset+len)` — viewer
+// "who uploads this tile?" lookup.
+uint32_t kintsuki_project_dma_prov_for_range(kintsuki_t*,
+                                             uint32_t rom_offset, uint32_t len,
+                                             kintsuki_project_dma_prov_t* out,
+                                             uint32_t cap);
 
 #ifdef __cplusplus
 }

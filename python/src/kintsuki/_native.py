@@ -172,6 +172,7 @@ class DmaEvent(Structure):
         ("vram_addr", c_uint16),
         ("hits",      c_uint32),
         ("last_frame", c_uint64),
+        ("caller_pc", c_uint32),
     ]
 
 
@@ -350,6 +351,24 @@ _bind("kintsuki_project_label_get",      c_int,    [HANDLE, c_uint32, POINTER(Pr
 _bind("kintsuki_project_label_clear",    None,     [HANDLE, c_uint32])
 _bind("kintsuki_project_label_count",    c_uint32, [HANDLE])
 _bind("kintsuki_project_label_snapshot", c_uint32, [HANDLE, POINTER(ProjectLabel), c_uint32])
+
+
+class ProjectDmaProv(Structure):
+    _fields_ = [
+        ("src_rom",    c_uint32),
+        ("size",       c_uint16),
+        ("dst_reg",    c_uint8),
+        ("_pad",       c_uint8),
+        ("caller_pc",  c_uint32),
+        ("hits",       c_uint32),
+        ("last_frame", c_uint64),
+    ]
+
+
+_bind("kintsuki_project_dma_prov_count",     c_uint32, [HANDLE])
+_bind("kintsuki_project_dma_prov_snapshot",  c_uint32, [HANDLE, POINTER(ProjectDmaProv), c_uint32])
+_bind("kintsuki_project_dma_prov_for_range", c_uint32, [HANDLE, c_uint32, c_uint32,
+                                                       POINTER(ProjectDmaProv), c_uint32])
 
 
 # Re-exports for convenience.
