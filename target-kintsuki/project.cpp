@@ -9,8 +9,10 @@
 #include <cstdlib>
 #include <cstring>
 #include <ctime>
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <map>
 #include <sstream>
 #include <string>
 #include <vector>
@@ -94,6 +96,33 @@ bool readFile(const fs::path& path, std::vector<uint8_t>& out) {
   return f.good();
 }
 
+// Split `s` on TAB. Trailing empties are preserved so column count is
+// stable. Returns a vector of field strings.
+std::vector<std::string> splitTab(const std::string& s) {
+  std::vector<std::string> out;
+  size_t a = 0;
+  for(size_t i = 0; i <= s.size(); i++) {
+    if(i == s.size() || s[i] == '\t') {
+      out.emplace_back(s.substr(a, i - a));
+      a = i + 1;
+    }
+  }
+  return out;
+}
+
+int8_t parseFlag(const std::string& s) {
+  if(s.empty()) return -1;
+  if(s == "0") return 0;
+  if(s == "1") return 1;
+  return -1;
+}
+
+std::string flagStr(int8_t v) {
+  if(v == 0) return "0";
+  if(v == 1) return "1";
+  return "";
+}
+
 // Classify a ROM source range based on the DMA destination PPU register.
 ByteClass classifyByDest(uint8_t dst_reg) {
   switch(dst_reg) {
@@ -114,8 +143,10 @@ struct Project::Impl {
   bool         is_hirom = false;
   bool         loaded_matches_pristine = true;
   bool         dirty = false;
+  bool         labels_dirty = false;
 
   std::vector<uint8_t> map;  // size == rom_size
+  std::map<uint32_t, Project::Label> labels;  // sorted by addr
 
   // Resolve bus -> rom offset for LoROM / HiROM. Returns -1 on non-ROM
   // address. ExHiROM + coprocessors not yet supported (slice 1 limitation
@@ -209,6 +240,26 @@ std::unique_ptr<Project> Project::open(const std::string& dir,
     im.map.assign(rom_size, 0);
   }
 
+  // labels.tsv — overlay table. Missing file is fine (empty overlay).
+  {
+    std::ifstream f(im.dir / "labels.tsv");
+    std::string line;
+    while(std::getline(f, line)) {
+      if(line.empty() || line[0] == '#') continue;
+      auto fields = splitTab(line);
+      if(fields.empty()) continue;
+      Project::Label L{};
+      L.addr = (uint32_t)std::strtoul(fields[0].c_str(), nullptr, 16) & 0xFFFFFF;
+      if(fields.size() > 1) L.name    = fields[1];
+      if(fields.size() > 2) L.type    = fields[2];
+      if(fields.size() > 3) L.m       = parseFlag(fields[3]);
+      if(fields.size() > 4) L.x       = parseFlag(fields[4]);
+      if(fields.size() > 5) L.e       = parseFlag(fields[5]);
+      if(fields.size() > 6) L.comment = fields[6];
+      im.labels[L.addr] = L;
+    }
+  }
+
   return p;
 }
 
@@ -236,6 +287,28 @@ bool Project::save() {
 
   // map.bin
   if(!writeFile(im.dir / "map.bin", im.map.data(), im.map.size())) return false;
+
+  // labels.tsv — only re-write when the overlay actually changed. Sorted
+  // by addr (the std::map iteration order already gives us this).
+  if(im.labels_dirty) {
+    std::ostringstream o;
+    o << "# addr\tname\ttype\tm\tx\te\tcomment\n";
+    for(auto& kv : im.labels) {
+      const auto& L = kv.second;
+      char addrBuf[16];
+      std::snprintf(addrBuf, sizeof(addrBuf), "%06X", L.addr & 0xFFFFFF);
+      o << addrBuf << '\t'
+        << L.name << '\t'
+        << L.type << '\t'
+        << flagStr(L.m) << '\t'
+        << flagStr(L.x) << '\t'
+        << flagStr(L.e) << '\t'
+        << L.comment << '\n';
+    }
+    auto s = o.str();
+    if(!writeFile(im.dir / "labels.tsv", s.data(), s.size())) return false;
+    im.labels_dirty = false;
+  }
 
   im.dirty = false;
   return true;
@@ -315,6 +388,82 @@ Project::Stats Project::stats() const {
 
 bool Project::loaded_matches_pristine() const {
   return impl_->loaded_matches_pristine;
+}
+
+// ---- Labels overlay -----------------------------------------------------
+
+void Project::set_label(const Label& L) {
+  auto& im = *impl_;
+  auto& slot = im.labels[L.addr & 0xFFFFFF];
+  slot = L;
+  slot.addr = L.addr & 0xFFFFFF;
+  im.labels_dirty = true;
+  im.dirty = true;
+}
+
+void Project::clear_label(uint32_t addr) {
+  auto& im = *impl_;
+  if(im.labels.erase(addr & 0xFFFFFF) > 0) {
+    im.labels_dirty = true;
+    im.dirty = true;
+  }
+}
+
+const Project::Label* Project::get_label(uint32_t addr) const {
+  auto& im = *impl_;
+  auto it = im.labels.find(addr & 0xFFFFFF);
+  return it == im.labels.end() ? nullptr : &it->second;
+}
+
+uint32_t Project::label_count() const {
+  return (uint32_t)impl_->labels.size();
+}
+
+uint32_t Project::label_snapshot(Label* out, uint32_t cap) const {
+  if(!out || cap == 0) return 0;
+  uint32_t i = 0;
+  for(auto& kv : impl_->labels) {
+    if(i >= cap) break;
+    out[i++] = kv.second;
+  }
+  return i;
+}
+
+const Project::Label* Project::label_at(uint32_t index) const {
+  auto& im = *impl_;
+  if(index >= im.labels.size()) return nullptr;
+  auto it = im.labels.begin();
+  std::advance(it, index);
+  return &it->second;
+}
+
+void Project::record_entry_flags(uint32_t addr, int8_t m, int8_t x, int8_t e,
+                                 bool force) {
+  auto& im = *impl_;
+  addr &= 0xFFFFFF;
+  auto& slot = im.labels[addr];
+  if(slot.name.empty() && slot.type.empty()) {
+    slot.addr = addr;
+  }
+  bool changed = false;
+  auto setOne = [&](int8_t& dst, int8_t v) {
+    if(v < 0) return;
+    if(dst < 0 || force) {
+      if(dst != v) { dst = v; changed = true; }
+    }
+  };
+  setOne(slot.m, m);
+  setOne(slot.x, x);
+  setOne(slot.e, e);
+  if(changed) {
+    im.labels_dirty = true;
+    im.dirty = true;
+  } else if(slot.name.empty() && slot.type.empty()
+            && slot.m < 0 && slot.x < 0 && slot.e < 0) {
+    // We created an empty slot but had nothing to record — drop it so
+    // labels.tsv doesn't accumulate empty rows.
+    im.labels.erase(addr);
+  }
 }
 
 }  // namespace kintsuki

@@ -54,6 +54,15 @@ void cOnCall(uint32_t callsite_pc, uint32_t target_pc, uint8_t kind) {
   f.target_pc   = target_pc   & 0xFFFFFF;
   f.kind        = kind;
   g_callstack.push_back(f);
+  // Auto-seed entry flags at every JSR/JSL target so cold-cache disasm at
+  // any reached function knows the caller's M/X/E. First writer wins —
+  // manual edits are not clobbered.
+  if(g_project) {
+    auto& r = ares::SuperFamicom::cpu.r;
+    g_project->record_entry_flags(target_pc,
+                                  (int8_t)r.p.m, (int8_t)r.p.x, (int8_t)r.e,
+                                  /*force=*/false);
+  }
 }
 
 void cOnReturn(uint8_t kind) {
@@ -1319,6 +1328,77 @@ int kintsuki_project_stats(kintsuki_t* h, kintsuki_project_stats_t* out) {
   out->data        = s.data;
   out->user_sticky = s.user_sticky;
   return 1;
+}
+
+// ---- Labels overlay -----------------------------------------------------
+
+int kintsuki_project_label_set(kintsuki_t* h, uint32_t addr,
+                               const char* name, const char* type,
+                               const char* comment,
+                               int m, int x, int e) {
+  (void)h;
+  if(!g_project) return 0;
+  kintsuki::Project::Label L{};
+  L.addr    = addr & 0xFFFFFF;
+  if(name)    L.name    = name;
+  if(type)    L.type    = type;
+  if(comment) L.comment = comment;
+  L.m = (int8_t)(m < 0 ? -1 : (m ? 1 : 0));
+  L.x = (int8_t)(x < 0 ? -1 : (x ? 1 : 0));
+  L.e = (int8_t)(e < 0 ? -1 : (e ? 1 : 0));
+  g_project->set_label(L);
+  return 1;
+}
+
+int kintsuki_project_label_get(kintsuki_t* h, uint32_t addr,
+                               kintsuki_project_label_t* out) {
+  (void)h;
+  if(!g_project || !out) return 0;
+  const auto* L = g_project->get_label(addr & 0xFFFFFF);
+  if(!L) return 0;
+  out->addr    = L->addr;
+  out->name    = L->name.c_str();
+  out->type    = L->type.c_str();
+  out->comment = L->comment.c_str();
+  out->m       = L->m;
+  out->x       = L->x;
+  out->e       = L->e;
+  return 1;
+}
+
+void kintsuki_project_label_clear(kintsuki_t* h, uint32_t addr) {
+  (void)h;
+  if(!g_project) return;
+  g_project->clear_label(addr & 0xFFFFFF);
+}
+
+uint32_t kintsuki_project_label_count(kintsuki_t* h) {
+  (void)h;
+  return g_project ? g_project->label_count() : 0;
+}
+
+uint32_t kintsuki_project_label_snapshot(kintsuki_t* h,
+                                         kintsuki_project_label_t* out,
+                                         uint32_t cap) {
+  (void)h;
+  if(!g_project || !out || cap == 0) return 0;
+  uint32_t total = g_project->label_count();
+  uint32_t n = total < cap ? total : cap;
+  for(uint32_t i = 0; i < n; i++) {
+    // label_at points into project-owned std::string storage; pointers
+    // stay valid until the next mutation (per the contract documented
+    // on kintsuki_project_label_t).
+    const auto* L = g_project->label_at(i);
+    if(!L) { n = i; break; }
+    out[i].addr    = L->addr;
+    out[i].name    = L->name.c_str();
+    out[i].type    = L->type.c_str();
+    out[i].comment = L->comment.c_str();
+    out[i].m       = L->m;
+    out[i].x       = L->x;
+    out[i].e       = L->e;
+  }
+  return n;
 }
 
 }  // extern "C"

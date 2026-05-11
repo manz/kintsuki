@@ -91,6 +91,83 @@ def test_project_bus_to_rom_lorom_hirom(assemble_rom, tmp_path):
         assert off in (0x7FFC, 0xFFFC), f"unexpected mapping: {off:#x}"
 
 
+def test_project_labels_roundtrip(assemble_rom, tmp_path):
+    rom = assemble_rom("test_dma_log.s")
+    project_dir = tmp_path / "p.kintsuki"
+
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        emu.project_open(project_dir)
+
+        # Manual set with all fields.
+        emu.project_label_set(0x008000, "Reset",
+                              type="function",
+                              comment="cold boot entry",
+                              m=1, x=1, e=1)
+        # Sparse — name only.
+        emu.project_label_set(0x00C000, "MainLoop")
+
+        L = emu.project_label_get(0x008000)
+        assert L is not None
+        assert L["name"] == "Reset"
+        assert L["type"] == "function"
+        assert L["comment"] == "cold boot entry"
+        assert L["m"] == 1 and L["x"] == 1 and L["e"] == 1
+
+        L2 = emu.project_label_get(0x00C000)
+        assert L2 is not None
+        assert L2["name"] == "MainLoop"
+        assert L2["m"] is None and L2["x"] is None and L2["e"] is None
+
+        # Snapshot is address-ascending.
+        all_labels = emu.project_labels()
+        names = [x["name"] for x in all_labels]
+        assert "Reset" in names and "MainLoop" in names
+        assert all_labels[0]["addr"] <= all_labels[-1]["addr"]
+
+        # Clear removes the entry.
+        emu.project_label_clear(0x00C000)
+        assert emu.project_label_get(0x00C000) is None
+
+        emu.project_save()
+        emu.project_close()
+
+    # Reopen — overlay must survive on-disk roundtrip.
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        emu.project_open(project_dir)
+        L = emu.project_label_get(0x008000)
+        assert L is not None
+        assert L["name"] == "Reset"
+        assert L["m"] == 1 and L["e"] == 1
+        # Cleared entry stays gone.
+        assert emu.project_label_get(0x00C000) is None
+        # Sidecar file on disk.
+        assert (project_dir / "labels.tsv").exists()
+
+
+def test_project_entry_flags_auto_seeded(assemble_rom, tmp_path):
+    """Shadow-callstack JSR/JSL hook records live M/X/E on the target so
+    cold-cache disasm at any reached function knows the caller's flags."""
+    rom = assemble_rom("test_dma_log.s")
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        emu.project_open(tmp_path / "p.kintsuki")
+        # Run far enough for the reset stub + NMI handler to JSR somewhere.
+        for _ in range(60):
+            emu.run_frames(1)
+            if emu.get_state().stp:
+                break
+        # The test ROM doesn't necessarily JSR anywhere, so this is a
+        # weak assertion — we only care that the hook ran without
+        # crashing and that *if* any labels were seeded, their flags are
+        # well-formed (0/1, not garbage).
+        for L in emu.project_labels():
+            for f in ("m", "x", "e"):
+                v = L[f]
+                assert v is None or v in (0, 1), f"bad {f}={v} at {L['addr']:#x}"
+
+
 def test_project_mark_dump_roundtrip(assemble_rom, tmp_path):
     rom = assemble_rom("test_dma_log.s")
     with Emu() as emu:

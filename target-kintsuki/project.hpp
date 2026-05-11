@@ -5,13 +5,21 @@
 //   game.sfc
 //   game.kintsuki/
 //     project.toml      // header: rom sha256, name, adbg path, schema version
+//     manifest.bml      // verbatim cart manifest at create time (bus map)
 //     map.bin           // 1 byte / ROM byte; classification (see ByteClass)
-//     labels.toml       // addr -> {name, type, comment} (overlay over .adbg)
+//     labels.tsv        // addr -> name + type + flags + comment (overlay)
 //     bookmarks.toml    // user-saved view targets
 //     breakpoints.toml  // persistent BPs by symbol or addr
-//     dma_log.bin       // append-only DMA event ring (rotated by size)
+//     dma_log.bin       // append-only DMA event log (rotated by size)
 //     notes/            // markdown free-form per-symbol
 //     views.toml        // saved panel layouts (frontend domain)
+//
+// labels.tsv columns (one record per line, tab-separated, # = comment):
+//   addr   name   type   m   x   e   comment
+// Fields after `name` are optional. addr is 6-hex 24-bit. m/x/e are 0/1/
+// empty (empty = unset). type is free-form lowercase string; conventional
+// values: function, data, pointer, string, gfx, palette, tilemap, audio.
+// `comment` may contain spaces but no tabs (tabs are field separators).
 //
 // Slice 1 ships only: project.toml + map.bin. The rest are planned slots and
 // must not break forward-compat when added — readers ignore unknown files.
@@ -91,6 +99,40 @@ public:
   // Honours the cartridge mapper currently loaded (LoROM/HiROM/ExHiROM).
   // The mapping table is supplied at construction by libkintsuki.
   int64_t bus_to_rom_offset(uint32_t bus_addr_24) const;
+
+  // ---- Labels overlay (slice 2) ----------------------------------------
+  // Per-address user metadata layered on top of any loaded `.adbg` symbol
+  // table. Labels here win over .adbg labels at the same address — useful
+  // when reversing a routine the assembly hasn't yet promoted to a name.
+  // m/x/e are tri-state ints: 0, 1, or -1 (unset). Comments contain no
+  // tabs and no newlines.
+  struct Label {
+    uint32_t    addr;    // 24-bit
+    std::string name;
+    std::string type;    // optional, lowercase ("function", "data", ...)
+    std::string comment; // optional
+    int8_t      m = -1;
+    int8_t      x = -1;
+    int8_t      e = -1;
+  };
+  void set_label(const Label& L);   // replaces any existing entry at L.addr
+  void clear_label(uint32_t addr);
+  const Label* get_label(uint32_t addr) const;   // nullptr if no overlay
+  uint32_t label_count() const;
+  uint32_t label_snapshot(Label* out, uint32_t cap) const;  // sorted by addr
+  // O(n) random access into the sorted label map. Returns nullptr if
+  // `index >= label_count()`. The pointer borrows project-owned storage
+  // and is valid until the next mutation (set_label/clear_label/close).
+  const Label* label_at(uint32_t index) const;
+
+  // Record live processor flags at a code entry point. Called from the
+  // shadow-callstack JSR/JSL hook so cold-cache disasm at any reached
+  // function knows the caller's M/X/E. Skipped silently when no project
+  // is open (libkintsuki calls unconditionally on the hot path).
+  // Idempotent — first writer wins, subsequent calls are no-ops unless
+  // `force` is set. Use `force=true` when the user manually sets flags.
+  void record_entry_flags(uint32_t addr, int8_t m, int8_t x, int8_t e,
+                          bool force = false);
 
   // Stats — used by inspector header.
   struct Stats {

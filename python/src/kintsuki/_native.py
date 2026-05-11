@@ -14,6 +14,7 @@ from ctypes import (
     Structure,
     c_char_p,
     c_int,
+    c_int8,
     c_size_t,
     c_uint8,
     c_uint16,
@@ -327,6 +328,28 @@ _bind("kintsuki_project_bus_to_rom", c_int,     [HANDLE, c_uint32, POINTER(c_uin
 _bind("kintsuki_project_mark",       c_uint32,  [HANDLE, c_uint32, c_uint32, c_int, c_int])
 _bind("kintsuki_project_map_dump",   c_uint32,  [HANDLE, POINTER(c_uint8), c_uint32])
 _bind("kintsuki_project_stats",      c_int,     [HANDLE, POINTER(ProjectStats)])
+
+
+class ProjectLabel(Structure):
+    _fields_ = [
+        ("addr",    c_uint32),
+        ("name",    c_char_p),
+        ("type",    c_char_p),
+        ("comment", c_char_p),
+        ("m",       c_int8),
+        ("x",       c_int8),
+        ("e",       c_int8),
+        ("_pad",    c_uint8),
+    ]
+
+
+_bind("kintsuki_project_label_set",      c_int,    [HANDLE, c_uint32,
+                                                    c_char_p, c_char_p, c_char_p,
+                                                    c_int, c_int, c_int])
+_bind("kintsuki_project_label_get",      c_int,    [HANDLE, c_uint32, POINTER(ProjectLabel)])
+_bind("kintsuki_project_label_clear",    None,     [HANDLE, c_uint32])
+_bind("kintsuki_project_label_count",    c_uint32, [HANDLE])
+_bind("kintsuki_project_label_snapshot", c_uint32, [HANDLE, POINTER(ProjectLabel), c_uint32])
 
 
 # Re-exports for convenience.

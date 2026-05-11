@@ -429,6 +429,47 @@ typedef struct {
 
 int kintsuki_project_stats(kintsuki_t*, kintsuki_project_stats_t* out);
 
+// ---- Labels overlay (slice 2) ------------------------------------------
+// Per-address user metadata layered on top of the loaded `.adbg`. Labels
+// here win over .adbg labels at the same address — used for renaming
+// routines mid-reverse without touching the assembly source. m/x/e are
+// tri-state ints encoding the processor flag state expected at this
+// entry point: 0 (clear / 16-bit), 1 (set / 8-bit), -1 (unset / not known).
+//
+// Auto-seeded: every JSR/JSL fire records the live M/X (E is fixed at
+// reset) on the target address. First writer wins — manual `label_set`
+// overrides via the same struct.
+
+typedef struct {
+  uint32_t    addr;     // 24-bit
+  const char* name;     // borrowed; valid until next label_set/clear/close
+  const char* type;     // optional; lowercase
+  const char* comment;  // optional
+  int8_t      m;        // -1 unset, 0/1
+  int8_t      x;
+  int8_t      e;
+  uint8_t     _pad;
+} kintsuki_project_label_t;
+
+// Pass NULL for any optional string. Returns 1 on success, 0 if no
+// project open. Replaces any existing entry at addr.
+int kintsuki_project_label_set(kintsuki_t*, uint32_t addr,
+                               const char* name,
+                               const char* type,
+                               const char* comment,
+                               int m, int x, int e);
+// Look up overlay-only (does NOT consult .adbg). Returns 1 + fills out
+// on hit; pointers borrow storage owned by the project, valid until the
+// next mutation.
+int kintsuki_project_label_get(kintsuki_t*, uint32_t addr,
+                               kintsuki_project_label_t* out);
+void kintsuki_project_label_clear(kintsuki_t*, uint32_t addr);
+uint32_t kintsuki_project_label_count(kintsuki_t*);
+// Snapshot in address-ascending order. Returns number written.
+uint32_t kintsuki_project_label_snapshot(kintsuki_t*,
+                                         kintsuki_project_label_t* out,
+                                         uint32_t cap);
+
 #ifdef __cplusplus
 }
 #endif

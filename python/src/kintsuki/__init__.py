@@ -458,6 +458,69 @@ class Emu:
             "user_sticky": int(s.user_sticky),
         }
 
+    def project_label_set(self, addr: int, name: str = "",
+                          *, type: str = "", comment: str = "",
+                          m: int | None = None, x: int | None = None,
+                          e: int | None = None) -> None:
+        """Set the project-overlay label at ``addr`` (24-bit). Replaces any
+        existing entry. Empty strings drop the corresponding column; pass
+        ``None`` for ``m/x/e`` to leave the processor flag unset
+        (tri-state, value -1 on the C side)."""
+        def _flag(v: int | None) -> int:
+            return -1 if v is None else int(v)
+        ok = _native.lib.kintsuki_project_label_set(
+            self._handle, addr & 0xFFFFFF,
+            name.encode("utf-8") if name else b"",
+            type.encode("utf-8") if type else b"",
+            comment.encode("utf-8") if comment else b"",
+            _flag(m), _flag(x), _flag(e))
+        if not ok:
+            raise RuntimeError("no project open")
+
+    def project_label_get(self, addr: int) -> dict | None:
+        """Look up the overlay-only label at ``addr``. Returns ``None``
+        when no overlay entry exists. Does NOT fall back to .adbg."""
+        L = _native.ProjectLabel()
+        ok = _native.lib.kintsuki_project_label_get(
+            self._handle, addr & 0xFFFFFF, ctypes.byref(L))
+        if not ok:
+            return None
+        def _flag(v: int) -> int | None:
+            return None if v < 0 else int(v)
+        return {
+            "addr":    int(L.addr),
+            "name":    L.name.decode("utf-8") if L.name else "",
+            "type":    L.type.decode("utf-8") if L.type else "",
+            "comment": L.comment.decode("utf-8") if L.comment else "",
+            "m": _flag(L.m), "x": _flag(L.x), "e": _flag(L.e),
+        }
+
+    def project_label_clear(self, addr: int) -> None:
+        _native.lib.kintsuki_project_label_clear(self._handle, addr & 0xFFFFFF)
+
+    def project_labels(self) -> list[dict]:
+        """All overlay labels, address-ascending. Empty list when no
+        project is open."""
+        n = int(_native.lib.kintsuki_project_label_count(self._handle))
+        if n == 0:
+            return []
+        buf = (_native.ProjectLabel * n)()
+        written = int(_native.lib.kintsuki_project_label_snapshot(
+            self._handle, buf, n))
+        def _flag(v: int) -> int | None:
+            return None if v < 0 else int(v)
+        out: list[dict] = []
+        for i in range(written):
+            L = buf[i]
+            out.append({
+                "addr":    int(L.addr),
+                "name":    L.name.decode("utf-8") if L.name else "",
+                "type":    L.type.decode("utf-8") if L.type else "",
+                "comment": L.comment.decode("utf-8") if L.comment else "",
+                "m": _flag(L.m), "x": _flag(L.x), "e": _flag(L.e),
+            })
+        return out
+
     # -------------------------------------------------------------- Run/step
     def run_frames(self, n: int) -> None:
         _native.lib.kintsuki_run_frames(self._handle, n)
