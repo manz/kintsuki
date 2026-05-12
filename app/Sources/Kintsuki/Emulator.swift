@@ -870,6 +870,57 @@ final class Emulator {
         }
     }
 
+    // ---- Project: function exits (slice 7) -----------------------------
+
+    struct ProjectFunction: Identifiable, Hashable {
+        let entry: UInt32        // 24-bit
+        let callCount: UInt32
+        let lastExitFrame: UInt64
+        let exits: [UInt32]      // 24-bit, dedup'd, first-seen order
+        let exitKinds: [UInt8]   // parallel to exits, 0=RTS, 1=RTL
+        var id: UInt32 { entry }
+        /// Inclusive last byte the function is known to span (max exit
+        /// observed; ~+2 bytes for RTS/RTL operand width). Nil when no
+        /// exits have been recorded yet.
+        var endApprox: UInt32? {
+            guard let m = exits.max() else { return nil }
+            return m + 2     // RTS is 1 byte, RTL is 1 byte, add a hair
+        }
+    }
+
+    /// Project-side observed functions (entry + recorded exit PCs).
+    /// Empty when no project is open or no function has returned yet.
+    func projectFunctions() -> [ProjectFunction] {
+        guard let h = handle, projectIsOpen else { return [] }
+        let count = kintsuki_project_func_count(h)
+        if count == 0 { return [] }
+        var buf = [kintsuki_project_func_t](
+            repeating: kintsuki_project_func_t(), count: Int(count))
+        let written = buf.withUnsafeMutableBufferPointer { p -> UInt32 in
+            kintsuki_project_func_snapshot(h, p.baseAddress, UInt32(p.count))
+        }
+        var out: [ProjectFunction] = []
+        out.reserveCapacity(Int(written))
+        for i in 0..<Int(written) {
+            let f = buf[i]
+            var exits = [kintsuki_project_exit_t](
+                repeating: kintsuki_project_exit_t(),
+                count: Int(f.exit_count))
+            let en = exits.withUnsafeMutableBufferPointer { p -> UInt32 in
+                kintsuki_project_func_exits(h, f.entry, p.baseAddress,
+                                            UInt32(p.count))
+            }
+            let exitPcs = (0..<Int(en)).map { exits[$0].pc }
+            let exitKinds = (0..<Int(en)).map { exits[$0].kind }
+            out.append(ProjectFunction(entry: f.entry,
+                                       callCount: f.call_count,
+                                       lastExitFrame: f.last_exit_frame,
+                                       exits: exitPcs,
+                                       exitKinds: exitKinds))
+        }
+        return out
+    }
+
     /// Bulk-dump map.bin into a Data buffer. Empty when no project open.
     func projectMapDump() -> Data {
         guard let h = handle, projectIsOpen,

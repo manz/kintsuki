@@ -60,6 +60,10 @@ struct DebuggerView: View {
     /// shadow it into @State and refresh via `.onReceive` so each
     /// row sees the latest BP set when it re-renders.
     @State private var displayedBreakpoints: [Emulator.Breakpoint] = []
+    /// Project functions whose range covers any displayed disasm row.
+    /// Updated alongside `displayedLines` in `rebuildLines` so the
+    /// gutter doesn't pull at 60 Hz.
+    @State private var displayedFunctions: [Emulator.ProjectFunction] = []
     /// Cached running flag — drives toolbar Pause/Resume label without
     /// taking a `@ObservedObject` subscription that would re-render the
     /// pane every emulator @Published mutation.
@@ -441,6 +445,45 @@ struct DebuggerView: View {
         }
     }
 
+    /// Per-row description of how the function gutter should render.
+    private struct FunctionGutter {
+        let color: Color
+        let isEntry: Bool
+        let isExit: Bool
+    }
+
+    /// Find the project function whose `[entry, endApprox]` range covers
+    /// `pc`. Returns nil when no project is open or no recorded function
+    /// spans this PC. Linear scan — function tables stay in the hundreds
+    /// even for big games, the cost is negligible per row.
+    private func functionGutter(for pc: UInt32) -> FunctionGutter? {
+        guard !displayedFunctions.isEmpty else { return nil }
+        for f in displayedFunctions {
+            guard let end = f.endApprox else {
+                if f.entry == pc {
+                    return FunctionGutter(color: gutterColor(forEntry: f.entry),
+                                          isEntry: true, isExit: false)
+                }
+                continue
+            }
+            if pc >= f.entry && pc <= end {
+                let isExit = f.exits.contains(pc)
+                return FunctionGutter(color: gutterColor(forEntry: f.entry),
+                                      isEntry: pc == f.entry,
+                                      isExit: isExit)
+            }
+        }
+        return nil
+    }
+
+    /// Stable per-function colour. Hash entry → hue. Saturation +
+    /// brightness fixed so the bar reads cleanly against the row bg.
+    private func gutterColor(forEntry entry: UInt32) -> Color {
+        // 24-bit golden-ratio hash → hue in [0, 1).
+        let h = Double((entry &* 2654435761) & 0xFFFFFFFF) / 4294967296.0
+        return Color(hue: h, saturation: 0.55, brightness: 0.95)
+    }
+
     private func disasmRow(line: Emulator.DisasmLine) -> some View {
         // Use the cached "active PC" rather than the live @Published
         // value so the row doesn't repaint at 60 Hz while running.
@@ -453,7 +496,31 @@ struct DebuggerView: View {
         // (rough hint of where execution sits) but wrong on disassembly
         // where every row of a routine ends up tagged with the same
         // line — sometimes kilobytes away from the actual instruction.
+        let funcGutter = functionGutter(for: line.pc)
         return HStack(spacing: 0) {
+            // Function gutter: vertical bar coloured per function entry.
+            // Tick at top = function start, tick at bottom = exit PC.
+            // Width is tight so it doesn't push the BP dot column out.
+            ZStack(alignment: .leading) {
+                if let fg = funcGutter {
+                    Rectangle()
+                        .fill(fg.color.opacity(0.55))
+                        .frame(width: 3)
+                    if fg.isEntry {
+                        Rectangle()
+                            .fill(fg.color)
+                            .frame(width: 6, height: 2)
+                            .offset(y: -7)
+                    }
+                    if fg.isExit {
+                        Rectangle()
+                            .fill(fg.color)
+                            .frame(width: 6, height: 2)
+                            .offset(y: 7)
+                    }
+                }
+            }
+            .frame(width: 6)
             // Gutter
             Button(action: { toggleBreakpoint(at: line.pc) }) {
                 Image(systemName: bp != nil ? "circle.fill" : "circle")
@@ -522,6 +589,7 @@ struct DebuggerView: View {
         displayedPC = displayPC ?? s.pc
         displayedLines = currentLines()
         displayedBreakpoints = emulator.breakpoints
+        displayedFunctions = emulator.projectFunctions()
         // Bump the LazyVStack's `.id` so SwiftUI rebuilds it, the
         // scroll position resets, and the .onAppear-style scrollTo on
         // the inner ScrollViewReader re-anchors on the (possibly new)
