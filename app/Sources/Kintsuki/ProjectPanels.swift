@@ -34,8 +34,11 @@ struct ProjectLabelsView: View {
         .frame(minWidth: 560, minHeight: 360)
         .onAppear { refresh() }
         .onChange(of: emulator.projectDir) { _, _ in refresh() }
+        .onChange(of: emulator.projectIsOpen) { _, _ in refresh() }
+        .onChange(of: emulator.loadedROM) { _, _ in refresh() }
         .onReceive(Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()) { _ in
-            // Pick up auto-seeded entry flags from the JSR/JSL hook.
+            // Pick up auto-seeded entry flags from the JSR/JSL hook +
+            // any external edits to labels.tsv (e.g. side scripts).
             refresh()
         }
     }
