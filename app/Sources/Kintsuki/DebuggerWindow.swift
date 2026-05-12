@@ -75,6 +75,12 @@ struct DebuggerView: View {
 
     private static let windowSize = 80          // total disassembly lines
     private static let linesBeforePC = 8         // lines retained above PC
+    private static let pageGrow = 64             // lines added per scroll page
+    private static let pageCap = 2000            // hard cap on retained rows
+    @State private var loadingTop = false
+    @State private var loadingBottom = false
+    @State private var prependBlocked = false   // can't walk back further
+    @State private var appendBlocked  = false   // hit bank wrap / ROM end
 
     var body: some View {
         VStack(spacing: 0) {
@@ -400,6 +406,12 @@ struct DebuggerView: View {
         return ScrollViewReader { scroller in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
+                    // Top sentinel: appears in the lazy stack viewport
+                    // only when the user scrolls within ~one row of the
+                    // first decoded line. Triggers a back-walk + prepend.
+                    Color.clear
+                        .frame(height: 1)
+                        .onAppear { loadMoreTop() }
                     ForEach(lines) { line in
                         VStack(alignment: .leading, spacing: 0) {
                             // Label header — shown above any line whose PC
@@ -416,6 +428,10 @@ struct DebuggerView: View {
                         }
                         .id(line.pc)
                     }
+                    // Bottom sentinel: trips an append when visible.
+                    Color.clear
+                        .frame(height: 1)
+                        .onAppear { loadMoreBottom() }
                 }
                 // Tie the LazyVStack's identity to the breakpoint set
                 // so adding / removing a BP forces every row to re-eval
@@ -654,11 +670,81 @@ struct DebuggerView: View {
         displayedLines = currentLines()
         displayedBreakpoints = emulator.breakpoints
         displayedFunctions = emulator.projectFunctions()
+        // Fresh window — unblock paging so the user can grow again.
+        prependBlocked = false
+        appendBlocked = false
         // Bump the LazyVStack's `.id` so SwiftUI rebuilds it, the
         // scroll position resets, and the .onAppear-style scrollTo on
         // the inner ScrollViewReader re-anchors on the (possibly new)
         // active PC. Without this the lazy stack reuses old offsets
         // after a step and the highlight scrolls out of view.
+        refreshTick &+= 1
+    }
+
+    /// Append more disasm lines past the last visible row. Walks the
+    /// `length` field of the current tail to find the next PC, then
+    /// asks the emulator for `pageGrow` more lines. Stops walking on
+    /// bank wrap so we don't leak across mapper boundaries.
+    private func loadMoreBottom() {
+        if loadingBottom || appendBlocked { return }
+        guard let last = displayedLines.last else { return }
+        loadingBottom = true
+        defer { loadingBottom = false }
+        let bankBase = last.pc & 0xFF0000
+        let next16 = UInt32(last.pc & 0xFFFF) + UInt32(last.length)
+        if next16 > 0xFFFF { appendBlocked = true; return }
+        let nextPc = bankBase | next16
+        let more = emulator.disassemble(at: nextPc,
+                                        count: Self.pageGrow,
+                                        eOverride: nil,
+                                        mOverride: nil,
+                                        xOverride: nil)
+        guard !more.isEmpty else { appendBlocked = true; return }
+        displayedLines.append(contentsOf: more)
+        // Trim from the top if we blew past the cap. Don't trim while
+        // the user might still want to scroll back through the prepend
+        // window — leave at least one full page above PC.
+        if displayedLines.count > Self.pageCap {
+            let drop = displayedLines.count - Self.pageCap
+            displayedLines.removeFirst(drop)
+            prependBlocked = false
+        }
+        refreshTick &+= 1
+    }
+
+    /// Prepend more lines above the first visible row. 65816 isn't
+    /// reverse-decodable without context, so we probe back ~3 bytes per
+    /// requested line, disassemble forward from that anchor, then keep
+    /// only the entries strictly before the current top.
+    private func loadMoreTop() {
+        if loadingTop || prependBlocked { return }
+        guard let first = displayedLines.first else { return }
+        loadingTop = true
+        defer { loadingTop = false }
+        let bankBase = first.pc & 0xFF0000
+        let pc16 = first.pc & 0xFFFF
+        // Always probe at least 3 bytes per requested line; bank-clamp.
+        let probeBack = UInt32(Self.pageGrow) * 3
+        if pc16 <= 0x8000 + probeBack {
+            // We're close to the bottom of the bank's ROM window — give
+            // up rather than producing speculative gibberish.
+            prependBlocked = true
+            return
+        }
+        let start = bankBase | (pc16 - probeBack)
+        let probed = emulator.disassemble(at: start,
+                                          count: Self.pageGrow * 2,
+                                          eOverride: nil,
+                                          mOverride: nil,
+                                          xOverride: nil)
+        let prefix = probed.prefix { $0.pc < first.pc }
+        guard !prefix.isEmpty else { prependBlocked = true; return }
+        displayedLines.insert(contentsOf: prefix, at: 0)
+        if displayedLines.count > Self.pageCap {
+            let drop = displayedLines.count - Self.pageCap
+            displayedLines.removeLast(drop)
+            appendBlocked = false
+        }
         refreshTick &+= 1
     }
 
