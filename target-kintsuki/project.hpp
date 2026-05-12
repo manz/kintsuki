@@ -37,6 +37,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <vector>
 
 namespace kintsuki {
 
@@ -50,7 +51,8 @@ enum class ByteClass : uint8_t {
   Tilemap   = 6,
   Palette   = 7,
   Audio     = 8,   // BRR / SPC engine data
-  // 9..0x3F reserved for future auto classes.
+  CodeOperand = 9, // bytes following an opcode (immediate, address, ...)
+  // 10..0x3F reserved for future auto classes.
   // 0x40..0x7F reserved for project-defined classes.
   // 0x80 bit = USER_STICKY (set by user, auto-reclassify must not clobber).
 };
@@ -184,6 +186,28 @@ public:
   void clear_breakpoints();
   uint32_t breakpoint_count() const;
   const Breakpoint* breakpoint_at(uint32_t index) const;
+
+  // ---- Function exits (slice 7) ----------------------------------------
+  // Per-function aggregated exit info: every RTS/RTL that pops back
+  // through an entry records its PC + kind in this entry's set. Lets
+  // viewers answer "where does this routine return from?" without a
+  // static cfg walk, and surface multi-exit / non-RTS-only functions.
+  struct FuncInfo {
+    uint32_t entry;        // 24-bit
+    uint32_t call_count;
+    uint64_t last_exit_frame;
+    // Exit PCs observed so far. Vector instead of set so the order is
+    // stable across save/load (first-seen wins) — UI shows them in the
+    // order they're encountered which matches reading the disassembly.
+    std::vector<uint32_t> exit_pcs;
+    // Parallel to exit_pcs: 0 = RTS, 1 = RTL.
+    std::vector<uint8_t>  exit_kinds;
+  };
+  void note_function_exit(uint32_t entry, uint32_t exit_pc,
+                          uint8_t kind, uint64_t frame);
+  uint32_t func_count() const;
+  const FuncInfo* func_at(uint32_t index) const;
+  const FuncInfo* func_for(uint32_t entry) const;
 
   // Record live processor flags at a code entry point. Called from the
   // shadow-callstack JSR/JSL hook so cold-cache disasm at any reached

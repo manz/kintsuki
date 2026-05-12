@@ -45,43 +45,46 @@ final class Emulator {
     /// Byte-class enum mirroring `KINTSUKI_BYTE_*`. Swift-side so views
     /// can switch over it without dragging the C constants in directly.
     enum ByteClass: UInt8 {
-        case unknown  = 0
-        case code     = 1
-        case data     = 2
-        case pointer  = 3
-        case string   = 4
-        case graphics = 5
-        case tilemap  = 6
-        case palette  = 7
-        case audio    = 8
+        case unknown     = 0
+        case code        = 1     // opcode byte
+        case data        = 2
+        case pointer     = 3
+        case string      = 4
+        case graphics    = 5
+        case tilemap     = 6
+        case palette     = 7
+        case audio       = 8
+        case codeOperand = 9     // bytes after an opcode
 
         /// Conventional colour for inspector overlays. Tuned to read at
         /// 12pt cell-fill alpha (~0.3) against the system table bg.
         var overlayColor: NSColor {
             switch self {
-            case .unknown:  return .clear
-            case .code:     return NSColor.systemBlue
-            case .data:     return NSColor.systemOrange
-            case .pointer:  return NSColor.systemTeal
-            case .string:   return NSColor.systemGreen
-            case .graphics: return NSColor.systemPurple
-            case .tilemap:  return NSColor.systemPink
-            case .palette:  return NSColor.systemYellow
-            case .audio:    return NSColor.systemBrown
+            case .unknown:     return .clear
+            case .code:        return NSColor.systemBlue
+            case .codeOperand: return NSColor.systemBlue.withAlphaComponent(0.55)
+            case .data:        return NSColor.systemOrange
+            case .pointer:     return NSColor.systemTeal
+            case .string:      return NSColor.systemGreen
+            case .graphics:    return NSColor.systemPurple
+            case .tilemap:     return NSColor.systemPink
+            case .palette:     return NSColor.systemYellow
+            case .audio:       return NSColor.systemBrown
             }
         }
         /// Short label for the right-click "Mark as…" menu + status pill.
         var label: String {
             switch self {
-            case .unknown:  return "Unknown"
-            case .code:     return "Code"
-            case .data:     return "Data"
-            case .pointer:  return "Pointer"
-            case .string:   return "String"
-            case .graphics: return "Graphics"
-            case .tilemap:  return "Tilemap"
-            case .palette:  return "Palette"
-            case .audio:    return "Audio"
+            case .unknown:     return "Unknown"
+            case .code:        return "Code"
+            case .codeOperand: return "Code operand"
+            case .data:        return "Data"
+            case .pointer:     return "Pointer"
+            case .string:      return "String"
+            case .graphics:    return "Graphics"
+            case .tilemap:     return "Tilemap"
+            case .palette:     return "Palette"
+            case .audio:       return "Audio"
             }
         }
         static let allUserMarkable: [ByteClass] = [
@@ -2059,31 +2062,52 @@ final class Emulator {
         var id: UInt32 { addr }
     }
 
-    /// All labels loaded from the active `.adbg` sidecar, sorted by
-    /// address ascending. Empty when no .adbg is loaded. Cached snapshot
-    /// — invalidated on `loadADBG` (caller responsibility to re-fetch).
+    /// Union of `.adbg` LABEL table + project overlay labels (IDA-style
+    /// renames stored in `labels.tsv`). Sorted by address; on name
+    /// collisions the project overlay wins. Empty when neither source
+    /// is loaded. The Debugger window uses this for the symbol jump +
+    /// breakpoint autocomplete so both populated tables suggest.
     func allLabels() -> [Label] {
-        guard let h = handle else { return [] }
-        let count = Int(kintsuki_label_count(h))
-        if count == 0 { return [] }
-        var raw = [kintsuki_label_entry_t](repeating: kintsuki_label_entry_t(),
-                                           count: count)
-        let n = raw.withUnsafeMutableBufferPointer { buf -> UInt32 in
-            kintsuki_label_snapshot(h, buf.baseAddress, UInt32(buf.count))
+        // Project overlay first (wins by address).
+        var byAddr: [UInt32: Label] = [:]
+        if projectIsOpen {
+            for L in projectLabels() where !L.name.isEmpty {
+                byAddr[L.addr] = Label(addr: L.addr, name: L.name)
+            }
         }
-        var out: [Label] = []
-        out.reserveCapacity(Int(n))
-        for i in 0..<Int(n) {
-            let e = raw[i]
-            guard let p = e.name else { continue }
-            out.append(Label(addr: e.addr, name: String(cString: p)))
+        // .adbg fills in any gaps.
+        if let h = handle {
+            let count = Int(kintsuki_label_count(h))
+            if count > 0 {
+                var raw = [kintsuki_label_entry_t](repeating: kintsuki_label_entry_t(),
+                                                   count: count)
+                let n = raw.withUnsafeMutableBufferPointer { buf -> UInt32 in
+                    kintsuki_label_snapshot(h, buf.baseAddress, UInt32(buf.count))
+                }
+                for i in 0..<Int(n) {
+                    let e = raw[i]
+                    guard let p = e.name else { continue }
+                    if byAddr[e.addr] == nil {
+                        byAddr[e.addr] = Label(addr: e.addr, name: String(cString: p))
+                    }
+                }
+            }
         }
-        return out
+        return byAddr.values.sorted { $0.addr < $1.addr }
     }
 
-    /// Resolve a label by name → 24-bit PC. Returns nil when no .adbg is
-    /// loaded or no label by that name exists.
+    /// Resolve a label by name → 24-bit PC. Consults project overlay
+    /// first, then `.adbg`. Returns nil when neither source has a
+    /// match.
     func resolveSymbol(_ name: String) -> UInt32? {
+        if projectIsOpen {
+            // Linear scan, but overlay tables are small (hundreds, not
+            // thousands of entries) so the cost is negligible vs the
+            // FFI hop that `kintsuki_lookup_symbol_addr` would do.
+            for L in projectLabels() where L.name == name {
+                return L.addr
+            }
+        }
         guard let h = handle else { return nil }
         var addr: UInt32 = 0
         let ok = name.withCString { kintsuki_lookup_symbol_addr(h, $0, &addr) }

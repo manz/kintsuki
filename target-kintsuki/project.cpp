@@ -154,6 +154,11 @@ struct Project::Impl {
   bool bookmarks_dirty = false;
   std::vector<Project::Breakpoint> breakpoints;
   bool breakpoints_dirty = false;
+  std::map<uint32_t, Project::FuncInfo> funcs;
+  // Parallel index of insertion order so func_at(index) returns stable
+  // results — std::map iteration is by addr, which is what we want for
+  // sorted display, so just iterate `funcs`.
+  bool funcs_dirty = false;
 
   // Resolve bus -> rom offset for LoROM / HiROM. Returns -1 on non-ROM
   // address. ExHiROM + coprocessors not yet supported (slice 1 limitation
@@ -266,6 +271,41 @@ std::unique_ptr<Project> Project::open(const std::string& dir,
     }
   }
 
+  // functions.tsv — observed function exits keyed by entry. Missing
+  // file is fine (project hasn't run yet, or no project label is a
+  // function entry).
+  {
+    std::ifstream f(im.dir / "functions.tsv");
+    std::string line;
+    while(std::getline(f, line)) {
+      if(line.empty() || line[0] == '#') continue;
+      auto fields = splitTab(line);
+      if(fields.size() < 4) continue;
+      Project::FuncInfo fi{};
+      fi.entry           = (uint32_t)std::strtoul(fields[0].c_str(), nullptr, 16);
+      fi.call_count      = (uint32_t)std::strtoul(fields[1].c_str(), nullptr, 0);
+      fi.last_exit_frame = (uint64_t)std::strtoull(fields[2].c_str(), nullptr, 0);
+      // Exits column: comma-separated `pc:kind` pairs.
+      std::string& exits = fields[3];
+      size_t a = 0;
+      for(size_t i = 0; i <= exits.size(); i++) {
+        if(i == exits.size() || exits[i] == ',') {
+          if(i > a) {
+            std::string pair = exits.substr(a, i - a);
+            auto colon = pair.find(':');
+            uint32_t pc = (uint32_t)std::strtoul(pair.c_str(), nullptr, 16);
+            uint8_t kind = (colon != std::string::npos
+                            && pair.substr(colon + 1) == "1") ? 1 : 0;
+            fi.exit_pcs.push_back(pc);
+            fi.exit_kinds.push_back(kind);
+          }
+          a = i + 1;
+        }
+      }
+      im.funcs[fi.entry] = fi;
+    }
+  }
+
   // bookmarks.tsv — named view targets.
   {
     std::ifstream f(im.dir / "bookmarks.tsv");
@@ -352,6 +392,28 @@ bool Project::save() {
 
   // map.bin
   if(!writeFile(im.dir / "map.bin", im.map.data(), im.map.size())) return false;
+
+  // functions.tsv
+  if(im.funcs_dirty) {
+    std::ostringstream o;
+    o << "# entry\tcall_count\tlast_frame\texits (pc:kind,...)\n";
+    for(auto& kv : im.funcs) {
+      const auto& fi = kv.second;
+      char eBuf[12];
+      std::snprintf(eBuf, sizeof(eBuf), "%06X", fi.entry & 0xFFFFFF);
+      o << eBuf << '\t' << fi.call_count << '\t' << fi.last_exit_frame << '\t';
+      for(size_t i = 0; i < fi.exit_pcs.size(); i++) {
+        if(i) o << ',';
+        char xBuf[12];
+        std::snprintf(xBuf, sizeof(xBuf), "%06X", fi.exit_pcs[i] & 0xFFFFFF);
+        o << xBuf << ':' << (int)fi.exit_kinds[i];
+      }
+      o << '\n';
+    }
+    auto s = o.str();
+    if(!writeFile(im.dir / "functions.tsv", s.data(), s.size())) return false;
+    im.funcs_dirty = false;
+  }
 
   // bookmarks.tsv
   if(im.bookmarks_dirty) {
@@ -485,7 +547,14 @@ void Project::note_exec(uint32_t pc_24, uint8_t insn_len) {
   auto& im = *impl_;
   int64_t off = im.busToRom(pc_24);
   if(off < 0) return;
-  mark_auto((uint32_t)off, insn_len ? insn_len : 1, ByteClass::Code);
+  // First byte = opcode; subsequent bytes = operands. Splitting the
+  // classes lets the disassembly view colour operands distinctly and
+  // saves a future static-analysis pass from re-disassembling to know
+  // "is this byte safe to read as a value".
+  mark_auto((uint32_t)off, 1, ByteClass::Code);
+  if(insn_len > 1) {
+    mark_auto((uint32_t)off + 1, (uint32_t)insn_len - 1, ByteClass::CodeOperand);
+  }
 }
 
 int64_t Project::bus_to_rom_offset(uint32_t bus_addr_24) const {
@@ -576,6 +645,52 @@ uint32_t Project::breakpoint_count() const {
 const Project::Breakpoint* Project::breakpoint_at(uint32_t index) const {
   auto& v = impl_->breakpoints;
   return index < v.size() ? &v[index] : nullptr;
+}
+
+// ---- Function exits (slice 7) ------------------------------------------
+
+void Project::note_function_exit(uint32_t entry, uint32_t exit_pc,
+                                 uint8_t kind, uint64_t frame) {
+  auto& im = *impl_;
+  entry  &= 0xFFFFFF;
+  exit_pc &= 0xFFFFFF;
+  auto& slot = im.funcs[entry];
+  if(slot.entry == 0 && slot.exit_pcs.empty()) {
+    slot.entry = entry;
+  }
+  slot.call_count += 1;
+  slot.last_exit_frame = frame;
+  // Dedupe exits per function — vector small, linear scan fine.
+  bool seen = false;
+  for(size_t i = 0; i < slot.exit_pcs.size(); i++) {
+    if(slot.exit_pcs[i] == exit_pc && slot.exit_kinds[i] == kind) {
+      seen = true; break;
+    }
+  }
+  if(!seen) {
+    slot.exit_pcs.push_back(exit_pc);
+    slot.exit_kinds.push_back(kind);
+  }
+  im.funcs_dirty = true;
+  im.dirty = true;
+}
+
+uint32_t Project::func_count() const {
+  return (uint32_t)impl_->funcs.size();
+}
+
+const Project::FuncInfo* Project::func_at(uint32_t index) const {
+  auto& m = impl_->funcs;
+  if(index >= m.size()) return nullptr;
+  auto it = m.begin();
+  std::advance(it, index);
+  return &it->second;
+}
+
+const Project::FuncInfo* Project::func_for(uint32_t entry) const {
+  auto& m = impl_->funcs;
+  auto it = m.find(entry & 0xFFFFFF);
+  return it == m.end() ? nullptr : &it->second;
 }
 
 // ---- DMA provenance -----------------------------------------------------

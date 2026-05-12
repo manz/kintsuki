@@ -382,6 +382,7 @@ typedef enum {
   KINTSUKI_BYTE_TILEMAP  = 6,
   KINTSUKI_BYTE_PALETTE  = 7,
   KINTSUKI_BYTE_AUDIO    = 8,
+  KINTSUKI_BYTE_CODE_OPERAND = 9,
 } kintsuki_byte_class_t;
 
 // User-sticky flag: OR'd into the byte stored in map.bin to mark a class as
@@ -507,6 +508,36 @@ uint32_t kintsuki_project_dma_prov_for_range(kintsuki_t*,
                                              uint32_t rom_offset, uint32_t len,
                                              kintsuki_project_dma_prov_t* out,
                                              uint32_t cap);
+
+// ---- Function exits (slice 7) ------------------------------------------
+// Per-function aggregated exit info, populated from the JSR/JSL <-> RTS/
+// RTL hook pair while a project is open. Lets the UI answer "where does
+// this routine return from?" for any known entry — drives the "end of
+// function" view on the labels panel.
+
+typedef struct {
+  uint32_t entry;          // 24-bit
+  uint32_t call_count;
+  uint64_t last_exit_frame;
+  uint32_t exit_count;     // number of unique (pc, kind) exit points
+} kintsuki_project_func_t;
+
+uint32_t kintsuki_project_func_count(kintsuki_t*);
+uint32_t kintsuki_project_func_snapshot(kintsuki_t*,
+                                        kintsuki_project_func_t* out,
+                                        uint32_t cap);
+
+// Per-function exit-PC list. Returns count actually written. The exits
+// are de-duplicated by (pc, kind) on the C++ side.
+typedef struct {
+  uint32_t pc;             // 24-bit; address of the RTS/RTL opcode
+  uint8_t  kind;           // 0=RTS, 1=RTL
+  uint8_t  _pad[3];
+} kintsuki_project_exit_t;
+
+uint32_t kintsuki_project_func_exits(kintsuki_t*, uint32_t entry,
+                                     kintsuki_project_exit_t* out,
+                                     uint32_t cap);
 
 // ---- Bookmarks (slice 4) -----------------------------------------------
 typedef struct {

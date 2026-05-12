@@ -42,6 +42,16 @@ kintsuki::AdbgLabels g_labels;
 // can reset it. Hooks fire only when non-null — single null-check on the
 // hot path.
 std::unique_ptr<kintsuki::Project> g_project;
+// Last PC seen by the exec hook. Used by cOnReturn to recover the RTS/
+// RTL opcode address — ares' returnHook fires after PC has been moved
+// to the return target, so the exit PC is unrecoverable from cpu.r.pc
+// alone. Sampled in cOnExec; falls back to 0 when no exec hook fired
+// recently.
+uint32_t g_lastExecPc = 0;
+
+// Forward decl — defined further down in this TU's anon-namespace.
+// Both blocks share linkage so this resolves to the same symbol.
+uint8_t inst_length_for(uint8_t opcode, bool m_flag, bool x_flag);
 // Autosave (slice 5): when non-zero, kintsuki_run_frames flushes the
 // project to disk every Nth call-frame if anything is dirty. We count
 // frames *requested* (the `n` arg to run_frames), not framesRendered —
@@ -75,8 +85,18 @@ void cOnCall(uint32_t callsite_pc, uint32_t target_pc, uint8_t kind) {
 }
 
 void cOnReturn(uint8_t kind) {
-  (void)kind;
-  if(!g_callstack.empty()) g_callstack.pop_back();
+  if(g_callstack.empty()) return;
+  // Snapshot entry of the frame we're about to pop. The shadow stack's
+  // top frame is the routine that's exiting.
+  uint32_t entry = g_callstack.back().target_pc & 0xFFFFFF;
+  g_callstack.pop_back();
+  if(g_project) {
+    // exit_pc = the RTS/RTL opcode address. cOnExec stashes the last
+    // PC it saw; ares' returnHook fires after PC has moved to the
+    // return target, so we can't read it from cpu.r.pc here.
+    uint64_t frame = kintsukiProgram ? kintsukiProgram->framesRendered : 0;
+    g_project->note_function_exit(entry, g_lastExecPc, kind, frame);
+  }
 }
 }  // namespace
 
@@ -531,13 +551,35 @@ auto cFire(std::vector<CCallback>& list, uint32_t addr, uint8_t value) -> void {
 void tracerOnExec(uint32_t pc);
 
 void cOnExec(uint32_t pc) {
-  if(g_project) g_project->note_exec(pc, 1);
+  g_lastExecPc = pc & 0xFFFFFF;
+  if(g_project) {
+    // Resolve instruction length from the live opcode + M/X flags so
+    // operand bytes get marked as CodeOperand (the user can spot
+    // `lda #$1234` immediates vs raw code without re-disassembling).
+    auto& r = ares::SuperFamicom::cpu.r;
+    uint8_t opcode = ares::SuperFamicom::cpu.readDisassembler(pc & 0xFFFFFF);
+    uint8_t len = inst_length_for(opcode, r.p.m, r.p.x);
+    g_project->note_exec(pc, len ? len : 1);
+  }
   tracerOnExec(pc);
   if(g_cExecPages[(pc & 0xffffff) >> 8] == 0) return;
   cFire(g_cExec, pc, 0);
 }
 
+
+// Inline project-data classifier; merged into cOnRead so a single
+// memReadHook covers both user CBs and the slice-7 project data marker.
+inline void projectMarkRead(uint32_t addr) {
+  if(!g_project) return;
+  int64_t rom = g_project->bus_to_rom_offset(addr);
+  if(rom < 0) return;
+  uint32_t o = (uint32_t)rom;
+  if((uint8_t)g_project->classify(o) != 0) return;   // already classified
+  g_project->mark_auto(o, 1, kintsuki::ByteClass::Data);
+}
+
 void cOnRead(uint32_t addr, uint8_t value) {
+  projectMarkRead(addr);
   if(g_cReadPages[(addr & 0xffffff) >> 8] == 0) return;
   cFire(g_cRead, addr, value);
 }
@@ -601,9 +643,11 @@ void kintsuki_remove_callback(kintsuki_t* h, int kind, int id) {
   bool any = false;
   for(auto& c : *list) if(c.active) { any = true; break; }
   if(!any) {
-    if(kind == CB_EXEC)  ares::SuperFamicom::execHook = nullptr;
-    if(kind == CB_READ)  ares::SuperFamicom::memReadHook = nullptr;
-    if(kind == CB_WRITE) ares::SuperFamicom::memWriteHook = nullptr;
+    // Keep hooks armed when a project is open — the project relies on
+    // exec + read marks even with zero user-registered CBs.
+    if(kind == CB_EXEC  && !g_project) ares::SuperFamicom::execHook = nullptr;
+    if(kind == CB_READ  && !g_project) ares::SuperFamicom::memReadHook = nullptr;
+    if(kind == CB_WRITE)               ares::SuperFamicom::memWriteHook = nullptr;
   }
 }
 
@@ -1296,6 +1340,12 @@ int kintsuki_project_open(kintsuki_t* h, const char* dir) {
   if(!g_project) return 0;
   // Ensure execHook is wired so note_exec fires even without user CBs.
   if(!ares::SuperFamicom::execHook) ares::SuperFamicom::execHook = &cOnExec;
+  // memReadHook only fires when registered; install cOnRead (which
+  // both stamps the project data classifier inline and dispatches
+  // user-registered tracing CBs). When the user later adds a CB,
+  // kintsuki_add_callback_ex installs cOnRead too — same target,
+  // safe to overwrite.
+  if(!ares::SuperFamicom::memReadHook) ares::SuperFamicom::memReadHook = &cOnRead;
   g_projectFrameClock    = 0;
   g_projectLastSaveFrame = 0;
   return 1;
@@ -1494,6 +1544,46 @@ uint32_t kintsuki_project_dma_prov_for_range(kintsuki_t* h,
   std::vector<kintsuki::Project::DmaProv> tmp(cap);
   uint32_t n = g_project->dma_prov_for_range(rom_offset, len, tmp.data(), cap);
   for(uint32_t i = 0; i < n; i++) copyProv(out[i], tmp[i]);
+  return n;
+}
+
+// ---- Function exits ----------------------------------------------------
+
+uint32_t kintsuki_project_func_count(kintsuki_t* h) {
+  (void)h;
+  return g_project ? g_project->func_count() : 0;
+}
+
+uint32_t kintsuki_project_func_snapshot(kintsuki_t* h,
+                                        kintsuki_project_func_t* out,
+                                        uint32_t cap) {
+  (void)h;
+  if(!g_project || !out || cap == 0) return 0;
+  uint32_t total = g_project->func_count();
+  uint32_t n = total < cap ? total : cap;
+  for(uint32_t i = 0; i < n; i++) {
+    const auto* fi = g_project->func_at(i);
+    if(!fi) { n = i; break; }
+    out[i].entry           = fi->entry;
+    out[i].call_count      = fi->call_count;
+    out[i].last_exit_frame = fi->last_exit_frame;
+    out[i].exit_count      = (uint32_t)fi->exit_pcs.size();
+  }
+  return n;
+}
+
+uint32_t kintsuki_project_func_exits(kintsuki_t* h, uint32_t entry,
+                                     kintsuki_project_exit_t* out,
+                                     uint32_t cap) {
+  (void)h;
+  if(!g_project || !out || cap == 0) return 0;
+  const auto* fi = g_project->func_for(entry);
+  if(!fi) return 0;
+  uint32_t n = (uint32_t)std::min<size_t>(fi->exit_pcs.size(), cap);
+  for(uint32_t i = 0; i < n; i++) {
+    out[i].pc   = fi->exit_pcs[i];
+    out[i].kind = fi->exit_kinds[i];
+  }
   return n;
 }
 

@@ -104,6 +104,17 @@ struct DebuggerView: View {
         }
         .onChange(of: emulator.breakpoints) { _, _ in rebuildLines() }
         .onChange(of: emulator.crashBacktrace) { _, _ in rebuildLines() }
+        // Project labels join the .adbg pool — re-pull the cache so
+        // autocomplete + per-row badges see imported IDA names without
+        // a window reopen.
+        .onChange(of: emulator.projectIsOpen) { _, _ in
+            labelCache = emulator.allLabels()
+            rebuildLines()
+        }
+        .onChange(of: emulator.projectDir) { _, _ in
+            labelCache = emulator.allLabels()
+            rebuildLines()
+        }
         .onChange(of: emulator.disasmNavRequest) { _, req in
             handleDisasmNav(req)
         }
