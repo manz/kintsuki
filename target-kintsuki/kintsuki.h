@@ -292,6 +292,25 @@ void        kintsuki_tracer_set_ranges(kintsuki_t*,
 // initial state and tracks REP/SEP flips through the disassembled stream
 // so a `rep #$30` advance into 16-bit immediates stays correctly sized.
 // Returns the number of entries actually produced.
+// Per-character token kinds emitted alongside `text`. `kinds[i]` tags
+// `text[i]` with the role of that byte in the assembly line so the host
+// can drive syntax-coloured rendering without re-parsing the string.
+// Appended at the end of `kintsuki_disasm_line_t` — old consumers reading
+// only the historical prefix stay binary-compatible.
+typedef enum {
+  KINTSUKI_TOK_OTHER     = 0,   // whitespace, padding, unclassified
+  KINTSUKI_TOK_MNEMONIC  = 1,
+  KINTSUKI_TOK_IMM_HEX   = 2,   // `$XX` / `$XXXX` immediately after `#`
+  KINTSUKI_TOK_ABS_HEX   = 3,   // 16-bit absolute / direct-non-DP hex
+  KINTSUKI_TOK_LONG_HEX  = 4,   // 24-bit long hex (5..6 nibbles)
+  KINTSUKI_TOK_DP_HEX    = 5,   // direct-page / 8-bit branch hex
+  KINTSUKI_TOK_REG       = 6,   // X / Y / S after a comma
+  KINTSUKI_TOK_PUNCT     = 7,   // `,` `#` `[` `]` `(` `)`
+  KINTSUKI_TOK_LABEL_REF = 8,   // identifier following ` -> `
+  KINTSUKI_TOK_ARROW     = 9,   // the ` -> ` separator itself
+  KINTSUKI_TOK_COMMENT   = 10,  // reserved for `;` comments
+} kintsuki_tok_kind_t;
+
 typedef struct kintsuki_disasm_line_t {
   uint32_t pc;       // 24-bit
   uint8_t  length;   // 1..4 bytes
@@ -302,6 +321,12 @@ typedef struct kintsuki_disasm_line_t {
   // (indirect/indexed). UI can use this for "double-click to follow".
   uint32_t target;
   char     text[128];
+  // Per-char token kinds parallel to `text`. Byte at `text[i]` belongs
+  // to token kind `kinds[i]`. Trailing NUL + padding bytes are
+  // KINTSUKI_TOK_OTHER (0). Hosts that haven't been updated for tokens
+  // can ignore this field entirely — `text` keeps the same content as
+  // before, the NUL terminator is still in place.
+  uint8_t  kinds[128];
 } kintsuki_disasm_line_t;
 
 uint32_t kintsuki_disassemble_at(kintsuki_t*, uint32_t pc, uint32_t count,

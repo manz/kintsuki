@@ -1115,6 +1115,27 @@ final class Emulator {
         /// JMP/JML/JSR/JSL/Bxx/BRL with a constant operand. Nil for
         /// non-branching ops or indirect/indexed jumps.
         let target: UInt32?
+        /// Per-byte token kinds parallel to `text`. `kinds[i]` is the
+        /// `KINTSUKI_TOK_*` value classifying `text[i]`. Truncated to
+        /// the visible string length. The Debugger uses this to paint
+        /// the line without re-parsing assembly.
+        let kinds: [UInt8]
+    }
+
+    /// Sugar mirroring `KINTSUKI_TOK_*` so disasm consumers don't have
+    /// to keep the C-side magic numbers in sync.
+    enum DisasmTok: UInt8 {
+        case other     = 0
+        case mnemonic  = 1
+        case immHex    = 2
+        case absHex    = 3
+        case longHex   = 4
+        case dpHex     = 5
+        case reg       = 6
+        case punct     = 7
+        case labelRef  = 8
+        case arrow     = 9
+        case comment   = 10
     }
 
     func disassemble(at pc: UInt32, count: Int,
@@ -1142,8 +1163,19 @@ final class Emulator {
                 }
             }
             let target: UInt32? = entry.target == 0xFFFFFFFF ? nil : entry.target
+            // Mirror the kinds[] array up to the visible string length.
+            // `text` was built with `String(cString:)`, which counts
+            // bytes up to the first NUL — the kinds are byte-parallel
+            // since the disassembler emits ASCII only.
+            let kinds: [UInt8] = withUnsafePointer(to: &entry.kinds) { tup in
+                tup.withMemoryRebound(to: UInt8.self, capacity: 128) { p in
+                    let utf8len = text.utf8.count
+                    let take = min(utf8len, 128)
+                    return Array(UnsafeBufferPointer(start: p, count: take))
+                }
+            }
             return DisasmLine(pc: entry.pc, length: entry.length,
-                              text: text, target: target)
+                              text: text, target: target, kinds: kinds)
         }
     }
 

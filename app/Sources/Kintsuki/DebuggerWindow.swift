@@ -461,18 +461,33 @@ struct DebuggerView: View {
         }
     }
 
-    /// Build a syntax-coloured AttributedString for one disasm row.
-    /// Three colour groups:
-    ///   - mnemonic (LDA / JMP / RTS / ...) in primary,
-    ///   - hex literal ($1234 / #$80 / .l forms) in orange (matches the
-    ///     map.bin Data tint so eyes pair operand bytes with their
-    ///     destination),
-    ///   - everything else (labels, commas, `,X`) secondary.
-    /// When the project flags this PC as Data, the live disasm text is
-    /// replaced with `.db $XX` — the byte stays visible without the
-    /// walker confidently decoding it as a 65816 opcode.
+    /// Colour for a single token-kind. Hex-width tiers share the orange
+    /// family so operand widths cluster visually; long-form `$XXXXXX`
+    /// reads bolder than DP `$XX` reads.
+    private static func tokColor(_ k: Emulator.DisasmTok) -> NSColor {
+        switch k {
+        case .mnemonic: return .controlAccentColor
+        case .immHex:   return .systemYellow
+        case .absHex:   return .systemOrange
+        case .longHex:  return .systemRed
+        case .dpHex:    return .systemTeal
+        case .reg:      return .systemPurple
+        case .punct:    return .secondaryLabelColor
+        case .labelRef: return .systemBlue
+        case .arrow:    return .tertiaryLabelColor
+        case .comment:  return .secondaryLabelColor
+        case .other:    return .labelColor
+        }
+    }
+
+    /// Build a syntax-coloured AttributedString for one disasm row using
+    /// the per-char `kinds` array emitted by libkintsuki. Each contiguous
+    /// run of identical kinds becomes one styled span. When the project
+    /// flags this PC as non-code, the line is replaced with `.db $XX`
+    /// so the byte still reads visibly without the walker pretending
+    /// the data is a 65816 opcode.
     private func disasmAttributed(for line: Emulator.DisasmLine) -> AttributedString {
-        // Data-aware override.
+        // Data-aware override (slice 7 follow-up).
         if emulator.projectIsOpen,
            let off = emulator.projectBusToRom(line.pc) {
             let raw = emulator.projectClassify(romOffset: off)
@@ -491,33 +506,30 @@ struct DebuggerView: View {
         }
 
         var attr = AttributedString(line.text)
-        attr.foregroundColor = .primary
-        // Highlight hex tokens first ($XX, $XXXX, #$XX, #$XXXX).
-        let nsText = line.text as NSString
-        let hexRE = try? NSRegularExpression(pattern: "#?\\$[0-9A-Fa-f]+", options: [])
-        if let re = hexRE {
-            let matches = re.matches(in: line.text, options: [],
-                                     range: NSRange(location: 0, length: nsText.length))
-            for m in matches {
-                let s = nsText.substring(with: m.range)
-                if let r = attr.range(of: s) {
-                    attr[r].foregroundColor = NSColor.systemOrange
-                }
+        attr.font = .system(.body, design: .monospaced)
+        attr.foregroundColor = NSColor.labelColor
+        let utf8 = Array(line.text.utf8)
+        let n = min(utf8.count, line.kinds.count)
+        guard n > 0 else { return attr }
+        // Walk runs of identical kind; build NSRange (UTF-16) per run +
+        // map to AttributedString.Index.
+        var i = 0
+        while i < n {
+            let k = line.kinds[i]
+            var j = i
+            while j < n && line.kinds[j] == k { j += 1 }
+            let tok = Emulator.DisasmTok(rawValue: k) ?? .other
+            // Resolve byte offsets to AttributedString indices through
+            // the underlying String. AttributedString.index(_:offsetBy:)
+            // operates on its own opaque indices, which line up with
+            // UTF-8 here (ASCII-only disasm output).
+            let start = attr.index(attr.startIndex, offsetByCharacters: i)
+            let end   = attr.index(attr.startIndex, offsetByCharacters: j)
+            attr[start..<end].foregroundColor = Self.tokColor(tok)
+            if tok == .mnemonic {
+                attr[start..<end].font = .system(.body, design: .monospaced).bold()
             }
-        }
-        // The mnemonic is the first whitespace-delimited word — drop
-        // address columns the C disasm doesn't emit; the line text only
-        // contains "MNEMONIC operands". Style it bold + accent.
-        if let space = line.text.firstIndex(where: { $0 == " " }) {
-            let mnemonic = String(line.text[..<space])
-            if let r = attr.range(of: mnemonic) {
-                attr[r].foregroundColor = NSColor.controlAccentColor
-                attr[r].font = .system(.body, design: .monospaced).bold()
-            }
-        } else if !line.text.isEmpty {
-            // Single-word lines (RTS / RTL / NOP).
-            attr.foregroundColor = NSColor.controlAccentColor
-            attr.font = .system(.body, design: .monospaced).bold()
+            i = j
         }
         return attr
     }

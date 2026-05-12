@@ -1255,6 +1255,67 @@ uint32_t kintsuki_disassemble_at_ex(kintsuki_t* h, uint32_t pc, uint32_t count,
                                     int e_override, int m_override, int x_override,
                                     kintsuki_disasm_line_t* out);
 
+// Classify the bytes of a disassembled instruction string into the
+// token-kind enum. State machine — single linear scan, populates
+// `kinds[0..len]` and zeroes the rest. Heuristic but matches every
+// shape ares' wdc65816 disassembler emits (verified against the
+// in-tree disassembler).
+namespace {
+inline bool isHexChar(char c) {
+  return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
+}
+void classifyTokens(const char* text, size_t len, uint8_t* kinds) {
+  std::memset(kinds, 0, 128);
+  if(len == 0) return;
+  size_t i = 0;
+  // Mnemonic: leading letters (+ optional `.l`/`.w` width suffix).
+  while(i < len && ((text[i] >= 'A' && text[i] <= 'Z')
+                 || (text[i] >= 'a' && text[i] <= 'z')
+                 || text[i] == '.')) {
+    kinds[i++] = KINTSUKI_TOK_MNEMONIC;
+  }
+  // Operand stream.
+  while(i < len) {
+    char c = text[i];
+    if(c == '#') {
+      kinds[i++] = KINTSUKI_TOK_PUNCT;
+      if(i < len && text[i] == '$') {
+        size_t start = i;
+        kinds[i++] = KINTSUKI_TOK_IMM_HEX;
+        while(i < len && isHexChar(text[i])) kinds[i++] = KINTSUKI_TOK_IMM_HEX;
+        (void)start;
+      }
+    } else if(c == '$') {
+      size_t start = i;
+      i++;
+      while(i < len && isHexChar(text[i])) i++;
+      size_t hexLen = i - start - 1;
+      uint8_t cls = hexLen <= 2 ? KINTSUKI_TOK_DP_HEX
+                  : hexLen <= 4 ? KINTSUKI_TOK_ABS_HEX
+                  :              KINTSUKI_TOK_LONG_HEX;
+      for(size_t k = start; k < i; k++) kinds[k] = cls;
+    } else if(c == ',') {
+      kinds[i++] = KINTSUKI_TOK_PUNCT;
+      if(i < len && (text[i] == 'X' || text[i] == 'Y' || text[i] == 'S'
+                  || text[i] == 'x' || text[i] == 'y' || text[i] == 's')) {
+        kinds[i++] = KINTSUKI_TOK_REG;
+      }
+    } else if(c == '[' || c == ']' || c == '(' || c == ')') {
+      kinds[i++] = KINTSUKI_TOK_PUNCT;
+    } else if(c == '-' && i + 1 < len && text[i + 1] == '>') {
+      // ` -> name` annotation — paint the arrow as ARROW, the rest as
+      // LABEL_REF up to end-of-string.
+      kinds[i++] = KINTSUKI_TOK_ARROW;
+      kinds[i++] = KINTSUKI_TOK_ARROW;
+      while(i < len && text[i] == ' ') kinds[i++] = KINTSUKI_TOK_ARROW;
+      while(i < len) kinds[i++] = KINTSUKI_TOK_LABEL_REF;
+    } else {
+      i++;   // whitespace + punctuation we don't tag stay OTHER (0)
+    }
+  }
+}
+}  // namespace
+
 uint32_t kintsuki_disassemble_at(kintsuki_t* h, uint32_t pc, uint32_t count,
                                  kintsuki_disasm_line_t* out) {
   return kintsuki_disassemble_at_ex(h, pc, count, -1, -1, -1, out);
@@ -1301,6 +1362,9 @@ uint32_t kintsuki_disassemble_at_ex(kintsuki_t* h, uint32_t pc, uint32_t count,
         }
       }
     }
+    // Tokenize for syntax-highlighted rendering. Cheap (single linear
+    // pass over <128 chars). Bytes past sl (NUL + padding) stay OTHER.
+    classifyTokens(out[i].text, sl, out[i].kinds);
     produced++;
     // REP/SEP track M/X flag flips so subsequent disassembly stays accurate
     // across `rep #$30` boundaries — the live table assumes flags don't
