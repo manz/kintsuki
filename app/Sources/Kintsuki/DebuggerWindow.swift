@@ -445,6 +445,67 @@ struct DebuggerView: View {
         }
     }
 
+    /// Build a syntax-coloured AttributedString for one disasm row.
+    /// Three colour groups:
+    ///   - mnemonic (LDA / JMP / RTS / ...) in primary,
+    ///   - hex literal ($1234 / #$80 / .l forms) in orange (matches the
+    ///     map.bin Data tint so eyes pair operand bytes with their
+    ///     destination),
+    ///   - everything else (labels, commas, `,X`) secondary.
+    /// When the project flags this PC as Data, the live disasm text is
+    /// replaced with `.db $XX` — the byte stays visible without the
+    /// walker confidently decoding it as a 65816 opcode.
+    private func disasmAttributed(for line: Emulator.DisasmLine) -> AttributedString {
+        // Data-aware override.
+        if emulator.projectIsOpen,
+           let off = emulator.projectBusToRom(line.pc) {
+            let raw = emulator.projectClassify(romOffset: off)
+            let cls = Emulator.ByteClass(rawValue: raw & 0x7F) ?? .unknown
+            if cls == .data || cls == .pointer || cls == .string
+                || cls == .graphics || cls == .tilemap
+                || cls == .palette || cls == .audio {
+                let byte = emulator.readBus(line.pc) ?? 0
+                var s = AttributedString(String(format: ".db $%02X", byte))
+                s.foregroundColor = .secondary
+                if let range = s.range(of: ".db") {
+                    s[range].foregroundColor = NSColor.systemGray
+                }
+                return s
+            }
+        }
+
+        var attr = AttributedString(line.text)
+        attr.foregroundColor = .primary
+        // Highlight hex tokens first ($XX, $XXXX, #$XX, #$XXXX).
+        let nsText = line.text as NSString
+        let hexRE = try? NSRegularExpression(pattern: "#?\\$[0-9A-Fa-f]+", options: [])
+        if let re = hexRE {
+            let matches = re.matches(in: line.text, options: [],
+                                     range: NSRange(location: 0, length: nsText.length))
+            for m in matches {
+                let s = nsText.substring(with: m.range)
+                if let r = attr.range(of: s) {
+                    attr[r].foregroundColor = NSColor.systemOrange
+                }
+            }
+        }
+        // The mnemonic is the first whitespace-delimited word — drop
+        // address columns the C disasm doesn't emit; the line text only
+        // contains "MNEMONIC operands". Style it bold + accent.
+        if let space = line.text.firstIndex(where: { $0 == " " }) {
+            let mnemonic = String(line.text[..<space])
+            if let r = attr.range(of: mnemonic) {
+                attr[r].foregroundColor = NSColor.controlAccentColor
+                attr[r].font = .system(.body, design: .monospaced).bold()
+            }
+        } else if !line.text.isEmpty {
+            // Single-word lines (RTS / RTL / NOP).
+            attr.foregroundColor = NSColor.controlAccentColor
+            attr.font = .system(.body, design: .monospaced).bold()
+        }
+        return attr
+    }
+
     /// Per-row description of how the function gutter should render.
     private struct FunctionGutter {
         let color: Color
@@ -555,8 +616,11 @@ struct DebuggerView: View {
                     .background(Color.blue.opacity(0.10), in: Capsule())
                     .padding(.trailing, 6)
             }
-            // Disassembly
-            Text(line.text)
+            // Disassembly. If the project byte-class says this PC is
+            // Data, override the live disasm with `.db $XX` — keeps the
+            // walker from speculatively decoding a known data byte as
+            // an opcode (and burning its operand bytes on garbage).
+            Text(disasmAttributed(for: line))
                 .lineLimit(1)
             Spacer()
         }

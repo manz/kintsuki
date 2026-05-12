@@ -921,6 +921,14 @@ final class Emulator {
         return out
     }
 
+    /// Single-byte CPU bus read. Returns nil when no ROM is loaded.
+    /// Cheap (one FFI hop) — useful for callers that need a single byte
+    /// without setting up a buffer.
+    func readBus(_ addr: UInt32) -> UInt8? {
+        guard let h = handle else { return nil }
+        return kintsuki_read_u8(h, addr & 0xFFFFFF)
+    }
+
     /// Bulk-dump map.bin into a Data buffer. Empty when no project open.
     func projectMapDump() -> Data {
         guard let h = handle, projectIsOpen,
