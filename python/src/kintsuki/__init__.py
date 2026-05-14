@@ -378,11 +378,264 @@ class Emu:
                 "vram_addr":  int(e.vram_addr),
                 "hits":       int(e.hits),
                 "last_frame": int(e.last_frame),
+                "caller_pc":  int(e.caller_pc),
             })
         return out
 
     def dma_log_clear(self) -> None:
         _native.lib.kintsuki_dma_log_clear(self._handle)
+
+    # ----------------------------------------------------------------- Project
+    def project_open(self, dir: str | os.PathLike[str]) -> None:
+        """Attach a kintsuki project to the currently-loaded ROM. ``dir``
+        is the ``.kintsuki/`` directory next to the ROM — created on first
+        open. While attached, every executed PC marks its byte as Code in
+        ``map.bin``, and every DMA fire marks its source range by destination
+        class (Graphics/Palette/...). Slice 1: map.bin only — labels,
+        bookmarks, notes come in later slices.
+
+        Raises ``RuntimeError`` if no ROM is loaded or the directory cannot
+        be created."""
+        encoded = os.fsencode(dir)
+        if not _native.lib.kintsuki_project_open(self._handle, encoded):
+            raise RuntimeError(f"failed to open project: {os.fspath(dir)}")
+
+    def project_close(self) -> None:
+        """Detach project without saving. No-op when none open."""
+        _native.lib.kintsuki_project_close(self._handle)
+
+    def project_save(self) -> bool:
+        """Flush dirty state (map.bin, project.toml, manifest.bml) to disk.
+        Returns False if no project is open."""
+        return bool(_native.lib.kintsuki_project_save(self._handle))
+
+    def project_is_open(self) -> bool:
+        return bool(_native.lib.kintsuki_project_is_open(self._handle))
+
+    def project_autosave(self, frames: int | None = None) -> int:
+        """Get/set the autosave interval in emulator frames. ``None``
+        reads the current value; non-None writes. ``0`` disables
+        autosave entirely (rely on explicit ``project_save``). Default
+        60 (~1s NTSC). Cheap when nothing is dirty — the save call is
+        a no-op."""
+        if frames is not None:
+            _native.lib.kintsuki_project_set_autosave(self._handle, int(frames))
+        return int(_native.lib.kintsuki_project_get_autosave(self._handle))
+
+    def project_classify(self, rom_offset: int) -> int:
+        """Return the raw byte stored at ``rom_offset`` in ``map.bin``:
+        the low 7 bits are the byte class (see ``BYTE_*`` constants),
+        bit 7 is the user-sticky flag. 0 if no project open or offset
+        out of range."""
+        return int(_native.lib.kintsuki_project_classify(self._handle, rom_offset))
+
+    def project_bus_to_rom(self, bus_addr: int) -> int | None:
+        """Convert a 24-bit CPU bus address to a ROM offset using the
+        active cart mapper. Returns ``None`` for non-ROM addresses."""
+        out = ctypes.c_uint32(0)
+        ok = _native.lib.kintsuki_project_bus_to_rom(
+            self._handle, bus_addr & 0xFFFFFF, ctypes.byref(out))
+        return int(out.value) if ok else None
+
+    def project_mark(self, rom_offset: int, length: int,
+                     cls: int, *, user_sticky: bool = False) -> int:
+        """Mark ``length`` bytes starting at ``rom_offset`` with class
+        ``cls`` (use ``_native.BYTE_CODE`` etc.). When ``user_sticky``
+        is True, the mark is protected from auto-reclassification."""
+        return int(_native.lib.kintsuki_project_mark(
+            self._handle, rom_offset, length, cls, 1 if user_sticky else 0))
+
+    def project_map_dump(self) -> bytes:
+        """Bulk snapshot of ``map.bin``. Returns the full byte array
+        (one byte per ROM byte, class | sticky bit)."""
+        stats = self.project_stats()
+        if stats is None or stats["total"] == 0:
+            return b""
+        n = stats["total"]
+        buf = (ctypes.c_uint8 * n)()
+        written = _native.lib.kintsuki_project_map_dump(self._handle, buf, n)
+        return bytes(buf[:written])
+
+    def project_stats(self) -> dict | None:
+        """Summary counters for the open project, or ``None`` if none open."""
+        s = _native.ProjectStats()
+        if not _native.lib.kintsuki_project_stats(self._handle, ctypes.byref(s)):
+            return None
+        return {
+            "total":       int(s.total),
+            "classified":  int(s.classified),
+            "code":        int(s.code),
+            "data":        int(s.data),
+            "user_sticky": int(s.user_sticky),
+        }
+
+    def project_label_set(self, addr: int, name: str = "",
+                          *, type: str = "", comment: str = "",
+                          m: int | None = None, x: int | None = None,
+                          e: int | None = None) -> None:
+        """Set the project-overlay label at ``addr`` (24-bit). Replaces any
+        existing entry. Empty strings drop the corresponding column; pass
+        ``None`` for ``m/x/e`` to leave the processor flag unset
+        (tri-state, value -1 on the C side)."""
+        def _flag(v: int | None) -> int:
+            return -1 if v is None else int(v)
+        ok = _native.lib.kintsuki_project_label_set(
+            self._handle, addr & 0xFFFFFF,
+            name.encode("utf-8") if name else b"",
+            type.encode("utf-8") if type else b"",
+            comment.encode("utf-8") if comment else b"",
+            _flag(m), _flag(x), _flag(e))
+        if not ok:
+            raise RuntimeError("no project open")
+
+    def project_label_get(self, addr: int) -> dict | None:
+        """Look up the overlay-only label at ``addr``. Returns ``None``
+        when no overlay entry exists. Does NOT fall back to .adbg."""
+        L = _native.ProjectLabel()
+        ok = _native.lib.kintsuki_project_label_get(
+            self._handle, addr & 0xFFFFFF, ctypes.byref(L))
+        if not ok:
+            return None
+        def _flag(v: int) -> int | None:
+            return None if v < 0 else int(v)
+        return {
+            "addr":    int(L.addr),
+            "name":    L.name.decode("utf-8") if L.name else "",
+            "type":    L.type.decode("utf-8") if L.type else "",
+            "comment": L.comment.decode("utf-8") if L.comment else "",
+            "m": _flag(L.m), "x": _flag(L.x), "e": _flag(L.e),
+        }
+
+    def project_label_clear(self, addr: int) -> None:
+        _native.lib.kintsuki_project_label_clear(self._handle, addr & 0xFFFFFF)
+
+    def project_dma_provenance(self,
+                               rom_range: tuple[int, int] | None = None,
+                               ) -> list[dict]:
+        """All DMA provenance entries (slice 3) — (src_rom, size, dst_reg,
+        caller_pc) deduplicated tuples plus hit count + last frame. Pass
+        ``rom_range=(offset, length)`` to filter to entries overlapping
+        that range — the "who uploads this tile?" viewer lookup."""
+        if rom_range is not None:
+            off, length = rom_range
+            # First pass with a generous cap; if filled, retry with the
+            # actual count to avoid truncation.
+            cap = max(8, int(_native.lib.kintsuki_project_dma_prov_count(self._handle)))
+            buf = (_native.ProjectDmaProv * cap)()
+            n = int(_native.lib.kintsuki_project_dma_prov_for_range(
+                self._handle, off, length, buf, cap))
+        else:
+            n_total = int(_native.lib.kintsuki_project_dma_prov_count(self._handle))
+            if n_total == 0:
+                return []
+            buf = (_native.ProjectDmaProv * n_total)()
+            n = int(_native.lib.kintsuki_project_dma_prov_snapshot(
+                self._handle, buf, n_total))
+        out: list[dict] = []
+        for i in range(n):
+            p = buf[i]
+            out.append({
+                "src_rom":    int(p.src_rom),
+                "size":       int(p.size),
+                "dst_reg":    int(p.dst_reg),
+                "caller_pc":  int(p.caller_pc),
+                "hits":       int(p.hits),
+                "last_frame": int(p.last_frame),
+            })
+        return out
+
+    # ---- Bookmarks ----------------------------------------------------
+    def project_bookmark_set(self, name: str, addr: int,
+                             *, view: str = "", comment: str = "") -> None:
+        ok = _native.lib.kintsuki_project_bookmark_set(
+            self._handle, name.encode("utf-8"), addr & 0xFFFFFF,
+            view.encode("utf-8") if view else b"",
+            comment.encode("utf-8") if comment else b"")
+        if not ok:
+            raise RuntimeError("no project open")
+
+    def project_bookmark_clear(self, name: str) -> None:
+        _native.lib.kintsuki_project_bookmark_clear(self._handle, name.encode("utf-8"))
+
+    def project_bookmarks(self) -> list[dict]:
+        n = int(_native.lib.kintsuki_project_bookmark_count(self._handle))
+        if n == 0:
+            return []
+        buf = (_native.ProjectBookmark * n)()
+        written = int(_native.lib.kintsuki_project_bookmark_snapshot(self._handle, buf, n))
+        out: list[dict] = []
+        for i in range(written):
+            b = buf[i]
+            out.append({
+                "name":    b.name.decode("utf-8") if b.name else "",
+                "addr":    int(b.addr),
+                "view":    b.view.decode("utf-8") if b.view else "",
+                "comment": b.comment.decode("utf-8") if b.comment else "",
+            })
+        return out
+
+    # ---- Breakpoints --------------------------------------------------
+    def project_bp_add(self, kind: int, addr_lo: int, addr_hi: int,
+                       *, halt: bool = True, enabled: bool = True,
+                       comment: str = "") -> None:
+        """Persist a BP record. Does NOT install a live callback —
+        frontends walk ``project_breakpoints()`` on attach and call
+        ``add_callback(..., halt=...)`` for each enabled entry."""
+        ok = _native.lib.kintsuki_project_bp_add(
+            self._handle, int(kind),
+            addr_lo & 0xFFFFFF, addr_hi & 0xFFFFFF,
+            1 if halt else 0, 1 if enabled else 0,
+            comment.encode("utf-8") if comment else b"")
+        if not ok:
+            raise RuntimeError("no project open")
+
+    def project_bp_remove(self, index: int) -> None:
+        _native.lib.kintsuki_project_bp_remove(self._handle, int(index))
+
+    def project_bp_clear(self) -> None:
+        _native.lib.kintsuki_project_bp_clear(self._handle)
+
+    def project_breakpoints(self) -> list[dict]:
+        n = int(_native.lib.kintsuki_project_bp_count(self._handle))
+        if n == 0:
+            return []
+        buf = (_native.ProjectBp * n)()
+        written = int(_native.lib.kintsuki_project_bp_snapshot(self._handle, buf, n))
+        out: list[dict] = []
+        for i in range(written):
+            bp = buf[i]
+            out.append({
+                "kind":    int(bp.kind),
+                "halt":    bool(bp.halt),
+                "enabled": bool(bp.enabled),
+                "addr_lo": int(bp.addr_lo),
+                "addr_hi": int(bp.addr_hi),
+                "comment": bp.comment.decode("utf-8") if bp.comment else "",
+            })
+        return out
+
+    def project_labels(self) -> list[dict]:
+        """All overlay labels, address-ascending. Empty list when no
+        project is open."""
+        n = int(_native.lib.kintsuki_project_label_count(self._handle))
+        if n == 0:
+            return []
+        buf = (_native.ProjectLabel * n)()
+        written = int(_native.lib.kintsuki_project_label_snapshot(
+            self._handle, buf, n))
+        def _flag(v: int) -> int | None:
+            return None if v < 0 else int(v)
+        out: list[dict] = []
+        for i in range(written):
+            L = buf[i]
+            out.append({
+                "addr":    int(L.addr),
+                "name":    L.name.decode("utf-8") if L.name else "",
+                "type":    L.type.decode("utf-8") if L.type else "",
+                "comment": L.comment.decode("utf-8") if L.comment else "",
+                "m": _flag(L.m), "x": _flag(L.x), "e": _flag(L.e),
+            })
+        return out
 
     # -------------------------------------------------------------- Run/step
     def run_frames(self, n: int) -> None:

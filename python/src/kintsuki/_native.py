@@ -14,6 +14,7 @@ from ctypes import (
     Structure,
     c_char_p,
     c_int,
+    c_int8,
     c_size_t,
     c_uint8,
     c_uint16,
@@ -171,6 +172,7 @@ class DmaEvent(Structure):
         ("vram_addr", c_uint16),
         ("hits",      c_uint32),
         ("last_frame", c_uint64),
+        ("caller_pc", c_uint32),
     ]
 
 
@@ -291,6 +293,123 @@ _bind("kintsuki_press", None, [HANDLE, c_int, c_int, c_int])
 # Callbacks
 _bind("kintsuki_add_callback", c_int, [HANDLE, c_int, c_uint32, c_uint32, CALLBACK, c_void_p])
 _bind("kintsuki_remove_callback", None, [HANDLE, c_int, c_int])
+
+
+# Project file (slice 1: map.bin classification).
+class ProjectStats(Structure):
+    _fields_ = [
+        ("total",       c_uint32),
+        ("classified",  c_uint32),
+        ("code",        c_uint32),
+        ("data",        c_uint32),
+        ("user_sticky", c_uint32),
+    ]
+
+
+# Byte class constants (must match KINTSUKI_BYTE_* in kintsuki.h).
+BYTE_UNKNOWN  = 0
+BYTE_CODE     = 1
+BYTE_DATA     = 2
+BYTE_POINTER  = 3
+BYTE_STRING   = 4
+BYTE_GRAPHICS = 5
+BYTE_TILEMAP  = 6
+BYTE_PALETTE  = 7
+BYTE_AUDIO    = 8
+BYTE_CODE_OPERAND = 9
+BYTE_USER_STICKY = 0x80
+BYTE_CLASS_MASK  = 0x7F
+
+
+_bind("kintsuki_project_open",       c_int,     [HANDLE, c_char_p])
+_bind("kintsuki_project_close",      None,      [HANDLE])
+_bind("kintsuki_project_save",       c_int,     [HANDLE])
+_bind("kintsuki_project_is_open",    c_int,     [HANDLE])
+_bind("kintsuki_project_classify",   c_uint8,   [HANDLE, c_uint32])
+_bind("kintsuki_project_bus_to_rom", c_int,     [HANDLE, c_uint32, POINTER(c_uint32)])
+_bind("kintsuki_project_mark",       c_uint32,  [HANDLE, c_uint32, c_uint32, c_int, c_int])
+_bind("kintsuki_project_map_dump",   c_uint32,  [HANDLE, POINTER(c_uint8), c_uint32])
+_bind("kintsuki_project_stats",      c_int,     [HANDLE, POINTER(ProjectStats)])
+_bind("kintsuki_project_set_autosave", None,    [HANDLE, c_uint32])
+_bind("kintsuki_project_get_autosave", c_uint32, [HANDLE])
+
+
+class ProjectLabel(Structure):
+    _fields_ = [
+        ("addr",    c_uint32),
+        ("name",    c_char_p),
+        ("type",    c_char_p),
+        ("comment", c_char_p),
+        ("m",       c_int8),
+        ("x",       c_int8),
+        ("e",       c_int8),
+        ("_pad",    c_uint8),
+    ]
+
+
+_bind("kintsuki_project_label_set",      c_int,    [HANDLE, c_uint32,
+                                                    c_char_p, c_char_p, c_char_p,
+                                                    c_int, c_int, c_int])
+_bind("kintsuki_project_label_get",      c_int,    [HANDLE, c_uint32, POINTER(ProjectLabel)])
+_bind("kintsuki_project_label_clear",    None,     [HANDLE, c_uint32])
+_bind("kintsuki_project_label_count",    c_uint32, [HANDLE])
+_bind("kintsuki_project_label_snapshot", c_uint32, [HANDLE, POINTER(ProjectLabel), c_uint32])
+
+
+class ProjectDmaProv(Structure):
+    _fields_ = [
+        ("src_rom",    c_uint32),
+        ("size",       c_uint16),
+        ("dst_reg",    c_uint8),
+        ("_pad",       c_uint8),
+        ("caller_pc",  c_uint32),
+        ("hits",       c_uint32),
+        ("last_frame", c_uint64),
+    ]
+
+
+_bind("kintsuki_project_dma_prov_count",     c_uint32, [HANDLE])
+_bind("kintsuki_project_dma_prov_snapshot",  c_uint32, [HANDLE, POINTER(ProjectDmaProv), c_uint32])
+_bind("kintsuki_project_dma_prov_for_range", c_uint32, [HANDLE, c_uint32, c_uint32,
+                                                       POINTER(ProjectDmaProv), c_uint32])
+
+
+class ProjectBookmark(Structure):
+    _fields_ = [
+        ("addr",    c_uint32),
+        ("name",    c_char_p),
+        ("view",    c_char_p),
+        ("comment", c_char_p),
+    ]
+
+
+_bind("kintsuki_project_bookmark_set",      c_int,    [HANDLE, c_char_p, c_uint32, c_char_p, c_char_p])
+_bind("kintsuki_project_bookmark_clear",    None,     [HANDLE, c_char_p])
+_bind("kintsuki_project_bookmark_count",    c_uint32, [HANDLE])
+_bind("kintsuki_project_bookmark_snapshot", c_uint32, [HANDLE, POINTER(ProjectBookmark), c_uint32])
+
+
+class ProjectBp(Structure):
+    _fields_ = [
+        ("kind",    c_uint8),
+        ("halt",    c_uint8),
+        ("enabled", c_uint8),
+        ("_pad",    c_uint8),
+        ("addr_lo", c_uint32),
+        ("addr_hi", c_uint32),
+        ("comment", c_char_p),
+    ]
+
+
+BP_EXEC  = 0
+BP_READ  = 1
+BP_WRITE = 2
+
+_bind("kintsuki_project_bp_add",      c_int,    [HANDLE, c_uint8, c_uint32, c_uint32, c_int, c_int, c_char_p])
+_bind("kintsuki_project_bp_remove",   None,     [HANDLE, c_uint32])
+_bind("kintsuki_project_bp_clear",    None,     [HANDLE])
+_bind("kintsuki_project_bp_count",    c_uint32, [HANDLE])
+_bind("kintsuki_project_bp_snapshot", c_uint32, [HANDLE, POINTER(ProjectBp), c_uint32])
 
 
 # Re-exports for convenience.

@@ -150,6 +150,13 @@ auto Program::loadRom(const char* path) -> bool {
     romData.erase(romData.begin(), romData.begin() + 512);
   }
 
+  // Pristine sha — locks the project file to the unpatched ROM identity
+  // so loading w/ an IPS applied still matches the saved project.
+  {
+    Hash::SHA256 h(std::span<const uint8_t>(romData.data(), romData.size()));
+    romPristineSha256 = std::string{h.digest().data()};
+  }
+
   // Auto-apply an IPS patch sitting next to the ROM. ares' upstream loader
   // doesn't do this in headless — we duplicate mia's behaviour here.
   // Two locations: <rom>.ips (preferred) and <rom-without-ext>.ips.
@@ -171,8 +178,10 @@ auto Program::loadRom(const char* path) -> bool {
 
   kintsuki::RomInfo info;
   if(!kintsuki::detectRom(romData, info)) return false;
+  romHiRom = info.hiRom;
 
   std::string m = kintsuki::buildManifest(info);
+  cartManifestStr = m;
   cartManifest = string{m.c_str()};
 
   cartPak = std::make_shared<vfs::directory>();

@@ -62,6 +62,14 @@ struct KintsukiApp: App {
         Window("HDMA Inspector", id: "hdma") {
             HDMAInspectorView(emulator: emulator)
         }
+
+        Window("Project Labels", id: "labels") {
+            ProjectLabelsView(emulator: emulator)
+        }
+
+        Window("Project Bookmarks", id: "bookmarks") {
+            ProjectBookmarksView(emulator: emulator)
+        }
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Open ROM…") {
@@ -121,6 +129,40 @@ struct KintsukiApp: App {
                     .keyboardShortcut("h", modifiers: [.command, .shift])
                 Button("Debugger") { toggleToolWindow("debugger") }
                     .keyboardShortcut("d", modifiers: [.command, .shift])
+                Button("Project Labels") { toggleToolWindow("labels") }
+                    .keyboardShortcut("l", modifiers: [.command, .shift])
+                Button("Project Bookmarks") { toggleToolWindow("bookmarks") }
+                    .keyboardShortcut("b", modifiers: [.command, .shift])
+            }
+            CommandMenu("Project") {
+                if emulator.projectIsOpen, let dir = emulator.projectDir {
+                    Text(dir.lastPathComponent)
+                    if let s = emulator.projectStats {
+                        Text(String(format: "%.1f%% classified · %u labels-sticky",
+                                    s.pctClassified, s.userSticky))
+                            .font(.caption)
+                    }
+                    Divider()
+                    Button("Save Now") { emulator.projectSave() }
+                        .keyboardShortcut("s", modifiers: [.command, .control])
+                    Button("Close Project") { emulator.projectClose() }
+                    Divider()
+                    Menu("Autosave") {
+                        Button("Off")            { _ = emulator.projectAutosave(0) }
+                        Button("Every 60 frames (~1s)") { _ = emulator.projectAutosave(60) }
+                        Button("Every 600 frames (~10s)") { _ = emulator.projectAutosave(600) }
+                    }
+                    Button("Reveal in Finder") {
+                        NSWorkspace.shared.activateFileViewerSelecting([dir])
+                    }
+                } else {
+                    Button("Create Project for Loaded ROM") {
+                        emulator.projectCreateForLoadedROM()
+                    }
+                    .disabled(emulator.loadedROM == nil)
+                    Button("Attach Existing Project…") { attachProjectViaPanel() }
+                        .disabled(emulator.loadedROM == nil)
+                }
             }
             CommandMenu("State") {
                 Button("Show Save States in Finder") {
@@ -173,6 +215,21 @@ struct KintsukiApp: App {
                 alert.informativeText = "Could not load \(url.lastPathComponent)."
                 alert.runModal()
             }
+        }
+    }
+
+    private func attachProjectViaPanel() {
+        let panel = NSOpenPanel()
+        panel.allowsMultipleSelection = false
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.message = "Select a Kintsuki project directory (.kintsuki/)"
+        panel.prompt = "Attach"
+        if let rom = emulator.loadedROM {
+            panel.directoryURL = rom.deletingLastPathComponent()
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            emulator.projectOpen(at: url)
         }
     }
 

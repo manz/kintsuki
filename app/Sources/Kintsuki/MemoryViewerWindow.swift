@@ -34,6 +34,10 @@ struct MemoryViewerView: View {
     var body: some View {
         VStack(spacing: 0) {
             toolbar
+            if region == .rom, emulator.projectIsOpen {
+                Divider()
+                projectStrip
+            }
             Divider()
             if emulator.loadedROM != nil {
                 HexCanvasRepresentable(
@@ -42,6 +46,7 @@ struct MemoryViewerView: View {
                     compact: compact,
                     selection: selection,
                     markers: markers,
+                    classByteAt: { off in projectClassByte(at: off) },
                     jumpTarget: jumpTarget,
                     jumpNonce: jumpNonce,
                     generation: generation,
@@ -78,6 +83,77 @@ struct MemoryViewerView: View {
             invalidate()
             rebuildMarkers()
         }
+    }
+
+    // ----- Project overlay (kintsuki project, slice 6 UI) ----------------
+
+    /// Project byte-class lookup hot path. Restricted to ROM region —
+    /// `map.bin` is ROM-offset addressed and WRAM/VRAM/CGRAM/OAM don't
+    /// have an equivalent overlay (yet).
+    private func projectClassByte(at romOffset: Int) -> UInt8? {
+        guard region == .rom, emulator.projectIsOpen else { return nil }
+        guard romOffset >= 0 else { return nil }
+        let b = emulator.projectClassify(romOffset: UInt32(romOffset))
+        return b == 0 ? nil : b
+    }
+
+    /// Top strip surfacing the project overlay on ROM: shows the class
+    /// under the cursor + lets the user re-tag the current selection
+    /// without leaving the keyboard. Only rendered when ROM is
+    /// selected and a project is open.
+    @ViewBuilder
+    private var projectStrip: some View {
+        let cursor = selection?.cursor
+        let cursorByte = cursor.flatMap { projectClassByte(at: $0) } ?? 0
+        let cursorCls = Emulator.ByteClass(rawValue: cursorByte & 0x7F) ?? .unknown
+        let sticky = (cursorByte & 0x80) != 0
+        HStack(spacing: 8) {
+            Image(systemName: "rectangle.3.group.fill")
+                .foregroundStyle(.purple)
+                .help("Kintsuki project overlay")
+            if let off = cursor {
+                Text(String(format: "$%06X", off))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Text(cursorCls.label)
+                    .font(.caption)
+                    .padding(.horizontal, 6).padding(.vertical, 1)
+                    .background(Color(cursorCls.overlayColor).opacity(sticky ? 0.55 : 0.3),
+                                in: Capsule())
+                if sticky {
+                    Text("(sticky)")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            } else {
+                Text("(no selection)")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+            Spacer()
+            Menu {
+                ForEach(Emulator.ByteClass.allUserMarkable, id: \.rawValue) { cls in
+                    Button(cls.label) { markSelection(as: cls, userSticky: true) }
+                }
+            } label: {
+                Label("Mark as…", systemImage: "tag.fill")
+                    .font(.caption)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+            .disabled(selection == nil)
+        }
+        .padding(.horizontal, 8).padding(.vertical, 4)
+    }
+
+    private func markSelection(as cls: Emulator.ByteClass, userSticky: Bool) {
+        guard region == .rom, let sel = selection else { return }
+        let range = sel.range
+        let lo = max(0, range.lowerBound)
+        let hi = max(lo, range.upperBound)
+        let len = hi - lo + 1
+        emulator.projectMark(romOffset: UInt32(lo),
+                             length: UInt32(len),
+                             cls: cls,
+                             userSticky: userSticky)
     }
 
     /// Honour an `Emulator.memoryNavRequest` exactly once per nonce.
@@ -429,6 +505,10 @@ struct HexCanvasRepresentable: NSViewRepresentable {
     let compact: Bool
     let selection: HexSelection?
     let markers: [HexMarker]
+    /// Closure returning the project byte-class for a region offset, or
+    /// nil when no overlay applies (no project, non-ROM region, OOB).
+    /// Bit 7 is the user-sticky flag; low 7 bits are the class enum.
+    let classByteAt: (Int) -> UInt8?
     let jumpTarget: Int?
     /// Bumped by the parent for each new `jumpTarget`. Used by the
     /// representable's coordinator to scroll exactly once per jump
@@ -466,6 +546,7 @@ struct HexCanvasRepresentable: NSViewRepresentable {
         canvas.totalBytes = totalBytes
         canvas.selection = selection
         canvas.markers = markers
+        canvas.classByteAt = classByteAt
         scroll.documentView = canvas
         applyCanvasFrame(scroll: scroll, canvas: canvas)
         return scroll
@@ -495,6 +576,7 @@ struct HexCanvasRepresentable: NSViewRepresentable {
         if canvas.markers != markers {
             canvas.markers = markers
         }
+        canvas.classByteAt = classByteAt
         canvas.needsDisplay = true
         // Coordinator-gated scroll: only honour a jumpTarget when its
         // nonce is fresh. Without this, every body re-eval (cache
@@ -536,6 +618,10 @@ final class HexCanvasView: NSView {
     var markers: [HexMarker] = [] {
         didSet { needsDisplay = true }
     }
+    /// Project byte-class overlay. Closure-fed so we don't have to copy
+    /// the full map.bin into the canvas on every paint — the parent
+    /// view does the FFI hop once per cell on demand.
+    var classByteAt: ((Int) -> UInt8?) = { _ in nil }
     var addrLabel: ((Int) -> String) = { _ in "" }
     var byteAt: ((Int) -> UInt8?) = { _ in nil }
     var onSelectionChanged: ((HexSelection) -> Void)? = nil
@@ -622,6 +708,18 @@ final class HexCanvasView: NSView {
                 let off = rowOffset + i
                 let cellX = hexAreaStart + CGFloat(i) * hexCellWidth
 
+                // Project byte-class tint (slice 6 UI). Drawn first so
+                // markers + selection still read on top — the class
+                // tint is for at-a-glance "what kind of bytes is this
+                // region" not for highlighting a focus point.
+                if let cb = classByteAt(off), (cb & 0x7F) != 0 {
+                    let cls = Emulator.ByteClass(rawValue: cb & 0x7F) ?? .unknown
+                    let rect = NSRect(x: cellX - 1, y: y,
+                                      width: hexCellWidth, height: rowH - 1)
+                    let alpha: CGFloat = (cb & 0x80) != 0 ? 0.32 : 0.18
+                    cls.overlayColor.withAlphaComponent(alpha).setFill()
+                    rect.fill()
+                }
                 // Marker tint underneath everything else.
                 if let mc = markerColor(at: off) {
                     let rect = NSRect(x: cellX - 1, y: y,

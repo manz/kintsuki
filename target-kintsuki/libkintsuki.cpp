@@ -7,6 +7,7 @@
 #include "program.hpp"
 #include "kintsuki.h"
 #include "adbg.hpp"
+#include "project.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -36,6 +37,30 @@ namespace {
 constexpr size_t kCallstackCap = 256;
 std::deque<kintsuki_call_frame_t> g_callstack;
 kintsuki::AdbgLabels g_labels;
+// Project file (slice 1): persistent reversing state. Declared up here so
+// kintsuki_destroy (file-order above the body where g_project is used)
+// can reset it. Hooks fire only when non-null — single null-check on the
+// hot path.
+std::unique_ptr<kintsuki::Project> g_project;
+// Last PC seen by the exec hook. Used by cOnReturn to recover the RTS/
+// RTL opcode address — ares' returnHook fires after PC has been moved
+// to the return target, so the exit PC is unrecoverable from cpu.r.pc
+// alone. Sampled in cOnExec; falls back to 0 when no exec hook fired
+// recently.
+uint32_t g_lastExecPc = 0;
+
+// Forward decl — defined further down in this TU's anon-namespace.
+// Both blocks share linkage so this resolves to the same symbol.
+uint8_t inst_length_for(uint8_t opcode, bool m_flag, bool x_flag);
+// Autosave (slice 5): when non-zero, kintsuki_run_frames flushes the
+// project to disk every Nth call-frame if anything is dirty. We count
+// frames *requested* (the `n` arg to run_frames), not framesRendered —
+// test ROMs that STP immediately never advance vblank, so a "frames
+// rendered" clock would silently disable autosave for them. 0 disables.
+// Default 60 = ~1s NTSC.
+uint32_t g_projectAutosaveFrames = 60;
+uint64_t g_projectFrameClock     = 0;  // accumulated frames-requested
+uint64_t g_projectLastSaveFrame  = 0;
 // Last label string emitted by the tracer as a `; --- name ---\n` header.
 // Compared by pointer (AdbgLabels storage owns stable const char*). Reset
 // to nullptr on tracer_start, load_adbg, clear_adbg, destroy.
@@ -48,11 +73,30 @@ void cOnCall(uint32_t callsite_pc, uint32_t target_pc, uint8_t kind) {
   f.target_pc   = target_pc   & 0xFFFFFF;
   f.kind        = kind;
   g_callstack.push_back(f);
+  // Auto-seed entry flags at every JSR/JSL target so cold-cache disasm at
+  // any reached function knows the caller's M/X/E. First writer wins —
+  // manual edits are not clobbered.
+  if(g_project) {
+    auto& r = ares::SuperFamicom::cpu.r;
+    g_project->record_entry_flags(target_pc,
+                                  (int8_t)r.p.m, (int8_t)r.p.x, (int8_t)r.e,
+                                  /*force=*/false);
+  }
 }
 
 void cOnReturn(uint8_t kind) {
-  (void)kind;
-  if(!g_callstack.empty()) g_callstack.pop_back();
+  if(g_callstack.empty()) return;
+  // Snapshot entry of the frame we're about to pop. The shadow stack's
+  // top frame is the routine that's exiting.
+  uint32_t entry = g_callstack.back().target_pc & 0xFFFFFF;
+  g_callstack.pop_back();
+  if(g_project) {
+    // exit_pc = the RTS/RTL opcode address. cOnExec stashes the last
+    // PC it saw; ares' returnHook fires after PC has moved to the
+    // return target, so we can't read it from cpu.r.pc here.
+    uint64_t frame = kintsukiProgram ? kintsukiProgram->framesRendered : 0;
+    g_project->note_function_exit(entry, g_lastExecPc, kind, frame);
+  }
 }
 }  // namespace
 
@@ -96,6 +140,7 @@ void kintsuki_destroy(kintsuki_t* h) {
   g_callstack.clear();
   g_labels.clear();
   g_tracer_last_label = nullptr;
+  g_project.reset();
   delete h;
   g_handle = nullptr;
   kintsukiProgram = nullptr;
@@ -128,7 +173,20 @@ uint32_t kintsuki_inject_sram(kintsuki_t* h, const uint8_t* data, uint32_t len) 
   return h->program->injectSram(data, len);
 }
 
-void kintsuki_run_frames(kintsuki_t* h, uint32_t n) { if(h) h->program->runFrames(n); }
+void kintsuki_run_frames(kintsuki_t* h, uint32_t n) {
+  if(!h) return;
+  h->program->runFrames(n);
+  // Autosave: debounced flush. Project::save() is a no-op when nothing
+  // is dirty, so the cost when idle is one comparison + one method call
+  // per autosave window. Disable by setting interval to 0.
+  if(g_project && g_projectAutosaveFrames > 0) {
+    g_projectFrameClock += n;
+    if(g_projectFrameClock >= g_projectLastSaveFrame + g_projectAutosaveFrames) {
+      g_project->save();
+      g_projectLastSaveFrame = g_projectFrameClock;
+    }
+  }
+}
 uint64_t kintsuki_frame_count(kintsuki_t* h) { return h ? h->program->framesRendered : 0; }
 
 uint8_t kintsuki_read_u8(kintsuki_t* h, uint32_t addr) { return h ? h->program->memRead(addr) : 0; }
@@ -493,12 +551,35 @@ auto cFire(std::vector<CCallback>& list, uint32_t addr, uint8_t value) -> void {
 void tracerOnExec(uint32_t pc);
 
 void cOnExec(uint32_t pc) {
+  g_lastExecPc = pc & 0xFFFFFF;
+  if(g_project) {
+    // Resolve instruction length from the live opcode + M/X flags so
+    // operand bytes get marked as CodeOperand (the user can spot
+    // `lda #$1234` immediates vs raw code without re-disassembling).
+    auto& r = ares::SuperFamicom::cpu.r;
+    uint8_t opcode = ares::SuperFamicom::cpu.readDisassembler(pc & 0xFFFFFF);
+    uint8_t len = inst_length_for(opcode, r.p.m, r.p.x);
+    g_project->note_exec(pc, len ? len : 1);
+  }
   tracerOnExec(pc);
   if(g_cExecPages[(pc & 0xffffff) >> 8] == 0) return;
   cFire(g_cExec, pc, 0);
 }
 
+
+// Inline project-data classifier; merged into cOnRead so a single
+// memReadHook covers both user CBs and the slice-7 project data marker.
+inline void projectMarkRead(uint32_t addr) {
+  if(!g_project) return;
+  int64_t rom = g_project->bus_to_rom_offset(addr);
+  if(rom < 0) return;
+  uint32_t o = (uint32_t)rom;
+  if((uint8_t)g_project->classify(o) != 0) return;   // already classified
+  g_project->mark_auto(o, 1, kintsuki::ByteClass::Data);
+}
+
 void cOnRead(uint32_t addr, uint8_t value) {
+  projectMarkRead(addr);
   if(g_cReadPages[(addr & 0xffffff) >> 8] == 0) return;
   cFire(g_cRead, addr, value);
 }
@@ -562,9 +643,11 @@ void kintsuki_remove_callback(kintsuki_t* h, int kind, int id) {
   bool any = false;
   for(auto& c : *list) if(c.active) { any = true; break; }
   if(!any) {
-    if(kind == CB_EXEC)  ares::SuperFamicom::execHook = nullptr;
-    if(kind == CB_READ)  ares::SuperFamicom::memReadHook = nullptr;
-    if(kind == CB_WRITE) ares::SuperFamicom::memWriteHook = nullptr;
+    // Keep hooks armed when a project is open — the project relies on
+    // exec + read marks even with zero user-registered CBs.
+    if(kind == CB_EXEC  && !g_project) ares::SuperFamicom::execHook = nullptr;
+    if(kind == CB_READ  && !g_project) ares::SuperFamicom::memReadHook = nullptr;
+    if(kind == CB_WRITE)               ares::SuperFamicom::memWriteHook = nullptr;
   }
 }
 
@@ -978,6 +1061,7 @@ struct DmaLogEntry {
   uint16_t vram_addr;    // VMADDR at DMA fire (word address)
   uint32_t hits;
   uint64_t last_frame;
+  uint32_t caller_pc;    // 24-bit; top of shadow callstack at fire time
 };
 constexpr size_t kDmaLogCap = 64;
 DmaLogEntry g_dmaLog[kDmaLogCap] = {};
@@ -985,17 +1069,31 @@ size_t g_dmaLogSize = 0;
 
 void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
                uint32_t src, uint8_t dst, uint16_t size) {
+  // Caller PC: top of the shadow callstack (the most recently entered
+  // routine), falling back to live cpu.r.pc.d if no JSR/JSL is on the
+  // stack yet (cold boot, IRQ context). 24-bit.
+  uint32_t callerPc = g_callstack.empty()
+    ? ((uint32_t)ares::SuperFamicom::cpu.r.pc.d & 0xFFFFFF)
+    : (g_callstack.back().target_pc & 0xFFFFFF);
+  // Project-file auto-classification: tag the ROM source range by the
+  // destination PPU register class (graphics/palette/...) — no-op when
+  // no project is open.
+  if(g_project) {
+    uint64_t frame = g_handle ? g_handle->program->framesRendered : 0;
+    g_project->note_dma(src, size, dst);
+    g_project->note_dma_provenance(src, size, dst, callerPc, frame);
+  }
   // Capture VMADDR (word) at the moment the DMA fires — gives the
   // user the actual VRAM destination, not just "we wrote something
   // through VMDATA". Read from the live performance PPU; the
   // CGRAM/OAM equivalents could be added later if needed.
   uint16_t vramAddr = (uint16_t)ares::SuperFamicom::ppuPerformanceImpl.vram.address;
-  // Dedupe key now includes vram_addr so two transfers to different
-  // VRAM regions through the same VMDATA register don't collapse.
+  // Dedupe key now includes vram_addr + caller_pc so two transfers from
+  // different callers (or to different VRAM regions) don't collapse.
   for(size_t i = 0; i < g_dmaLogSize; i++) {
     auto& e = g_dmaLog[i];
     if(e.src_addr == src && e.dst_reg == dst && e.size == size
-       && e.vram_addr == vramAddr) {
+       && e.vram_addr == vramAddr && e.caller_pc == callerPc) {
       e.hits += 1;
       e.last_frame = (g_handle ? g_handle->program->framesRendered : 0);
       if(i > 0) {
@@ -1018,6 +1116,7 @@ void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
     .vram_addr = vramAddr,
     .hits = 1,
     .last_frame = (g_handle ? g_handle->program->framesRendered : 0),
+    .caller_pc = callerPc,
   };
   if(g_dmaLogSize < kDmaLogCap) g_dmaLogSize++;
 }
@@ -1082,6 +1181,7 @@ uint32_t kintsuki_dma_log_snapshot(kintsuki_t* h,
     out[i].vram_addr = e.vram_addr;
     out[i].hits = e.hits;
     out[i].last_frame = e.last_frame;
+    out[i].caller_pc = e.caller_pc;
   }
   return n;
 }
@@ -1119,6 +1219,7 @@ uint32_t kintsuki_label_snapshot(kintsuki_t* h,
 // immediate). M-extending opcodes: ORA/AND/EOR/ADC/BIT/LDA/CMP/SBC #imm
 // (09,29,49,69,89,A9,C9,E9). X-extending: LDY/LDX/CPY/CPX #imm
 // (A0,A2,C0,E0). Order matches the 65816 opcode matrix.
+}  // extern "C"
 namespace {
 constexpr uint8_t LEN_M = 0x10;
 constexpr uint8_t LEN_X = 0x20;
@@ -1150,10 +1251,72 @@ uint8_t inst_length_for(uint8_t opcode, bool m_flag, bool x_flag) {
   return len;
 }
 }  // namespace
+extern "C" {
 
 uint32_t kintsuki_disassemble_at_ex(kintsuki_t* h, uint32_t pc, uint32_t count,
                                     int e_override, int m_override, int x_override,
                                     kintsuki_disasm_line_t* out);
+
+// Classify the bytes of a disassembled instruction string into the
+// token-kind enum. State machine — single linear scan, populates
+// `kinds[0..len]` and zeroes the rest. Heuristic but matches every
+// shape ares' wdc65816 disassembler emits (verified against the
+// in-tree disassembler).
+namespace {
+inline bool isHexChar(char c) {
+  return (c >= '0' && c <= '9') || (c >= 'A' && c <= 'F') || (c >= 'a' && c <= 'f');
+}
+void classifyTokens(const char* text, size_t len, uint8_t* kinds) {
+  std::memset(kinds, 0, 128);
+  if(len == 0) return;
+  size_t i = 0;
+  // Mnemonic: leading letters (+ optional `.l`/`.w` width suffix).
+  while(i < len && ((text[i] >= 'A' && text[i] <= 'Z')
+                 || (text[i] >= 'a' && text[i] <= 'z')
+                 || text[i] == '.')) {
+    kinds[i++] = KINTSUKI_TOK_MNEMONIC;
+  }
+  // Operand stream.
+  while(i < len) {
+    char c = text[i];
+    if(c == '#') {
+      kinds[i++] = KINTSUKI_TOK_PUNCT;
+      if(i < len && text[i] == '$') {
+        size_t start = i;
+        kinds[i++] = KINTSUKI_TOK_IMM_HEX;
+        while(i < len && isHexChar(text[i])) kinds[i++] = KINTSUKI_TOK_IMM_HEX;
+        (void)start;
+      }
+    } else if(c == '$') {
+      size_t start = i;
+      i++;
+      while(i < len && isHexChar(text[i])) i++;
+      size_t hexLen = i - start - 1;
+      uint8_t cls = hexLen <= 2 ? KINTSUKI_TOK_DP_HEX
+                  : hexLen <= 4 ? KINTSUKI_TOK_ABS_HEX
+                  :              KINTSUKI_TOK_LONG_HEX;
+      for(size_t k = start; k < i; k++) kinds[k] = cls;
+    } else if(c == ',') {
+      kinds[i++] = KINTSUKI_TOK_PUNCT;
+      if(i < len && (text[i] == 'X' || text[i] == 'Y' || text[i] == 'S'
+                  || text[i] == 'x' || text[i] == 'y' || text[i] == 's')) {
+        kinds[i++] = KINTSUKI_TOK_REG;
+      }
+    } else if(c == '[' || c == ']' || c == '(' || c == ')') {
+      kinds[i++] = KINTSUKI_TOK_PUNCT;
+    } else if(c == '-' && i + 1 < len && text[i + 1] == '>') {
+      // ` -> name` annotation — paint the arrow as ARROW, the rest as
+      // LABEL_REF up to end-of-string.
+      kinds[i++] = KINTSUKI_TOK_ARROW;
+      kinds[i++] = KINTSUKI_TOK_ARROW;
+      while(i < len && text[i] == ' ') kinds[i++] = KINTSUKI_TOK_ARROW;
+      while(i < len) kinds[i++] = KINTSUKI_TOK_LABEL_REF;
+    } else {
+      i++;   // whitespace + punctuation we don't tag stay OTHER (0)
+    }
+  }
+}
+}  // namespace
 
 uint32_t kintsuki_disassemble_at(kintsuki_t* h, uint32_t pc, uint32_t count,
                                  kintsuki_disasm_line_t* out) {
@@ -1201,6 +1364,9 @@ uint32_t kintsuki_disassemble_at_ex(kintsuki_t* h, uint32_t pc, uint32_t count,
         }
       }
     }
+    // Tokenize for syntax-highlighted rendering. Cheap (single linear
+    // pass over <128 chars). Bytes past sl (NUL + padding) stay OTHER.
+    classifyTokens(out[i].text, sl, out[i].kinds);
     produced++;
     // REP/SEP track M/X flag flips so subsequent disassembly stays accurate
     // across `rep #$30` boundaries — the live table assumes flags don't
@@ -1219,6 +1385,371 @@ uint32_t kintsuki_disassemble_at_ex(kintsuki_t* h, uint32_t pc, uint32_t count,
     addr = (addr & 0xFF0000) | ((addr + len) & 0xFFFF);
   }
   return produced;
+}
+
+// ---- Project file -------------------------------------------------------
+
+int kintsuki_project_open(kintsuki_t* h, const char* dir) {
+  if(!h || !dir) return 0;
+  if(!h->program) return 0;
+  if(h->program->romSize() == 0) {
+    std::fprintf(stderr, "kintsuki_project_open: no ROM loaded\n");
+    return 0;
+  }
+  g_project.reset();
+  g_project = kintsuki::Project::open(
+    dir,
+    h->program->romPristineSha(),
+    h->program->romSize(),
+    h->program->romManifest(),
+    h->program->romIsHiRom());
+  if(!g_project) return 0;
+  // Ensure execHook is wired so note_exec fires even without user CBs.
+  if(!ares::SuperFamicom::execHook) ares::SuperFamicom::execHook = &cOnExec;
+  // memReadHook only fires when registered; install cOnRead (which
+  // both stamps the project data classifier inline and dispatches
+  // user-registered tracing CBs). When the user later adds a CB,
+  // kintsuki_add_callback_ex installs cOnRead too — same target,
+  // safe to overwrite.
+  if(!ares::SuperFamicom::memReadHook) ares::SuperFamicom::memReadHook = &cOnRead;
+  g_projectFrameClock    = 0;
+  g_projectLastSaveFrame = 0;
+  return 1;
+}
+
+void kintsuki_project_close(kintsuki_t* h) {
+  (void)h;
+  g_project.reset();
+  g_projectFrameClock    = 0;
+  g_projectLastSaveFrame = 0;
+}
+
+int kintsuki_project_save(kintsuki_t* h) {
+  (void)h;
+  if(!g_project) return 0;
+  return g_project->save() ? 1 : 0;
+}
+
+int kintsuki_project_is_open(kintsuki_t* h) {
+  (void)h;
+  return g_project ? 1 : 0;
+}
+
+uint8_t kintsuki_project_classify(kintsuki_t* h, uint32_t rom_offset) {
+  (void)h;
+  if(!g_project) return 0;
+  auto cls = (uint8_t)g_project->classify(rom_offset);
+  if(g_project->is_user_sticky(rom_offset)) cls |= KINTSUKI_BYTE_USER_STICKY;
+  return cls;
+}
+
+int kintsuki_project_bus_to_rom(kintsuki_t* h, uint32_t bus_addr, uint32_t* out_offset) {
+  (void)h;
+  if(!g_project || !out_offset) return 0;
+  int64_t off = g_project->bus_to_rom_offset(bus_addr);
+  if(off < 0) return 0;
+  *out_offset = (uint32_t)off;
+  return 1;
+}
+
+uint32_t kintsuki_project_mark(kintsuki_t* h, uint32_t rom_offset, uint32_t len,
+                               kintsuki_byte_class_t cls, int user_sticky) {
+  (void)h;
+  if(!g_project || len == 0) return 0;
+  auto kcls = (kintsuki::ByteClass)((uint8_t)cls & 0x7F);
+  if(user_sticky) g_project->mark_user(rom_offset, len, kcls);
+  else            g_project->mark_auto(rom_offset, len, kcls);
+  return len;
+}
+
+uint32_t kintsuki_project_map_dump(kintsuki_t* h, uint8_t* out, uint32_t cap) {
+  if(!h || !out || cap == 0 || !g_project) return 0;
+  uint32_t total = g_project->stats().total;
+  uint32_t n = (cap < total) ? cap : total;
+  for(uint32_t i = 0; i < n; i++) {
+    out[i] = (uint8_t)g_project->classify(i);
+    if(g_project->is_user_sticky(i)) out[i] |= KINTSUKI_BYTE_USER_STICKY;
+  }
+  return n;
+}
+
+void kintsuki_project_set_autosave(kintsuki_t* h, uint32_t frames) {
+  (void)h;
+  g_projectAutosaveFrames = frames;
+}
+
+uint32_t kintsuki_project_get_autosave(kintsuki_t* h) {
+  (void)h;
+  return g_projectAutosaveFrames;
+}
+
+int kintsuki_project_stats(kintsuki_t* h, kintsuki_project_stats_t* out) {
+  (void)h;
+  if(!g_project || !out) return 0;
+  auto s = g_project->stats();
+  out->total       = s.total;
+  out->classified  = s.classified;
+  out->code        = s.code;
+  out->data        = s.data;
+  out->user_sticky = s.user_sticky;
+  return 1;
+}
+
+// ---- Labels overlay -----------------------------------------------------
+
+int kintsuki_project_label_set(kintsuki_t* h, uint32_t addr,
+                               const char* name, const char* type,
+                               const char* comment,
+                               int m, int x, int e) {
+  (void)h;
+  if(!g_project) return 0;
+  kintsuki::Project::Label L{};
+  L.addr    = addr & 0xFFFFFF;
+  if(name)    L.name    = name;
+  if(type)    L.type    = type;
+  if(comment) L.comment = comment;
+  L.m = (int8_t)(m < 0 ? -1 : (m ? 1 : 0));
+  L.x = (int8_t)(x < 0 ? -1 : (x ? 1 : 0));
+  L.e = (int8_t)(e < 0 ? -1 : (e ? 1 : 0));
+  g_project->set_label(L);
+  return 1;
+}
+
+int kintsuki_project_label_get(kintsuki_t* h, uint32_t addr,
+                               kintsuki_project_label_t* out) {
+  (void)h;
+  if(!g_project || !out) return 0;
+  const auto* L = g_project->get_label(addr & 0xFFFFFF);
+  if(!L) return 0;
+  out->addr    = L->addr;
+  out->name    = L->name.c_str();
+  out->type    = L->type.c_str();
+  out->comment = L->comment.c_str();
+  out->m       = L->m;
+  out->x       = L->x;
+  out->e       = L->e;
+  return 1;
+}
+
+void kintsuki_project_label_clear(kintsuki_t* h, uint32_t addr) {
+  (void)h;
+  if(!g_project) return;
+  g_project->clear_label(addr & 0xFFFFFF);
+}
+
+uint32_t kintsuki_project_label_count(kintsuki_t* h) {
+  (void)h;
+  return g_project ? g_project->label_count() : 0;
+}
+
+uint32_t kintsuki_project_label_snapshot(kintsuki_t* h,
+                                         kintsuki_project_label_t* out,
+                                         uint32_t cap) {
+  (void)h;
+  if(!g_project || !out || cap == 0) return 0;
+  uint32_t total = g_project->label_count();
+  uint32_t n = total < cap ? total : cap;
+  for(uint32_t i = 0; i < n; i++) {
+    // label_at points into project-owned std::string storage; pointers
+    // stay valid until the next mutation (per the contract documented
+    // on kintsuki_project_label_t).
+    const auto* L = g_project->label_at(i);
+    if(!L) { n = i; break; }
+    out[i].addr    = L->addr;
+    out[i].name    = L->name.c_str();
+    out[i].type    = L->type.c_str();
+    out[i].comment = L->comment.c_str();
+    out[i].m       = L->m;
+    out[i].x       = L->x;
+    out[i].e       = L->e;
+  }
+  return n;
+}
+
+// ---- DMA provenance -----------------------------------------------------
+
+namespace {
+void copyProv(kintsuki_project_dma_prov_t& dst,
+              const kintsuki::Project::DmaProv& src) {
+  dst.src_rom    = src.src_rom;
+  dst.size       = src.size;
+  dst.dst_reg    = src.dst_reg;
+  dst._pad       = 0;
+  dst.caller_pc  = src.caller_pc;
+  dst.hits       = src.hits;
+  dst.last_frame = src.last_frame;
+}
+}  // namespace
+
+uint32_t kintsuki_project_dma_prov_count(kintsuki_t* h) {
+  (void)h;
+  return g_project ? g_project->dma_prov_count() : 0;
+}
+
+uint32_t kintsuki_project_dma_prov_snapshot(kintsuki_t* h,
+                                            kintsuki_project_dma_prov_t* out,
+                                            uint32_t cap) {
+  (void)h;
+  if(!g_project || !out || cap == 0) return 0;
+  uint32_t total = g_project->dma_prov_count();
+  uint32_t n = total < cap ? total : cap;
+  for(uint32_t i = 0; i < n; i++) {
+    const auto* p = g_project->dma_prov_at(i);
+    if(!p) { n = i; break; }
+    copyProv(out[i], *p);
+  }
+  return n;
+}
+
+uint32_t kintsuki_project_dma_prov_for_range(kintsuki_t* h,
+                                             uint32_t rom_offset, uint32_t len,
+                                             kintsuki_project_dma_prov_t* out,
+                                             uint32_t cap) {
+  (void)h;
+  if(!g_project || !out || cap == 0) return 0;
+  std::vector<kintsuki::Project::DmaProv> tmp(cap);
+  uint32_t n = g_project->dma_prov_for_range(rom_offset, len, tmp.data(), cap);
+  for(uint32_t i = 0; i < n; i++) copyProv(out[i], tmp[i]);
+  return n;
+}
+
+// ---- Function exits ----------------------------------------------------
+
+uint32_t kintsuki_project_func_count(kintsuki_t* h) {
+  (void)h;
+  return g_project ? g_project->func_count() : 0;
+}
+
+uint32_t kintsuki_project_func_snapshot(kintsuki_t* h,
+                                        kintsuki_project_func_t* out,
+                                        uint32_t cap) {
+  (void)h;
+  if(!g_project || !out || cap == 0) return 0;
+  uint32_t total = g_project->func_count();
+  uint32_t n = total < cap ? total : cap;
+  for(uint32_t i = 0; i < n; i++) {
+    const auto* fi = g_project->func_at(i);
+    if(!fi) { n = i; break; }
+    out[i].entry           = fi->entry;
+    out[i].call_count      = fi->call_count;
+    out[i].last_exit_frame = fi->last_exit_frame;
+    out[i].exit_count      = (uint32_t)fi->exit_pcs.size();
+  }
+  return n;
+}
+
+uint32_t kintsuki_project_func_exits(kintsuki_t* h, uint32_t entry,
+                                     kintsuki_project_exit_t* out,
+                                     uint32_t cap) {
+  (void)h;
+  if(!g_project || !out || cap == 0) return 0;
+  const auto* fi = g_project->func_for(entry);
+  if(!fi) return 0;
+  uint32_t n = (uint32_t)std::min<size_t>(fi->exit_pcs.size(), cap);
+  for(uint32_t i = 0; i < n; i++) {
+    out[i].pc   = fi->exit_pcs[i];
+    out[i].kind = fi->exit_kinds[i];
+  }
+  return n;
+}
+
+// ---- Bookmarks ---------------------------------------------------------
+
+int kintsuki_project_bookmark_set(kintsuki_t* h, const char* name, uint32_t addr,
+                                  const char* view, const char* comment) {
+  (void)h;
+  if(!g_project || !name) return 0;
+  kintsuki::Project::Bookmark b{};
+  b.addr    = addr & 0xFFFFFF;
+  b.name    = name;
+  if(view)    b.view    = view;
+  if(comment) b.comment = comment;
+  g_project->set_bookmark(b);
+  return 1;
+}
+
+void kintsuki_project_bookmark_clear(kintsuki_t* h, const char* name) {
+  (void)h;
+  if(!g_project || !name) return;
+  g_project->clear_bookmark(name);
+}
+
+uint32_t kintsuki_project_bookmark_count(kintsuki_t* h) {
+  (void)h;
+  return g_project ? g_project->bookmark_count() : 0;
+}
+
+uint32_t kintsuki_project_bookmark_snapshot(kintsuki_t* h,
+                                            kintsuki_project_bookmark_t* out,
+                                            uint32_t cap) {
+  (void)h;
+  if(!g_project || !out || cap == 0) return 0;
+  uint32_t total = g_project->bookmark_count();
+  uint32_t n = total < cap ? total : cap;
+  for(uint32_t i = 0; i < n; i++) {
+    const auto* b = g_project->bookmark_at(i);
+    if(!b) { n = i; break; }
+    out[i].addr    = b->addr;
+    out[i].name    = b->name.c_str();
+    out[i].view    = b->view.c_str();
+    out[i].comment = b->comment.c_str();
+  }
+  return n;
+}
+
+// ---- Breakpoints -------------------------------------------------------
+
+int kintsuki_project_bp_add(kintsuki_t* h, uint8_t kind,
+                            uint32_t addr_lo, uint32_t addr_hi,
+                            int halt, int enabled, const char* comment) {
+  (void)h;
+  if(!g_project) return 0;
+  kintsuki::Project::Breakpoint bp{};
+  bp.kind    = (kintsuki::Project::BpKind)(kind & 0x3);
+  bp.halt    = halt != 0;
+  bp.enabled = enabled != 0;
+  bp.addr_lo = addr_lo & 0xFFFFFF;
+  bp.addr_hi = addr_hi & 0xFFFFFF;
+  if(comment) bp.comment = comment;
+  g_project->add_breakpoint(bp);
+  return 1;
+}
+
+void kintsuki_project_bp_remove(kintsuki_t* h, uint32_t index) {
+  (void)h;
+  if(!g_project) return;
+  g_project->remove_breakpoint(index);
+}
+
+void kintsuki_project_bp_clear(kintsuki_t* h) {
+  (void)h;
+  if(!g_project) return;
+  g_project->clear_breakpoints();
+}
+
+uint32_t kintsuki_project_bp_count(kintsuki_t* h) {
+  (void)h;
+  return g_project ? g_project->breakpoint_count() : 0;
+}
+
+uint32_t kintsuki_project_bp_snapshot(kintsuki_t* h, kintsuki_project_bp_t* out,
+                                      uint32_t cap) {
+  (void)h;
+  if(!g_project || !out || cap == 0) return 0;
+  uint32_t total = g_project->breakpoint_count();
+  uint32_t n = total < cap ? total : cap;
+  for(uint32_t i = 0; i < n; i++) {
+    const auto* bp = g_project->breakpoint_at(i);
+    if(!bp) { n = i; break; }
+    out[i].kind    = (uint8_t)bp->kind;
+    out[i].halt    = bp->halt ? 1 : 0;
+    out[i].enabled = bp->enabled ? 1 : 0;
+    out[i]._pad    = 0;
+    out[i].addr_lo = bp->addr_lo;
+    out[i].addr_hi = bp->addr_hi;
+    out[i].comment = bp->comment.c_str();
+  }
+  return n;
 }
 
 }  // extern "C"

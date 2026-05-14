@@ -18,6 +18,85 @@ final class Emulator {
     private(set) var cpuState = CpuState()
     private(set) var breakpoints: [Breakpoint] = []
 
+    // ---- Project file (kintsuki project, slices 1-5) -------------------
+    /// True while a `.kintsuki/` directory is attached to the loaded ROM.
+    private(set) var projectIsOpen: Bool = false
+    /// Filesystem location of the open project, or nil when none.
+    private(set) var projectDir: URL?
+    /// Last-snapshot summary counters; refreshed by ``projectRefreshStats``
+    /// and after every project_* mutation.
+    private(set) var projectStats: ProjectStats? = nil
+    /// Cached `map.bin` byte array. Pulled on demand by viewers via
+    /// ``projectMapDump()``; the viewer keeps its own copy. Empty when
+    /// no project is open.
+
+    struct ProjectStats: Equatable {
+        var total: UInt32 = 0
+        var classified: UInt32 = 0
+        var code: UInt32 = 0
+        var data: UInt32 = 0
+        var userSticky: UInt32 = 0
+        /// classified / total as a percentage in [0, 100].
+        var pctClassified: Double {
+            total == 0 ? 0 : Double(classified) * 100 / Double(total)
+        }
+    }
+
+    /// Byte-class enum mirroring `KINTSUKI_BYTE_*`. Swift-side so views
+    /// can switch over it without dragging the C constants in directly.
+    enum ByteClass: UInt8 {
+        case unknown     = 0
+        case code        = 1     // opcode byte
+        case data        = 2
+        case pointer     = 3
+        case string      = 4
+        case graphics    = 5
+        case tilemap     = 6
+        case palette     = 7
+        case audio       = 8
+        case codeOperand = 9     // bytes after an opcode
+
+        /// Conventional colour for inspector overlays. Tuned to read at
+        /// 12pt cell-fill alpha (~0.3) against the system table bg.
+        var overlayColor: NSColor {
+            switch self {
+            case .unknown:     return .clear
+            case .code:        return NSColor.systemBlue
+            case .codeOperand: return NSColor.systemBlue.withAlphaComponent(0.55)
+            case .data:        return NSColor.systemOrange
+            case .pointer:     return NSColor.systemTeal
+            case .string:      return NSColor.systemGreen
+            case .graphics:    return NSColor.systemPurple
+            case .tilemap:     return NSColor.systemPink
+            case .palette:     return NSColor.systemYellow
+            case .audio:       return NSColor.systemBrown
+            }
+        }
+        /// Short label for the right-click "Mark as…" menu + status pill.
+        var label: String {
+            switch self {
+            case .unknown:     return "Unknown"
+            case .code:        return "Code"
+            case .codeOperand: return "Code operand"
+            case .data:        return "Data"
+            case .pointer:     return "Pointer"
+            case .string:      return "String"
+            case .graphics:    return "Graphics"
+            case .tilemap:     return "Tilemap"
+            case .palette:     return "Palette"
+            case .audio:       return "Audio"
+            }
+        }
+        static let allUserMarkable: [ByteClass] = [
+            .code, .data, .pointer, .string, .graphics, .tilemap,
+            .palette, .audio, .unknown,
+        ]
+    }
+    /// Bit 7 of a `map.bin` byte. Set ⇒ the entry was hand-marked by
+    /// the user and survives auto-reclassification.
+    static let projectUserStickyBit: UInt8 = 0x80
+    static let projectClassMask: UInt8 = 0x7F
+
     /// Set by ContentView once SwiftData's ModelContext is available.
     /// Use `setModelContext(_:)` rather than assigning directly — it
     /// pumps any auto-load that fired before the context was ready.
@@ -94,6 +173,25 @@ final class Emulator {
     private(set) var memoryNavRequest: MemoryNavRequest? = nil
     private var memoryNavNonce: Int = 0
 
+    /// Cross-window disasm navigation request — e.g. Labels panel asks
+    /// the Debugger to focus on a given PC. Mirrors the memory request
+    /// pattern: nonce bumps so a second click on the same PC still
+    /// re-jumps the disasm scroller.
+    struct DisasmNavRequest: Equatable {
+        let pc: UInt32
+        let nonce: Int
+    }
+    private(set) var disasmNavRequest: DisasmNavRequest? = nil
+    private var disasmNavNonce: Int = 0
+
+    /// Hand the Debugger a focus request. Pair with
+    /// `openWindow(id: "debugger")` so the window exists before
+    /// the request arrives.
+    func requestDisasmView(pc: UInt32) {
+        disasmNavNonce &+= 1
+        disasmNavRequest = DisasmNavRequest(pc: pc & 0xFFFFFF, nonce: disasmNavNonce)
+    }
+
     /// Hand the Memory Viewer a focus request. Pair with
     /// `openWindow(id: "memory")` from the caller to make sure the
     /// window exists before the request is delivered.
@@ -146,6 +244,10 @@ final class Emulator {
         let vramAddr: UInt16
         let hits: UInt32
         let lastFrame: UInt64
+        /// Caller PC at the moment the DMA fired (top of shadow callstack,
+        /// or live PC when none). Lets viewers answer "who pushed this
+        /// buffer?" without spinning the tracer.
+        let callerPc: UInt32     // 24-bit
         var id: UInt64 {
             (UInt64(srcAddr) << 32) | (UInt64(vramAddr) << 16) | UInt64(size)
         }
@@ -200,7 +302,8 @@ final class Emulator {
                                    dstReg: e.dst_reg,
                                    vramAddr: e.vram_addr,
                                    hits: e.hits,
-                                   lastFrame: e.last_frame))
+                                   lastFrame: e.last_frame,
+                                   callerPc: e.caller_pc))
         }
         return out
     }
@@ -473,6 +576,368 @@ final class Emulator {
                   + "(tried .sfc.adbg, .adbg, .ips.adbg)")
         }
         startRunLoop()
+        // Auto-attach a sibling `.kintsuki/` directory if one exists.
+        // Matches the .adbg auto-load above: power-users mark their work
+        // up alongside the ROM and expect the project to follow on next
+        // launch without manual fuss.
+        let projectGuess = url.deletingPathExtension().appendingPathExtension("kintsuki")
+        if FileManager.default.fileExists(atPath: projectGuess.path) {
+            projectOpen(at: projectGuess)
+        } else {
+            projectIsOpen = false
+            projectDir = nil
+            projectStats = nil
+        }
+    }
+
+    // ---- Project lifecycle --------------------------------------------
+
+    /// Attach (or create) a `.kintsuki/` project directory next to the
+    /// loaded ROM. The directory will be created on first open. Refreshes
+    /// stats on success. Logs + returns silently on failure (typically:
+    /// no ROM loaded, directory unwritable).
+    func projectOpen(at dir: URL) {
+        guard let h = handle else { return }
+        let ok = dir.path.withCString { kintsuki_project_open(h, $0) }
+        guard ok != 0 else {
+            NSLog("kintsuki: project open failed for \(dir.path)")
+            return
+        }
+        projectIsOpen = true
+        projectDir = dir
+        projectRefreshStats()
+        projectReinstallBreakpoints()
+        NSLog("kintsuki: project attached at \(dir.path)")
+    }
+
+    /// Create a fresh project directory next to the loaded ROM and
+    /// attach. No-op when no ROM is loaded.
+    func projectCreateForLoadedROM() {
+        guard let rom = loadedROM else { return }
+        let dir = rom.deletingPathExtension().appendingPathExtension("kintsuki")
+        projectOpen(at: dir)
+    }
+
+    /// Detach the current project without explicit save (autosave runs
+    /// every N frames via `kintsuki_run_frames` already).
+    func projectClose() {
+        guard let h = handle else { return }
+        kintsuki_project_close(h)
+        projectIsOpen = false
+        projectDir = nil
+        projectStats = nil
+    }
+
+    /// Force a flush. Cheap when nothing is dirty.
+    @discardableResult
+    func projectSave() -> Bool {
+        guard let h = handle else { return false }
+        let ok = kintsuki_project_save(h)
+        return ok != 0
+    }
+
+    /// Get/set the autosave interval in emulator-frames. 0 disables.
+    func projectAutosave(_ frames: UInt32? = nil) -> UInt32 {
+        guard let h = handle else { return 0 }
+        if let f = frames {
+            kintsuki_project_set_autosave(h, f)
+        }
+        return kintsuki_project_get_autosave(h)
+    }
+
+    /// Pull the latest counters into ``projectStats``. Cheap (single
+    /// FFI call). Call after any mutation that should bump the UI.
+    func projectRefreshStats() {
+        guard let h = handle, projectIsOpen else {
+            projectStats = nil
+            return
+        }
+        var raw = kintsuki_project_stats_t()
+        if kintsuki_project_stats(h, &raw) != 0 {
+            projectStats = ProjectStats(total: raw.total,
+                                        classified: raw.classified,
+                                        code: raw.code,
+                                        data: raw.data,
+                                        userSticky: raw.user_sticky)
+        }
+    }
+
+    /// Single-byte classify lookup at a ROM offset. Returns nil when no
+    /// project is open or offset is out of range. The high bit is the
+    /// user-sticky flag; viewers strip it via ``projectClassMask``.
+    func projectClassify(romOffset: UInt32) -> UInt8 {
+        guard let h = handle, projectIsOpen else { return 0 }
+        return kintsuki_project_classify(h, romOffset)
+    }
+
+    /// Map a 24-bit CPU bus address to a ROM offset, or nil if the
+    /// address isn't in ROM (WRAM, SRAM, system regs, ...).
+    func projectBusToRom(_ busAddr: UInt32) -> UInt32? {
+        guard let h = handle, projectIsOpen else { return nil }
+        var out: UInt32 = 0
+        return kintsuki_project_bus_to_rom(h, busAddr & 0xFFFFFF, &out) != 0
+            ? out : nil
+    }
+
+    /// Mark a ROM range. ``userSticky`` protects the mark from auto-
+    /// reclassification.
+    func projectMark(romOffset: UInt32, length: UInt32,
+                     cls: ByteClass, userSticky: Bool = true) {
+        guard let h = handle, projectIsOpen else { return }
+        _ = kintsuki_project_mark(h, romOffset, length,
+                                  kintsuki_byte_class_t(UInt32(cls.rawValue)),
+                                  userSticky ? 1 : 0)
+        projectRefreshStats()
+    }
+
+    /// Resolve a 24-bit PC to "(label, bytes-into-routine)" using the
+    /// loaded `.adbg`. Nil when no label precedes the address. The
+    /// label name borrows from .adbg-owned storage; safe to copy out.
+    func lookupLabelContaining(addr: UInt32) -> (String, UInt32)? {
+        guard let h = handle else { return nil }
+        var off: UInt32 = 0
+        guard let p = kintsuki_lookup_label_containing(h, addr & 0xFFFFFF, &off) else {
+            return nil
+        }
+        return (String(cString: p), off)
+    }
+
+    // ---- Project: labels overlay (slice 2) -----------------------------
+
+    struct ProjectLabel: Identifiable, Hashable {
+        let addr: UInt32        // 24-bit
+        var name: String
+        var type: String
+        var comment: String
+        var m: Int8             // -1 = unset, 0/1
+        var x: Int8
+        var e: Int8
+        var id: UInt32 { addr }
+    }
+
+    /// Upsert an overlay label at `addr`. Pass empty strings / nil flags
+    /// to leave columns unset. Refreshes stats so the UI badge updates.
+    func projectLabelSet(addr: UInt32, name: String = "",
+                         type: String = "", comment: String = "",
+                         m: Int? = nil, x: Int? = nil, e: Int? = nil) {
+        guard let h = handle, projectIsOpen else { return }
+        let mi: Int32 = m.map(Int32.init) ?? -1
+        let xi: Int32 = x.map(Int32.init) ?? -1
+        let ei: Int32 = e.map(Int32.init) ?? -1
+        _ = name.withCString { np in
+            type.withCString { tp in
+                comment.withCString { cp in
+                    kintsuki_project_label_set(h, addr & 0xFFFFFF,
+                                               name.isEmpty ? nil : np,
+                                               type.isEmpty ? nil : tp,
+                                               comment.isEmpty ? nil : cp,
+                                               mi, xi, ei)
+                }
+            }
+        }
+        projectRefreshStats()
+    }
+
+    func projectLabelGet(addr: UInt32) -> ProjectLabel? {
+        guard let h = handle, projectIsOpen else { return nil }
+        var raw = kintsuki_project_label_t()
+        guard kintsuki_project_label_get(h, addr & 0xFFFFFF, &raw) != 0 else { return nil }
+        return ProjectLabel(
+            addr: raw.addr,
+            name: raw.name.map { String(cString: $0) } ?? "",
+            type: raw.type.map { String(cString: $0) } ?? "",
+            comment: raw.comment.map { String(cString: $0) } ?? "",
+            m: raw.m, x: raw.x, e: raw.e)
+    }
+
+    func projectLabelClear(addr: UInt32) {
+        guard let h = handle, projectIsOpen else { return }
+        kintsuki_project_label_clear(h, addr & 0xFFFFFF)
+    }
+
+    /// All overlay labels, address-ascending. Pointers in the C struct
+    /// are copied to Swift strings, so the returned values outlive the
+    /// next mutation (unlike the raw C ABI contract).
+    func projectLabels() -> [ProjectLabel] {
+        guard let h = handle, projectIsOpen else { return [] }
+        let cap = kintsuki_project_label_count(h)
+        if cap == 0 { return [] }
+        var buf = [kintsuki_project_label_t](repeating: kintsuki_project_label_t(),
+                                              count: Int(cap))
+        let n = buf.withUnsafeMutableBufferPointer { p -> UInt32 in
+            kintsuki_project_label_snapshot(h, p.baseAddress, UInt32(p.count))
+        }
+        return (0..<Int(n)).map { i in
+            let r = buf[i]
+            return ProjectLabel(
+                addr: r.addr,
+                name: r.name.map { String(cString: $0) } ?? "",
+                type: r.type.map { String(cString: $0) } ?? "",
+                comment: r.comment.map { String(cString: $0) } ?? "",
+                m: r.m, x: r.x, e: r.e)
+        }
+    }
+
+    // ---- Project: bookmarks (slice 4) ----------------------------------
+
+    struct ProjectBookmark: Identifiable, Hashable {
+        var name: String
+        var addr: UInt32
+        var view: String
+        var comment: String
+        var id: String { name }
+    }
+
+    func projectBookmarkSet(name: String, addr: UInt32,
+                            view: String = "", comment: String = "") {
+        guard let h = handle, projectIsOpen, !name.isEmpty else { return }
+        _ = name.withCString { np in
+            view.withCString { vp in
+                comment.withCString { cp in
+                    kintsuki_project_bookmark_set(h, np, addr & 0xFFFFFF, vp, cp)
+                }
+            }
+        }
+    }
+
+    func projectBookmarkClear(name: String) {
+        guard let h = handle, projectIsOpen else { return }
+        name.withCString { kintsuki_project_bookmark_clear(h, $0) }
+    }
+
+    func projectBookmarks() -> [ProjectBookmark] {
+        guard let h = handle, projectIsOpen else { return [] }
+        let cap = kintsuki_project_bookmark_count(h)
+        if cap == 0 { return [] }
+        var buf = [kintsuki_project_bookmark_t](
+            repeating: kintsuki_project_bookmark_t(), count: Int(cap))
+        let n = buf.withUnsafeMutableBufferPointer { p -> UInt32 in
+            kintsuki_project_bookmark_snapshot(h, p.baseAddress, UInt32(p.count))
+        }
+        return (0..<Int(n)).map { i in
+            let r = buf[i]
+            return ProjectBookmark(
+                name: r.name.map { String(cString: $0) } ?? "",
+                addr: r.addr,
+                view: r.view.map { String(cString: $0) } ?? "",
+                comment: r.comment.map { String(cString: $0) } ?? "")
+        }
+    }
+
+    // ---- Project: breakpoint persistence (slice 4) ---------------------
+
+    /// Rewrite the project's BP records from the live ``breakpoints``
+    /// list. Cheap (clear + walk). Called on every add/remove while a
+    /// project is open so close→reopen survives the entire BP set.
+    fileprivate func projectSyncBreakpoints() {
+        guard let h = handle, projectIsOpen else { return }
+        kintsuki_project_bp_clear(h)
+        for bp in breakpoints {
+            _ = kintsuki_project_bp_add(
+                h, UInt8(bp.kind.rawValue),
+                bp.lo, bp.hi,
+                bp.halt ? 1 : 0, /*enabled=*/1,
+                nil)
+        }
+    }
+
+    /// Walk the open project's BP records and install a live callback
+    /// for each enabled entry. Called once from `projectOpen` so users
+    /// land on a session with their previous BPs already armed.
+    fileprivate func projectReinstallBreakpoints() {
+        guard let h = handle, projectIsOpen else { return }
+        let n = kintsuki_project_bp_count(h)
+        if n == 0 { return }
+        var buf = [kintsuki_project_bp_t](
+            repeating: kintsuki_project_bp_t(), count: Int(n))
+        let written = buf.withUnsafeMutableBufferPointer { p -> UInt32 in
+            kintsuki_project_bp_snapshot(h, p.baseAddress, UInt32(p.count))
+        }
+        for i in 0..<Int(written) {
+            let r = buf[i]
+            if r.enabled == 0 { continue }
+            // Skip dup-installs: if a session-local BP already covers
+            // the same range + kind, leave it alone.
+            let already = breakpoints.contains { b in
+                b.kind.rawValue == Int(r.kind)
+                && b.lo == r.addr_lo && b.hi == r.addr_hi
+                && b.halt == (r.halt != 0)
+            }
+            if already { continue }
+            guard let kind = BreakKind(rawValue: Int(r.kind)) else { continue }
+            addBreakpoint(kind: kind, lo: r.addr_lo, hi: r.addr_hi,
+                          halt: r.halt != 0)
+        }
+    }
+
+    // ---- Project: function exits (slice 7) -----------------------------
+
+    struct ProjectFunction: Identifiable, Hashable {
+        let entry: UInt32        // 24-bit
+        let callCount: UInt32
+        let lastExitFrame: UInt64
+        let exits: [UInt32]      // 24-bit, dedup'd, first-seen order
+        let exitKinds: [UInt8]   // parallel to exits, 0=RTS, 1=RTL
+        var id: UInt32 { entry }
+        /// Inclusive last byte the function is known to span (max exit
+        /// observed; ~+2 bytes for RTS/RTL operand width). Nil when no
+        /// exits have been recorded yet.
+        var endApprox: UInt32? {
+            guard let m = exits.max() else { return nil }
+            return m + 2     // RTS is 1 byte, RTL is 1 byte, add a hair
+        }
+    }
+
+    /// Project-side observed functions (entry + recorded exit PCs).
+    /// Empty when no project is open or no function has returned yet.
+    func projectFunctions() -> [ProjectFunction] {
+        guard let h = handle, projectIsOpen else { return [] }
+        let count = kintsuki_project_func_count(h)
+        if count == 0 { return [] }
+        var buf = [kintsuki_project_func_t](
+            repeating: kintsuki_project_func_t(), count: Int(count))
+        let written = buf.withUnsafeMutableBufferPointer { p -> UInt32 in
+            kintsuki_project_func_snapshot(h, p.baseAddress, UInt32(p.count))
+        }
+        var out: [ProjectFunction] = []
+        out.reserveCapacity(Int(written))
+        for i in 0..<Int(written) {
+            let f = buf[i]
+            var exits = [kintsuki_project_exit_t](
+                repeating: kintsuki_project_exit_t(),
+                count: Int(f.exit_count))
+            let en = exits.withUnsafeMutableBufferPointer { p -> UInt32 in
+                kintsuki_project_func_exits(h, f.entry, p.baseAddress,
+                                            UInt32(p.count))
+            }
+            let exitPcs = (0..<Int(en)).map { exits[$0].pc }
+            let exitKinds = (0..<Int(en)).map { exits[$0].kind }
+            out.append(ProjectFunction(entry: f.entry,
+                                       callCount: f.call_count,
+                                       lastExitFrame: f.last_exit_frame,
+                                       exits: exitPcs,
+                                       exitKinds: exitKinds))
+        }
+        return out
+    }
+
+    /// Single-byte CPU bus read. Returns nil when no ROM is loaded.
+    /// Cheap (one FFI hop) — useful for callers that need a single byte
+    /// without setting up a buffer.
+    func readBus(_ addr: UInt32) -> UInt8? {
+        guard let h = handle else { return nil }
+        return kintsuki_read_u8(h, addr & 0xFFFFFF)
+    }
+
+    /// Bulk-dump map.bin into a Data buffer. Empty when no project open.
+    func projectMapDump() -> Data {
+        guard let h = handle, projectIsOpen,
+              let total = projectStats?.total, total > 0 else { return Data() }
+        var buf = [UInt8](repeating: 0, count: Int(total))
+        let written = buf.withUnsafeMutableBufferPointer { p -> UInt32 in
+            kintsuki_project_map_dump(h, p.baseAddress, UInt32(p.count))
+        }
+        return Data(buf.prefix(Int(written)))
     }
 
     func clearRecents() {
@@ -650,6 +1115,27 @@ final class Emulator {
         /// JMP/JML/JSR/JSL/Bxx/BRL with a constant operand. Nil for
         /// non-branching ops or indirect/indexed jumps.
         let target: UInt32?
+        /// Per-byte token kinds parallel to `text`. `kinds[i]` is the
+        /// `KINTSUKI_TOK_*` value classifying `text[i]`. Truncated to
+        /// the visible string length. The Debugger uses this to paint
+        /// the line without re-parsing assembly.
+        let kinds: [UInt8]
+    }
+
+    /// Sugar mirroring `KINTSUKI_TOK_*` so disasm consumers don't have
+    /// to keep the C-side magic numbers in sync.
+    enum DisasmTok: UInt8 {
+        case other     = 0
+        case mnemonic  = 1
+        case immHex    = 2
+        case absHex    = 3
+        case longHex   = 4
+        case dpHex     = 5
+        case reg       = 6
+        case punct     = 7
+        case labelRef  = 8
+        case arrow     = 9
+        case comment   = 10
     }
 
     func disassemble(at pc: UInt32, count: Int,
@@ -677,8 +1163,19 @@ final class Emulator {
                 }
             }
             let target: UInt32? = entry.target == 0xFFFFFFFF ? nil : entry.target
+            // Mirror the kinds[] array up to the visible string length.
+            // `text` was built with `String(cString:)`, which counts
+            // bytes up to the first NUL — the kinds are byte-parallel
+            // since the disassembler emits ASCII only.
+            let kinds: [UInt8] = withUnsafePointer(to: &entry.kinds) { tup in
+                tup.withMemoryRebound(to: UInt8.self, capacity: 128) { p in
+                    let utf8len = text.utf8.count
+                    let take = min(utf8len, 128)
+                    return Array(UnsafeBufferPointer(start: p, count: take))
+                }
+            }
             return DisasmLine(pc: entry.pc, length: entry.length,
-                              text: text, target: target)
+                              text: text, target: target, kinds: kinds)
         }
     }
 
@@ -1569,6 +2066,7 @@ final class Emulator {
             h, Int32(kind.rawValue), lo, hi, halt ? 1 : 0,
             Self.breakCallback, opaque))
         breakpoints.append(bp)
+        projectSyncBreakpoints()
     }
 
     func removeBreakpoint(_ bp: Breakpoint) {
@@ -1578,6 +2076,7 @@ final class Emulator {
         silentHits.removeValue(forKey: bp.id)
         silentLastHit.removeValue(forKey: bp.id)
         breakpoints.removeAll { $0.id == bp.id }
+        projectSyncBreakpoints()
     }
 
     // ----- Framebuffer ------------------------------------------------------
@@ -1654,31 +2153,52 @@ final class Emulator {
         var id: UInt32 { addr }
     }
 
-    /// All labels loaded from the active `.adbg` sidecar, sorted by
-    /// address ascending. Empty when no .adbg is loaded. Cached snapshot
-    /// — invalidated on `loadADBG` (caller responsibility to re-fetch).
+    /// Union of `.adbg` LABEL table + project overlay labels (IDA-style
+    /// renames stored in `labels.tsv`). Sorted by address; on name
+    /// collisions the project overlay wins. Empty when neither source
+    /// is loaded. The Debugger window uses this for the symbol jump +
+    /// breakpoint autocomplete so both populated tables suggest.
     func allLabels() -> [Label] {
-        guard let h = handle else { return [] }
-        let count = Int(kintsuki_label_count(h))
-        if count == 0 { return [] }
-        var raw = [kintsuki_label_entry_t](repeating: kintsuki_label_entry_t(),
-                                           count: count)
-        let n = raw.withUnsafeMutableBufferPointer { buf -> UInt32 in
-            kintsuki_label_snapshot(h, buf.baseAddress, UInt32(buf.count))
+        // Project overlay first (wins by address).
+        var byAddr: [UInt32: Label] = [:]
+        if projectIsOpen {
+            for L in projectLabels() where !L.name.isEmpty {
+                byAddr[L.addr] = Label(addr: L.addr, name: L.name)
+            }
         }
-        var out: [Label] = []
-        out.reserveCapacity(Int(n))
-        for i in 0..<Int(n) {
-            let e = raw[i]
-            guard let p = e.name else { continue }
-            out.append(Label(addr: e.addr, name: String(cString: p)))
+        // .adbg fills in any gaps.
+        if let h = handle {
+            let count = Int(kintsuki_label_count(h))
+            if count > 0 {
+                var raw = [kintsuki_label_entry_t](repeating: kintsuki_label_entry_t(),
+                                                   count: count)
+                let n = raw.withUnsafeMutableBufferPointer { buf -> UInt32 in
+                    kintsuki_label_snapshot(h, buf.baseAddress, UInt32(buf.count))
+                }
+                for i in 0..<Int(n) {
+                    let e = raw[i]
+                    guard let p = e.name else { continue }
+                    if byAddr[e.addr] == nil {
+                        byAddr[e.addr] = Label(addr: e.addr, name: String(cString: p))
+                    }
+                }
+            }
         }
-        return out
+        return byAddr.values.sorted { $0.addr < $1.addr }
     }
 
-    /// Resolve a label by name → 24-bit PC. Returns nil when no .adbg is
-    /// loaded or no label by that name exists.
+    /// Resolve a label by name → 24-bit PC. Consults project overlay
+    /// first, then `.adbg`. Returns nil when neither source has a
+    /// match.
     func resolveSymbol(_ name: String) -> UInt32? {
+        if projectIsOpen {
+            // Linear scan, but overlay tables are small (hundreds, not
+            // thousands of entries) so the cost is negligible vs the
+            // FFI hop that `kintsuki_lookup_symbol_addr` would do.
+            for L in projectLabels() where L.name == name {
+                return L.addr
+            }
+        }
         guard let h = handle else { return nil }
         var addr: UInt32 = 0
         let ok = name.withCString { kintsuki_lookup_symbol_addr(h, $0, &addr) }
@@ -1699,10 +2219,27 @@ final class Emulator {
 
     /// Exact-address label lookup. Cheaper than `containingLabel` when
     /// the caller wants to know "is this PC the start of a routine?".
+    /// Project overlay wins over .adbg — renaming in the labels panel
+    /// shadows the source-of-truth symbol.
     func exactLabel(at pc: UInt32) -> String? {
+        if projectIsOpen,
+           let lbl = projectLabelGet(addr: pc),
+           !lbl.name.isEmpty {
+            return lbl.name
+        }
         guard let h = handle else { return nil }
         guard let p = kintsuki_lookup_label(h, pc) else { return nil }
         return String(cString: p)
+    }
+
+    /// Project-overlay label at exactly `pc`, ignoring .adbg. Used by
+    /// the disasm view to badge entry rows with a purple tag distinct
+    /// from the .adbg blue tag.
+    func projectExactLabel(at pc: UInt32) -> String? {
+        guard projectIsOpen,
+              let lbl = projectLabelGet(addr: pc),
+              !lbl.name.isEmpty else { return nil }
+        return lbl.name
     }
 
     /// `.adbg` source-line lookup. Returns `(file, line, column)` when

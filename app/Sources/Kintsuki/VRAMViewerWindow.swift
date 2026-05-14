@@ -238,29 +238,50 @@ struct VRAMViewerView: View {
                     .font(.caption).foregroundStyle(.secondary)
             } else {
                 ForEach(xfers.prefix(8)) { x in
-                    Button {
-                        let region: Emulator.MemRegion =
-                            (0x7E0000...0x7FFFFF).contains(x.srcAddr)
-                                ? .wram : .rom
-                        let off = region == .wram
-                            ? Int(x.srcAddr & 0x1FFFF)
-                            : romOffsetFor(busAddr: x.srcAddr)
-                        emulator.requestMemoryView(region: region, offset: off)
-                        openWindow(id: "memory")
-                    } label: {
-                        HStack {
-                            Text(String(format: "%06X", x.srcAddr))
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundStyle(Color.accentColor)
-                                .underline()
-                            Text(String(format: "→ VRAM $%04X.w (%d B) ×%d",
-                                        x.vramAddr, x.size, x.hits))
-                                .font(.system(.caption2, design: .monospaced))
-                                .foregroundStyle(.secondary)
-                            Spacer()
+                    HStack(spacing: 6) {
+                        Button {
+                            let region: Emulator.MemRegion =
+                                (0x7E0000...0x7FFFFF).contains(x.srcAddr)
+                                    ? .wram : .rom
+                            let off = region == .wram
+                                ? Int(x.srcAddr & 0x1FFFF)
+                                : romOffsetFor(busAddr: x.srcAddr)
+                            emulator.requestMemoryView(region: region, offset: off)
+                            openWindow(id: "memory")
+                        } label: {
+                            HStack(spacing: 4) {
+                                Text(String(format: "%06X", x.srcAddr))
+                                    .font(.system(.caption, design: .monospaced))
+                                    .foregroundStyle(Color.accentColor)
+                                    .underline()
+                                Text(String(format: "→ VRAM $%04X.w (%d B) ×%d",
+                                            x.vramAddr, x.size, x.hits))
+                                    .font(.system(.caption2, design: .monospaced))
+                                    .foregroundStyle(.secondary)
+                            }
                         }
+                        .buttonStyle(.plain)
+                        Spacer(minLength: 4)
+                        // Caller PC (slice 3 / UI slice 6): jump to the
+                        // routine that pushed this buffer. Lands in the
+                        // Debugger — DMA callers are always code, the
+                        // disasm view is the natural surface.
+                        Button {
+                            emulator.requestDisasmView(pc: x.callerPc)
+                            openWindow(id: "debugger")
+                        } label: {
+                            HStack(spacing: 2) {
+                                Image(systemName: "arrow.uturn.left")
+                                    .font(.caption2)
+                                Text(callerLabel(for: x.callerPc))
+                                    .font(.system(.caption2, design: .monospaced))
+                            }
+                            .foregroundStyle(Color.purple)
+                            .underline()
+                        }
+                        .buttonStyle(.plain)
+                        .help("Caller PC at DMA fire — click to jump")
                     }
-                    .buttonStyle(.plain)
                 }
             }
         }
@@ -305,6 +326,15 @@ struct VRAMViewerView: View {
         let lo = Int(busAddr & 0xFFFF)
         if lo < 0x8000 { return 0 }
         return bank * 0x8000 + (lo - 0x8000)
+    }
+
+    /// "$00C0:801F" or "FooRoutine+12" if .adbg is loaded and the PC
+    /// lands inside a known routine. Compact enough to fit the DMA row.
+    private func callerLabel(for pc: UInt32) -> String {
+        if let (name, off) = emulator.lookupLabelContaining(addr: pc) {
+            return off == 0 ? name : "\(name)+\(String(off, radix: 16))"
+        }
+        return String(format: "$%02X:%04X", pc >> 16, pc & 0xFFFF)
     }
 
     // ----- Snapshot derivation -----

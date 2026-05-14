@@ -292,6 +292,25 @@ void        kintsuki_tracer_set_ranges(kintsuki_t*,
 // initial state and tracks REP/SEP flips through the disassembled stream
 // so a `rep #$30` advance into 16-bit immediates stays correctly sized.
 // Returns the number of entries actually produced.
+// Per-character token kinds emitted alongside `text`. `kinds[i]` tags
+// `text[i]` with the role of that byte in the assembly line so the host
+// can drive syntax-coloured rendering without re-parsing the string.
+// Appended at the end of `kintsuki_disasm_line_t` — old consumers reading
+// only the historical prefix stay binary-compatible.
+typedef enum {
+  KINTSUKI_TOK_OTHER     = 0,   // whitespace, padding, unclassified
+  KINTSUKI_TOK_MNEMONIC  = 1,
+  KINTSUKI_TOK_IMM_HEX   = 2,   // `$XX` / `$XXXX` immediately after `#`
+  KINTSUKI_TOK_ABS_HEX   = 3,   // 16-bit absolute / direct-non-DP hex
+  KINTSUKI_TOK_LONG_HEX  = 4,   // 24-bit long hex (5..6 nibbles)
+  KINTSUKI_TOK_DP_HEX    = 5,   // direct-page / 8-bit branch hex
+  KINTSUKI_TOK_REG       = 6,   // X / Y / S after a comma
+  KINTSUKI_TOK_PUNCT     = 7,   // `,` `#` `[` `]` `(` `)`
+  KINTSUKI_TOK_LABEL_REF = 8,   // identifier following ` -> `
+  KINTSUKI_TOK_ARROW     = 9,   // the ` -> ` separator itself
+  KINTSUKI_TOK_COMMENT   = 10,  // reserved for `;` comments
+} kintsuki_tok_kind_t;
+
 typedef struct kintsuki_disasm_line_t {
   uint32_t pc;       // 24-bit
   uint8_t  length;   // 1..4 bytes
@@ -302,6 +321,12 @@ typedef struct kintsuki_disasm_line_t {
   // (indirect/indexed). UI can use this for "double-click to follow".
   uint32_t target;
   char     text[128];
+  // Per-char token kinds parallel to `text`. Byte at `text[i]` belongs
+  // to token kind `kinds[i]`. Trailing NUL + padding bytes are
+  // KINTSUKI_TOK_OTHER (0). Hosts that haven't been updated for tokens
+  // can ignore this field entirely — `text` keeps the same content as
+  // before, the NUL terminator is still in place.
+  uint8_t  kinds[128];
 } kintsuki_disasm_line_t;
 
 uint32_t kintsuki_disassemble_at(kintsuki_t*, uint32_t pc, uint32_t count,
@@ -334,6 +359,11 @@ typedef struct kintsuki_dma_event_t {
                          // only when dst_reg == 0x18 / 0x19
   uint32_t hits;
   uint64_t last_frame;
+  // Caller PC at the moment DMA fired. Sourced from the top of the
+  // shadow callstack (deepest live JSR/JSL target), falling back to the
+  // live cpu.r.pc.d if the callstack is empty. Lets viewers answer
+  // "who pushed this VRAM block?" without a separate trace.
+  uint32_t caller_pc;    // 24-bit
 } kintsuki_dma_event_t;
 
 uint32_t kintsuki_dma_log_count(kintsuki_t*);
@@ -347,6 +377,239 @@ void     kintsuki_dma_log_clear(kintsuki_t*);
 // on scanline `i` (bit 0 = channel 0). Returns the number of bytes
 // written (min of `cap` and the internal scanline buffer size, 320).
 uint32_t kintsuki_hdma_scanline_mask(kintsuki_t*, uint8_t* out, uint32_t cap);
+
+// ---- Project file -------------------------------------------------------
+// Persistent reversing state attached to the currently-loaded ROM. The
+// project lives in a `.kintsuki/` directory next to the ROM. Slice 1 ships
+// the byte-classification map (`map.bin`); labels/bookmarks/notes are
+// reserved slots filled by later slices.
+//
+// Lifecycle: call `project_open` after `load_rom`. The project handle is
+// owned by the kintsuki_t instance and torn down on `destroy` or on the
+// next `project_open`/`project_close`. ROM size + sha256 must match what
+// was recorded on first creation, otherwise open fails.
+//
+// While a project is open the emulator auto-populates `map.bin`:
+//   - every executed PC marks its bytes as KINTSUKI_BYTE_CODE,
+//   - every DMA fire marks its source range based on the destination PPU
+//     register ($2118/9 -> GRAPHICS, $2122 -> PALETTE, etc.),
+// unless the bytes are already user-sticky.
+//
+// Saves are explicit — call `project_save` before quitting. No autosave.
+
+typedef enum {
+  KINTSUKI_BYTE_UNKNOWN  = 0,
+  KINTSUKI_BYTE_CODE     = 1,
+  KINTSUKI_BYTE_DATA     = 2,
+  KINTSUKI_BYTE_POINTER  = 3,
+  KINTSUKI_BYTE_STRING   = 4,
+  KINTSUKI_BYTE_GRAPHICS = 5,
+  KINTSUKI_BYTE_TILEMAP  = 6,
+  KINTSUKI_BYTE_PALETTE  = 7,
+  KINTSUKI_BYTE_AUDIO    = 8,
+  KINTSUKI_BYTE_CODE_OPERAND = 9,
+} kintsuki_byte_class_t;
+
+// User-sticky flag: OR'd into the byte stored in map.bin to mark a class as
+// user-set, protecting it from auto-reclassification. Mask off when reading
+// the base class.
+#define KINTSUKI_BYTE_USER_STICKY 0x80
+#define KINTSUKI_BYTE_CLASS_MASK  0x7F
+
+// Returns 1 on success, 0 on failure (no ROM loaded, dir unwritable, sha
+// mismatch on reload). On first open the directory is created.
+int  kintsuki_project_open (kintsuki_t*, const char* dir);
+// Closes without saving. Safe to call when no project is open.
+void kintsuki_project_close(kintsuki_t*);
+// Persist dirty state to disk. Returns 1 on success.
+int  kintsuki_project_save (kintsuki_t*);
+// 1 if a project is currently open.
+int  kintsuki_project_is_open(kintsuki_t*);
+
+// Single-byte classify at a ROM offset (NOT a bus address — caller is
+// expected to have run `kintsuki_project_bus_to_rom` first when starting
+// from a CPU bus address). Returns the raw byte value (class | sticky).
+// 0 if no project open or offset out of range.
+uint8_t kintsuki_project_classify(kintsuki_t*, uint32_t rom_offset);
+
+// Convert a CPU bus 24-bit address to a ROM offset using the active
+// cartridge mapper. Returns 1 + fills `out_offset` on hit, 0 if the
+// address is not in ROM. Used by viewers that work in bus addresses.
+int  kintsuki_project_bus_to_rom(kintsuki_t*, uint32_t bus_addr, uint32_t* out_offset);
+
+// Mark a ROM range. `user_sticky` non-zero sets the sticky bit so auto-
+// reclassification will not overwrite. Passing `cls == UNKNOWN` with
+// `user_sticky=1` clears any existing classification + clears the sticky
+// flag (use this to "un-mark" a region). Returns bytes actually written
+// (clamped to map.bin size).
+uint32_t kintsuki_project_mark(kintsuki_t*, uint32_t rom_offset, uint32_t len,
+                               kintsuki_byte_class_t cls, int user_sticky);
+
+// Bulk dump of map.bin to caller buffer. Returns bytes written (min of
+// `cap` and ROM size). 0 if no project open.
+uint32_t kintsuki_project_map_dump(kintsuki_t*, uint8_t* out, uint32_t cap);
+
+// Summary counters for inspector header.
+typedef struct {
+  uint32_t total;       // ROM size in bytes
+  uint32_t classified;  // bytes with class != UNKNOWN
+  uint32_t code;
+  uint32_t data;
+  uint32_t user_sticky; // bytes the user has hand-marked
+} kintsuki_project_stats_t;
+
+int kintsuki_project_stats(kintsuki_t*, kintsuki_project_stats_t* out);
+
+// Autosave: when non-zero, `kintsuki_run_frames` flushes the project
+// every Nth completed frame if anything is dirty. Saves are debounced
+// (no fsync storm when nothing changed). Default 60 frames (~1s NTSC).
+// Set to 0 to disable and rely on explicit `kintsuki_project_save`.
+void kintsuki_project_set_autosave(kintsuki_t*, uint32_t frames);
+uint32_t kintsuki_project_get_autosave(kintsuki_t*);
+
+// ---- Labels overlay (slice 2) ------------------------------------------
+// Per-address user metadata layered on top of the loaded `.adbg`. Labels
+// here win over .adbg labels at the same address — used for renaming
+// routines mid-reverse without touching the assembly source. m/x/e are
+// tri-state ints encoding the processor flag state expected at this
+// entry point: 0 (clear / 16-bit), 1 (set / 8-bit), -1 (unset / not known).
+//
+// Auto-seeded: every JSR/JSL fire records the live M/X (E is fixed at
+// reset) on the target address. First writer wins — manual `label_set`
+// overrides via the same struct.
+
+typedef struct {
+  uint32_t    addr;     // 24-bit
+  const char* name;     // borrowed; valid until next label_set/clear/close
+  const char* type;     // optional; lowercase
+  const char* comment;  // optional
+  int8_t      m;        // -1 unset, 0/1
+  int8_t      x;
+  int8_t      e;
+  uint8_t     _pad;
+} kintsuki_project_label_t;
+
+// Pass NULL for any optional string. Returns 1 on success, 0 if no
+// project open. Replaces any existing entry at addr.
+int kintsuki_project_label_set(kintsuki_t*, uint32_t addr,
+                               const char* name,
+                               const char* type,
+                               const char* comment,
+                               int m, int x, int e);
+// Look up overlay-only (does NOT consult .adbg). Returns 1 + fills out
+// on hit; pointers borrow storage owned by the project, valid until the
+// next mutation.
+int kintsuki_project_label_get(kintsuki_t*, uint32_t addr,
+                               kintsuki_project_label_t* out);
+void kintsuki_project_label_clear(kintsuki_t*, uint32_t addr);
+uint32_t kintsuki_project_label_count(kintsuki_t*);
+// Snapshot in address-ascending order. Returns number written.
+uint32_t kintsuki_project_label_snapshot(kintsuki_t*,
+                                         kintsuki_project_label_t* out,
+                                         uint32_t cap);
+
+// ---- DMA provenance (slice 3) ------------------------------------------
+// Per (src_rom, size, dst_reg, caller_pc) record: who pushed which buffer
+// where, and how often. Auto-populated from every DMA fire while a
+// project is open. Persisted as `dma_log.tsv` on save.
+
+typedef struct {
+  uint32_t src_rom;     // ROM offset of source bytes
+  uint16_t size;
+  uint8_t  dst_reg;
+  uint8_t  _pad;
+  uint32_t caller_pc;   // 24-bit
+  uint32_t hits;
+  uint64_t last_frame;
+} kintsuki_project_dma_prov_t;
+
+uint32_t kintsuki_project_dma_prov_count(kintsuki_t*);
+uint32_t kintsuki_project_dma_prov_snapshot(kintsuki_t*,
+                                            kintsuki_project_dma_prov_t* out,
+                                            uint32_t cap);
+// Filter to entries overlapping `[rom_offset, rom_offset+len)` — viewer
+// "who uploads this tile?" lookup.
+uint32_t kintsuki_project_dma_prov_for_range(kintsuki_t*,
+                                             uint32_t rom_offset, uint32_t len,
+                                             kintsuki_project_dma_prov_t* out,
+                                             uint32_t cap);
+
+// ---- Function exits (slice 7) ------------------------------------------
+// Per-function aggregated exit info, populated from the JSR/JSL <-> RTS/
+// RTL hook pair while a project is open. Lets the UI answer "where does
+// this routine return from?" for any known entry — drives the "end of
+// function" view on the labels panel.
+
+typedef struct {
+  uint32_t entry;          // 24-bit
+  uint32_t call_count;
+  uint64_t last_exit_frame;
+  uint32_t exit_count;     // number of unique (pc, kind) exit points
+} kintsuki_project_func_t;
+
+uint32_t kintsuki_project_func_count(kintsuki_t*);
+uint32_t kintsuki_project_func_snapshot(kintsuki_t*,
+                                        kintsuki_project_func_t* out,
+                                        uint32_t cap);
+
+// Per-function exit-PC list. Returns count actually written. The exits
+// are de-duplicated by (pc, kind) on the C++ side.
+typedef struct {
+  uint32_t pc;             // 24-bit; address of the RTS/RTL opcode
+  uint8_t  kind;           // 0=RTS, 1=RTL
+  uint8_t  _pad[3];
+} kintsuki_project_exit_t;
+
+uint32_t kintsuki_project_func_exits(kintsuki_t*, uint32_t entry,
+                                     kintsuki_project_exit_t* out,
+                                     uint32_t cap);
+
+// ---- Bookmarks (slice 4) -----------------------------------------------
+typedef struct {
+  uint32_t    addr;
+  const char* name;
+  const char* view;     // free-form short string
+  const char* comment;
+} kintsuki_project_bookmark_t;
+
+int  kintsuki_project_bookmark_set(kintsuki_t*, const char* name, uint32_t addr,
+                                   const char* view, const char* comment);
+void kintsuki_project_bookmark_clear(kintsuki_t*, const char* name);
+uint32_t kintsuki_project_bookmark_count(kintsuki_t*);
+uint32_t kintsuki_project_bookmark_snapshot(kintsuki_t*,
+                                            kintsuki_project_bookmark_t* out,
+                                            uint32_t cap);
+
+// ---- Breakpoints (slice 4) ---------------------------------------------
+// Persistent records only — the project does NOT auto-install live BPs
+// on attach. The frontend walks the snapshot at project_open time and
+// re-calls kintsuki_add_callback_ex(...) for each enabled record, then
+// drives removal through the existing callback handle if the user
+// toggles the BP off.
+typedef enum {
+  KINTSUKI_PROJECT_BP_EXEC  = 0,
+  KINTSUKI_PROJECT_BP_READ  = 1,
+  KINTSUKI_PROJECT_BP_WRITE = 2,
+} kintsuki_project_bp_kind_t;
+
+typedef struct {
+  uint8_t  kind;
+  uint8_t  halt;
+  uint8_t  enabled;
+  uint8_t  _pad;
+  uint32_t addr_lo;     // inclusive
+  uint32_t addr_hi;     // inclusive
+  const char* comment;
+} kintsuki_project_bp_t;
+
+int kintsuki_project_bp_add(kintsuki_t*, uint8_t kind,
+                            uint32_t addr_lo, uint32_t addr_hi,
+                            int halt, int enabled, const char* comment);
+void kintsuki_project_bp_remove(kintsuki_t*, uint32_t index);
+void kintsuki_project_bp_clear(kintsuki_t*);
+uint32_t kintsuki_project_bp_count(kintsuki_t*);
+uint32_t kintsuki_project_bp_snapshot(kintsuki_t*, kintsuki_project_bp_t* out,
+                                      uint32_t cap);
 
 #ifdef __cplusplus
 }

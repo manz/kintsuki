@@ -60,6 +60,10 @@ struct DebuggerView: View {
     /// shadow it into @State and refresh via `.onReceive` so each
     /// row sees the latest BP set when it re-renders.
     @State private var displayedBreakpoints: [Emulator.Breakpoint] = []
+    /// Project functions whose range covers any displayed disasm row.
+    /// Updated alongside `displayedLines` in `rebuildLines` so the
+    /// gutter doesn't pull at 60 Hz.
+    @State private var displayedFunctions: [Emulator.ProjectFunction] = []
     /// Cached running flag — drives toolbar Pause/Resume label without
     /// taking a `@ObservedObject` subscription that would re-render the
     /// pane every emulator @Published mutation.
@@ -71,6 +75,12 @@ struct DebuggerView: View {
 
     private static let windowSize = 80          // total disassembly lines
     private static let linesBeforePC = 8         // lines retained above PC
+    private static let pageGrow = 64             // lines added per scroll page
+    private static let pageCap = 2000            // hard cap on retained rows
+    @State private var loadingTop = false
+    @State private var loadingBottom = false
+    @State private var prependBlocked = false   // can't walk back further
+    @State private var appendBlocked  = false   // hit bank wrap / ROM end
 
     var body: some View {
         VStack(spacing: 0) {
@@ -104,6 +114,21 @@ struct DebuggerView: View {
         }
         .onChange(of: emulator.breakpoints) { _, _ in rebuildLines() }
         .onChange(of: emulator.crashBacktrace) { _, _ in rebuildLines() }
+        // Project labels join the .adbg pool — re-pull the cache so
+        // autocomplete + per-row badges see imported IDA names without
+        // a window reopen.
+        .onChange(of: emulator.projectIsOpen) { _, _ in
+            labelCache = emulator.allLabels()
+            rebuildLines()
+        }
+        .onChange(of: emulator.projectDir) { _, _ in
+            labelCache = emulator.allLabels()
+            rebuildLines()
+        }
+        .onChange(of: emulator.disasmNavRequest) { _, req in
+            handleDisasmNav(req)
+        }
+        .onAppear { handleDisasmNav(emulator.disasmNavRequest) }
         // (refreshTick is bumped *by* rebuildLines to force the LazyVStack
         // to re-anchor; calling rebuildLines from its own onChange would
         // recurse, so the scroll-side handlers below depend on
@@ -230,6 +255,17 @@ struct DebuggerView: View {
         displayPC = navStack[target]
         cursorPC = navStack[target]
         rebuildLines()
+    }
+
+    @State private var lastHandledDisasmNonce: Int = 0
+
+    /// Honour an `Emulator.disasmNavRequest` exactly once per nonce.
+    /// Used by external panels (Labels, Bookmarks, DMA caller) to jump
+    /// the disasm view without owning a binding into `displayPC`.
+    private func handleDisasmNav(_ req: Emulator.DisasmNavRequest?) {
+        guard let req, req.nonce != lastHandledDisasmNonce else { return }
+        lastHandledDisasmNonce = req.nonce
+        pushNav(req.pc)
     }
 
     /// Push `addr` onto the navigation stack and focus it. Truncates
@@ -370,6 +406,12 @@ struct DebuggerView: View {
         return ScrollViewReader { scroller in
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 0) {
+                    // Top sentinel: appears in the lazy stack viewport
+                    // only when the user scrolls within ~one row of the
+                    // first decoded line. Triggers a back-walk + prepend.
+                    Color.clear
+                        .frame(height: 1)
+                        .onAppear { loadMoreTop() }
                     ForEach(lines) { line in
                         VStack(alignment: .leading, spacing: 0) {
                             // Label header — shown above any line whose PC
@@ -386,6 +428,10 @@ struct DebuggerView: View {
                         }
                         .id(line.pc)
                     }
+                    // Bottom sentinel: trips an append when visible.
+                    Color.clear
+                        .frame(height: 1)
+                        .onAppear { loadMoreBottom() }
                 }
                 // Tie the LazyVStack's identity to the breakpoint set
                 // so adding / removing a BP forces every row to re-eval
@@ -415,6 +461,118 @@ struct DebuggerView: View {
         }
     }
 
+    /// Colour for a single token-kind. Hex-width tiers share the orange
+    /// family so operand widths cluster visually; long-form `$XXXXXX`
+    /// reads bolder than DP `$XX` reads.
+    private static func tokColor(_ k: Emulator.DisasmTok) -> NSColor {
+        switch k {
+        case .mnemonic: return .controlAccentColor
+        case .immHex:   return .systemYellow
+        case .absHex:   return .systemOrange
+        case .longHex:  return .systemRed
+        case .dpHex:    return .systemTeal
+        case .reg:      return .systemPurple
+        case .punct:    return .secondaryLabelColor
+        case .labelRef: return .systemBlue
+        case .arrow:    return .tertiaryLabelColor
+        case .comment:  return .secondaryLabelColor
+        case .other:    return .labelColor
+        }
+    }
+
+    /// Build a syntax-coloured AttributedString for one disasm row using
+    /// the per-char `kinds` array emitted by libkintsuki. Each contiguous
+    /// run of identical kinds becomes one styled span. When the project
+    /// flags this PC as non-code, the line is replaced with `.db $XX`
+    /// so the byte still reads visibly without the walker pretending
+    /// the data is a 65816 opcode.
+    private func disasmAttributed(for line: Emulator.DisasmLine) -> AttributedString {
+        // Data-aware override (slice 7 follow-up).
+        if emulator.projectIsOpen,
+           let off = emulator.projectBusToRom(line.pc) {
+            let raw = emulator.projectClassify(romOffset: off)
+            let cls = Emulator.ByteClass(rawValue: raw & 0x7F) ?? .unknown
+            if cls == .data || cls == .pointer || cls == .string
+                || cls == .graphics || cls == .tilemap
+                || cls == .palette || cls == .audio {
+                let byte = emulator.readBus(line.pc) ?? 0
+                var s = AttributedString(String(format: ".db $%02X", byte))
+                s.foregroundColor = .secondary
+                if let range = s.range(of: ".db") {
+                    s[range].foregroundColor = NSColor.systemGray
+                }
+                return s
+            }
+        }
+
+        var attr = AttributedString(line.text)
+        attr.font = .system(.body, design: .monospaced)
+        attr.foregroundColor = NSColor.labelColor
+        let utf8 = Array(line.text.utf8)
+        let n = min(utf8.count, line.kinds.count)
+        guard n > 0 else { return attr }
+        // Walk runs of identical kind; build NSRange (UTF-16) per run +
+        // map to AttributedString.Index.
+        var i = 0
+        while i < n {
+            let k = line.kinds[i]
+            var j = i
+            while j < n && line.kinds[j] == k { j += 1 }
+            let tok = Emulator.DisasmTok(rawValue: k) ?? .other
+            // Resolve byte offsets to AttributedString indices through
+            // the underlying String. AttributedString.index(_:offsetBy:)
+            // operates on its own opaque indices, which line up with
+            // UTF-8 here (ASCII-only disasm output).
+            let start = attr.index(attr.startIndex, offsetByCharacters: i)
+            let end   = attr.index(attr.startIndex, offsetByCharacters: j)
+            attr[start..<end].foregroundColor = Self.tokColor(tok)
+            if tok == .mnemonic {
+                attr[start..<end].font = .system(.body, design: .monospaced).bold()
+            }
+            i = j
+        }
+        return attr
+    }
+
+    /// Per-row description of how the function gutter should render.
+    private struct FunctionGutter {
+        let color: Color
+        let isEntry: Bool
+        let isExit: Bool
+    }
+
+    /// Find the project function whose `[entry, endApprox]` range covers
+    /// `pc`. Returns nil when no project is open or no recorded function
+    /// spans this PC. Linear scan — function tables stay in the hundreds
+    /// even for big games, the cost is negligible per row.
+    private func functionGutter(for pc: UInt32) -> FunctionGutter? {
+        guard !displayedFunctions.isEmpty else { return nil }
+        for f in displayedFunctions {
+            guard let end = f.endApprox else {
+                if f.entry == pc {
+                    return FunctionGutter(color: gutterColor(forEntry: f.entry),
+                                          isEntry: true, isExit: false)
+                }
+                continue
+            }
+            if pc >= f.entry && pc <= end {
+                let isExit = f.exits.contains(pc)
+                return FunctionGutter(color: gutterColor(forEntry: f.entry),
+                                      isEntry: pc == f.entry,
+                                      isExit: isExit)
+            }
+        }
+        return nil
+    }
+
+    /// Stable per-function colour. Hash entry → hue. Saturation +
+    /// brightness fixed so the bar reads cleanly against the row bg.
+    private func gutterColor(forEntry entry: UInt32) -> Color {
+        // 24-bit golden-ratio hash → hue in [0, 1).
+        let h = Double((entry &* 2654435761) & 0xFFFFFFFF) / 4294967296.0
+        return Color(hue: h, saturation: 0.55, brightness: 0.95)
+    }
+
     private func disasmRow(line: Emulator.DisasmLine) -> some View {
         // Use the cached "active PC" rather than the live @Published
         // value so the row doesn't repaint at 60 Hz while running.
@@ -427,7 +585,31 @@ struct DebuggerView: View {
         // (rough hint of where execution sits) but wrong on disassembly
         // where every row of a routine ends up tagged with the same
         // line — sometimes kilobytes away from the actual instruction.
+        let funcGutter = functionGutter(for: line.pc)
         return HStack(spacing: 0) {
+            // Function gutter: vertical bar coloured per function entry.
+            // Tick at top = function start, tick at bottom = exit PC.
+            // Width is tight so it doesn't push the BP dot column out.
+            ZStack(alignment: .leading) {
+                if let fg = funcGutter {
+                    Rectangle()
+                        .fill(fg.color.opacity(0.55))
+                        .frame(width: 3)
+                    if fg.isEntry {
+                        Rectangle()
+                            .fill(fg.color)
+                            .frame(width: 6, height: 2)
+                            .offset(y: -7)
+                    }
+                    if fg.isExit {
+                        Rectangle()
+                            .fill(fg.color)
+                            .frame(width: 6, height: 2)
+                            .offset(y: 7)
+                    }
+                }
+            }
+            .frame(width: 6)
             // Gutter
             Button(action: { toggleBreakpoint(at: line.pc) }) {
                 Image(systemName: bp != nil ? "circle.fill" : "circle")
@@ -444,8 +626,29 @@ struct DebuggerView: View {
                         (line.pc >> 16) & 0xFF, line.pc & 0xFFFF))
                 .foregroundStyle(.secondary)
                 .frame(width: 80, alignment: .leading)
-            // Disassembly
-            Text(line.text)
+            // Entry-label badge. Project overlay (purple) wins over
+            // .adbg (blue). Helps the disasm read as IDA-style "Name:"
+            // separators without breaking the row-per-instruction layout.
+            if let projName = emulator.projectExactLabel(at: line.pc) {
+                Text(projName)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(Color.purple)
+                    .padding(.horizontal, 4).padding(.vertical, 0)
+                    .background(Color.purple.opacity(0.12), in: Capsule())
+                    .padding(.trailing, 6)
+            } else if let adbgName = emulator.exactLabel(at: line.pc) {
+                Text(adbgName)
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundStyle(.blue)
+                    .padding(.horizontal, 4).padding(.vertical, 0)
+                    .background(Color.blue.opacity(0.10), in: Capsule())
+                    .padding(.trailing, 6)
+            }
+            // Disassembly. If the project byte-class says this PC is
+            // Data, override the live disasm with `.db $XX` — keeps the
+            // walker from speculatively decoding a known data byte as
+            // an opcode (and burning its operand bytes on garbage).
+            Text(disasmAttributed(for: line))
                 .lineLimit(1)
             Spacer()
         }
@@ -478,11 +681,82 @@ struct DebuggerView: View {
         displayedPC = displayPC ?? s.pc
         displayedLines = currentLines()
         displayedBreakpoints = emulator.breakpoints
+        displayedFunctions = emulator.projectFunctions()
+        // Fresh window — unblock paging so the user can grow again.
+        prependBlocked = false
+        appendBlocked = false
         // Bump the LazyVStack's `.id` so SwiftUI rebuilds it, the
         // scroll position resets, and the .onAppear-style scrollTo on
         // the inner ScrollViewReader re-anchors on the (possibly new)
         // active PC. Without this the lazy stack reuses old offsets
         // after a step and the highlight scrolls out of view.
+        refreshTick &+= 1
+    }
+
+    /// Append more disasm lines past the last visible row. Walks the
+    /// `length` field of the current tail to find the next PC, then
+    /// asks the emulator for `pageGrow` more lines. Stops walking on
+    /// bank wrap so we don't leak across mapper boundaries.
+    private func loadMoreBottom() {
+        if loadingBottom || appendBlocked { return }
+        guard let last = displayedLines.last else { return }
+        loadingBottom = true
+        defer { loadingBottom = false }
+        let bankBase = last.pc & 0xFF0000
+        let next16 = UInt32(last.pc & 0xFFFF) + UInt32(last.length)
+        if next16 > 0xFFFF { appendBlocked = true; return }
+        let nextPc = bankBase | next16
+        let more = emulator.disassemble(at: nextPc,
+                                        count: Self.pageGrow,
+                                        eOverride: nil,
+                                        mOverride: nil,
+                                        xOverride: nil)
+        guard !more.isEmpty else { appendBlocked = true; return }
+        displayedLines.append(contentsOf: more)
+        // Trim from the top if we blew past the cap. Don't trim while
+        // the user might still want to scroll back through the prepend
+        // window — leave at least one full page above PC.
+        if displayedLines.count > Self.pageCap {
+            let drop = displayedLines.count - Self.pageCap
+            displayedLines.removeFirst(drop)
+            prependBlocked = false
+        }
+        refreshTick &+= 1
+    }
+
+    /// Prepend more lines above the first visible row. 65816 isn't
+    /// reverse-decodable without context, so we probe back ~3 bytes per
+    /// requested line, disassemble forward from that anchor, then keep
+    /// only the entries strictly before the current top.
+    private func loadMoreTop() {
+        if loadingTop || prependBlocked { return }
+        guard let first = displayedLines.first else { return }
+        loadingTop = true
+        defer { loadingTop = false }
+        let bankBase = first.pc & 0xFF0000
+        let pc16 = first.pc & 0xFFFF
+        // Always probe at least 3 bytes per requested line; bank-clamp.
+        let probeBack = UInt32(Self.pageGrow) * 3
+        if pc16 <= 0x8000 + probeBack {
+            // We're close to the bottom of the bank's ROM window — give
+            // up rather than producing speculative gibberish.
+            prependBlocked = true
+            return
+        }
+        let start = bankBase | (pc16 - probeBack)
+        let probed = emulator.disassemble(at: start,
+                                          count: Self.pageGrow * 2,
+                                          eOverride: nil,
+                                          mOverride: nil,
+                                          xOverride: nil)
+        let prefix = probed.prefix { $0.pc < first.pc }
+        guard !prefix.isEmpty else { prependBlocked = true; return }
+        displayedLines.insert(contentsOf: prefix, at: 0)
+        if displayedLines.count > Self.pageCap {
+            let drop = displayedLines.count - Self.pageCap
+            displayedLines.removeLast(drop)
+            appendBlocked = false
+        }
         refreshTick &+= 1
     }
 
