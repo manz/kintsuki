@@ -1219,6 +1219,7 @@ uint32_t kintsuki_label_snapshot(kintsuki_t* h,
 // immediate). M-extending opcodes: ORA/AND/EOR/ADC/BIT/LDA/CMP/SBC #imm
 // (09,29,49,69,89,A9,C9,E9). X-extending: LDY/LDX/CPY/CPX #imm
 // (A0,A2,C0,E0). Order matches the 65816 opcode matrix.
+}  // extern "C"
 namespace {
 constexpr uint8_t LEN_M = 0x10;
 constexpr uint8_t LEN_X = 0x20;
@@ -1250,6 +1251,7 @@ uint8_t inst_length_for(uint8_t opcode, bool m_flag, bool x_flag) {
   return len;
 }
 }  // namespace
+extern "C" {
 
 uint32_t kintsuki_disassemble_at_ex(kintsuki_t* h, uint32_t pc, uint32_t count,
                                     int e_override, int m_override, int x_override,
