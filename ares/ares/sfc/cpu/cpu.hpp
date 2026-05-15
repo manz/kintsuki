@@ -99,6 +99,13 @@ struct CPU : WDC65816, Thread, PPUcounter {
   std::vector<Thread*> coprocessors;
   std::vector<Thread*> peripherals;
 
+  // Public read-only accessor for the internal master-cycle step counter.
+  // Increments by 2 inside `step()` per tick — never touched by the
+  // scheduler's reduce pass, unlike `Thread::_clock`. Wraps at u32
+  // (~200s of wall time); callers that need wider range must track
+  // wraps externally.
+  auto masterCycleCounter() const -> u32 { return counter.cpu; }
+
 private:
   struct Counter {
     u32 cpu = 0;

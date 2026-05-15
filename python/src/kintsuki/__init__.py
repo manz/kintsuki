@@ -28,7 +28,26 @@ __all__ = [
     "DmaChannelState",
     "CallbackKind",
     "SymbolTable",
+    "FnStat",
 ]
+
+
+@dataclass(frozen=True)
+class FnStat:
+    """One row of a kintsuki function profile. ``incl_cycles`` is the sum
+    of inclusive master-cycle deltas across all calls; ``excl_cycles``
+    subtracts the inclusive cycles attributed to children of that call.
+    ``min_cycles`` / ``max_cycles`` bound a single-call delta. ``name`` is
+    resolved from the loaded .adbg label table — ``None`` when no label
+    covers the target PC."""
+
+    pc: int
+    name: str | None
+    calls: int
+    incl_cycles: int
+    excl_cycles: int
+    max_cycles: int
+    min_cycles: int
 
 
 @dataclass(frozen=True)
@@ -353,6 +372,56 @@ class Emu:
     def callstack_clear(self) -> None:
         _native.lib.kintsuki_callstack_clear(self._handle)
 
+    # ------------------------------------------------------------------ Profile
+    def profile_start(self, lo: int | None = None, hi: int | None = None) -> None:
+        """Begin per-function cycle aggregation. Calls into JSR/JSL/RTS/RTL
+        are intercepted: each frame stamps ``cpu.clock()`` on push, diffs
+        on pop, and folds the delta into the function's bucket.
+
+        ``lo`` and ``hi`` define an inclusive 24-bit PC range filter; only
+        functions whose target_pc falls inside ``[lo, hi]`` are aggregated.
+        Pass both as ``None`` (default) or both as ``0`` to disable the
+        filter. Frames outside the range still push/pop on the internal
+        stack so exclusive-cycle math for in-range parents stays correct.
+
+        Starting clears any prior stats."""
+        lo_i = 0 if lo is None else int(lo) & 0xFFFFFF
+        hi_i = 0 if hi is None else int(hi) & 0xFFFFFF
+        _native.lib.kintsuki_profile_start(self._handle, lo_i, hi_i)
+
+    def profile_stop(self) -> list[FnStat]:
+        """Freeze the profiler and return the flat profile. Each entry is
+        a :class:`FnStat` with ``pc``, ``name`` (resolved via the loaded
+        .adbg labels — ``None`` if no label), ``calls``, ``incl_cycles``,
+        ``excl_cycles``, ``max_cycles``, ``min_cycles``. Order is
+        unspecified — sort by ``excl_cycles`` for hot-fn view."""
+        _native.lib.kintsuki_profile_stop(self._handle)
+        n = int(_native.lib.kintsuki_profile_stats_count(self._handle))
+        if n == 0:
+            return []
+        buf = (_native.FnStatRaw * n)()
+        wrote = int(_native.lib.kintsuki_profile_stats(self._handle, buf, n))
+        out: list[FnStat] = []
+        for i in range(wrote):
+            r = buf[i]
+            name_b = _native.lib.kintsuki_lookup_label(self._handle, r.pc)
+            name = name_b.decode("utf-8") if name_b else None
+            out.append(FnStat(
+                pc=int(r.pc),
+                name=name,
+                calls=int(r.calls),
+                incl_cycles=int(r.incl_cycles),
+                excl_cycles=int(r.excl_cycles),
+                max_cycles=int(r.max_cycles),
+                min_cycles=int(r.min_cycles),
+            ))
+        return out
+
+    def profile_reset(self) -> None:
+        """Discard accumulated stats. Does not change active/inactive
+        state — call ``profile_start`` to begin a fresh window."""
+        _native.lib.kintsuki_profile_reset(self._handle)
+
     # ----------------------------------------------------------------- DMA log
     def dma_transfers(self, max_entries: int = 64) -> list[dict]:
         """Snapshot the DMA transfer ring (most-recent first). Each
@@ -648,6 +717,18 @@ class Emu:
     def frame_count(self) -> int:
         return int(_native.lib.kintsuki_frame_count(self._handle))
 
+    @property
+    def master_cycles(self) -> int:
+        # ares-scaled master clock; monotonic u64. Use raw deltas for relative
+        # measurement — the absolute unit is "master ticks since reset".
+        return int(_native.lib.kintsuki_master_clock(self._handle))
+
+    @property
+    def cpu_cycles(self) -> int:
+        # master / 6 ≈ 65816 CPU cycles. Standard mode; FastROM and IO waits
+        # are already folded into the master clock by the ares core.
+        return int(_native.lib.kintsuki_cpu_cycles(self._handle))
+
     # ------------------------------------------------------------------ Mem
     def read(self, addr: int) -> int:
         return int(_native.lib.kintsuki_read_u8(self._handle, addr))
@@ -929,6 +1010,22 @@ class Emu:
         """Run until PC == target_pc. Mid-frame bail. Returns True on hit."""
         rc = _native.lib.kintsuki_run_until(self._handle, target_pc, max_frames)
         return rc != 0
+
+    def run_until_ex(
+        self,
+        target_pc: int,
+        max_frames: int = 60,
+    ) -> tuple[bool, int]:
+        """Run until PC == target_pc; return (hit, master_cycles_spent).
+        The cycle delta uses the same monotonic widener as the profiler,
+        so it survives scheduler reduce and the internal counter's u32
+        wrap. Useful for wrapping a single suspect routine without
+        spinning up profile_start/stop."""
+        out = ctypes.c_uint64(0)
+        rc = _native.lib.kintsuki_run_until_ex(
+            self._handle, target_pc, max_frames, ctypes.byref(out)
+        )
+        return rc != 0, int(out.value)
 
     def rearm_cpu(self) -> None:
         """Rebuild the CPU coroutine. Use between consecutive STP-terminated

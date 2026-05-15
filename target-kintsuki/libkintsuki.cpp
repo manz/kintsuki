@@ -16,6 +16,7 @@
 #include <string>
 #include <vector>
 #include <deque>
+#include <unordered_map>
 
 // kintsuki test-harness bail flag: defined in ares/sfc/system/system.cpp,
 // read+cleared from cpu.cpp before each instruction. Declared here at
@@ -66,6 +67,94 @@ uint64_t g_projectLastSaveFrame  = 0;
 // to nullptr on tracer_start, load_adbg, clear_adbg, destroy.
 const char* g_tracer_last_label = nullptr;
 
+// Per-function profiler. Hooks into the existing call/return path: on
+// every JSR/JSL we push (target_pc, clock_at_push) on a parallel stack;
+// on every RTS/RTL we pop, compute incl = pop_clock - push_clock and
+// aggregate. excl = incl − sum(children's incl), tracked via the parent
+// frame's child_acc field.
+//
+// `cpu.clock()` is non-monotonic in absolute terms — the ares scheduler
+// periodically subtracts the per-thread minimum to prevent overflow —
+// BUT it subtracts the same amount from every thread, so any
+// (pop_clock − push_clock) delta is invariant under that reduction.
+// Profiler math stays honest.
+//
+// Range filter (lo, hi): when set, only target_pcs inside [lo, hi] are
+// aggregated. Frames outside the range still push/pop on the profiler
+// stack so excl math for in-range parents remains correct.
+struct ProfFrame {
+  uint32_t target_pc;
+  uint64_t push_clock;
+  uint64_t child_acc;  // sum of children's incl cycles
+  bool     aggregated; // true if target_pc passed the range filter
+};
+
+struct ProfStat {
+  uint32_t calls = 0;
+  uint64_t incl  = 0;
+  uint64_t excl  = 0;
+  uint64_t max   = 0;
+  uint64_t min   = UINT64_MAX;
+};
+
+bool                          g_profileActive = false;
+uint32_t                      g_profileLo     = 0;  // 0,0 = unfiltered
+uint32_t                      g_profileHi     = 0;
+std::vector<ProfFrame>        g_profileStack;
+std::unordered_map<uint32_t, ProfStat> g_profileStats;
+
+// Monotonic master-cycle clock. Built on ares CPU's internal step counter
+// (`masterCycleCounter()`), which increments by 2 per master tick and is
+// NOT touched by the scheduler's reduce pass — unlike `Thread::_clock`,
+// where reduce subtracts `minimum()` from every thread and corrupts any
+// delta straddling a reduce event. The counter is u32 and wraps roughly
+// every 2^32 ticks (~200s of emulated wall time at 21.477MHz). We widen
+// to u64 by detecting any backward step as a wrap and adding 2^32 to a
+// running base; profile_start resets both.
+uint32_t                      g_lastMasterCounter = 0;
+uint64_t                      g_masterCounterBase = 0;
+
+uint64_t profileMasterCycles() {
+  uint32_t raw = ares::SuperFamicom::cpu.masterCycleCounter();
+  if(raw < g_lastMasterCounter) {
+    g_masterCounterBase += ((uint64_t)1 << 32);
+  }
+  g_lastMasterCounter = raw;
+  return g_masterCounterBase + (uint64_t)raw;
+}
+
+void profileOnCall(uint32_t target_pc) {
+  if(!g_profileActive) return;
+  ProfFrame f{};
+  f.target_pc = target_pc & 0xFFFFFF;
+  f.push_clock = profileMasterCycles();
+  f.child_acc = 0;
+  f.aggregated = (g_profileLo == 0 && g_profileHi == 0)
+                 || (f.target_pc >= g_profileLo && f.target_pc <= g_profileHi);
+  g_profileStack.push_back(f);
+}
+
+void profileOnReturn() {
+  if(!g_profileActive) return;
+  if(g_profileStack.empty()) return;
+  ProfFrame top = g_profileStack.back();
+  g_profileStack.pop_back();
+  uint64_t now  = profileMasterCycles();
+  uint64_t incl = now - top.push_clock;
+  uint64_t excl = incl > top.child_acc ? (incl - top.child_acc) : 0;
+  if(top.aggregated) {
+    auto& s = g_profileStats[top.target_pc];
+    s.calls += 1;
+    s.incl  += incl;
+    s.excl  += excl;
+    if(incl > s.max) s.max = incl;
+    if(incl < s.min) s.min = incl;
+  }
+  if(!g_profileStack.empty()) {
+    g_profileStack.back().child_acc += incl;
+  }
+}
+
 void cOnCall(uint32_t callsite_pc, uint32_t target_pc, uint8_t kind) {
   if(g_callstack.size() >= kCallstackCap) g_callstack.pop_front();
   kintsuki_call_frame_t f{};
@@ -73,6 +162,7 @@ void cOnCall(uint32_t callsite_pc, uint32_t target_pc, uint8_t kind) {
   f.target_pc   = target_pc   & 0xFFFFFF;
   f.kind        = kind;
   g_callstack.push_back(f);
+  profileOnCall(target_pc);
   // Auto-seed entry flags at every JSR/JSL target so cold-cache disasm at
   // any reached function knows the caller's M/X/E. First writer wins —
   // manual edits are not clobbered.
@@ -90,6 +180,7 @@ void cOnReturn(uint8_t kind) {
   // top frame is the routine that's exiting.
   uint32_t entry = g_callstack.back().target_pc & 0xFFFFFF;
   g_callstack.pop_back();
+  profileOnReturn();
   if(g_project) {
     // exit_pc = the RTS/RTL opcode address. cOnExec stashes the last
     // PC it saw; ares' returnHook fires after PC has moved to the
@@ -188,6 +279,20 @@ void kintsuki_run_frames(kintsuki_t* h, uint32_t n) {
   }
 }
 uint64_t kintsuki_frame_count(kintsuki_t* h) { return h ? h->program->framesRendered : 0; }
+
+uint64_t kintsuki_master_clock(kintsuki_t* h) {
+  if(!h) return 0;
+  return ares::SuperFamicom::cpu.clock();
+}
+
+uint64_t kintsuki_cpu_cycles(kintsuki_t* h) {
+  if(!h) return 0;
+  // SNES CPU runs at master/6. Thread clock is in ares-scaled units; the
+  // scalar collapses the ratio to nominal cycles for the lowest-frequency
+  // thread we care about. Dividing the master count by 6 keeps the unit
+  // intuitive for asm developers reading per-instruction timings.
+  return (uint64_t)ares::SuperFamicom::cpu.clock() / 6;
+}
 
 uint8_t kintsuki_read_u8(kintsuki_t* h, uint32_t addr) { return h ? h->program->memRead(addr) : 0; }
 void kintsuki_write_u8(kintsuki_t* h, uint32_t addr, uint8_t val) { if(h) h->program->memWrite(addr, val); }
@@ -960,6 +1065,20 @@ int kintsuki_run_until(kintsuki_t* h, uint32_t target_pc, uint32_t max_frames) {
   return g_runUntilHit ? 1 : 0;
 }
 
+int kintsuki_run_until_ex(kintsuki_t* h, uint32_t target_pc,
+                          uint32_t max_frames, uint64_t* out_cycles) {
+  if(!h) return 0;
+  // Snapshot the monotonic master-cycle counter (widened via the same
+  // wrap-tracker the profiler uses). Bracket the wrapped run_until call
+  // so the delta survives any scheduler reduce and any u32 wrap of the
+  // ares internal counter.
+  uint64_t before = profileMasterCycles();
+  int hit = kintsuki_run_until(h, target_pc, max_frames);
+  uint64_t after = profileMasterCycles();
+  if(out_cycles) *out_cycles = after - before;
+  return hit;
+}
+
 // ---- Shadow callstack + .adbg C ABI -------------------------------------
 
 uint32_t kintsuki_callstack_snapshot(kintsuki_t* h,
@@ -977,6 +1096,58 @@ uint32_t kintsuki_callstack_snapshot(kintsuki_t* h,
 void kintsuki_callstack_clear(kintsuki_t* h) {
   if(!h) return;
   g_callstack.clear();
+}
+
+void kintsuki_profile_start(kintsuki_t* h, uint32_t lo, uint32_t hi) {
+  if(!h) return;
+  g_profileStats.clear();
+  g_profileStack.clear();
+  g_profileLo = lo & 0xFFFFFF;
+  g_profileHi = hi & 0xFFFFFF;
+  // Re-baseline the master-cycle widener. We don't reset the ares core
+  // counter (private, lives in the cpu Counter struct); instead we
+  // snapshot its current value as the new origin.
+  g_lastMasterCounter = ares::SuperFamicom::cpu.masterCycleCounter();
+  g_masterCounterBase = 0;
+  g_profileActive = true;
+}
+
+void kintsuki_profile_stop(kintsuki_t* h) {
+  if(!h) return;
+  g_profileActive = false;
+  // Drop any unclosed frames — partial functions in-flight at stop have
+  // no honest incl number. Leaving them in g_profileStack would corrupt
+  // a subsequent profile_start's first push/pop accounting.
+  g_profileStack.clear();
+}
+
+void kintsuki_profile_reset(kintsuki_t* h) {
+  if(!h) return;
+  g_profileStats.clear();
+  g_profileStack.clear();
+}
+
+uint32_t kintsuki_profile_stats_count(kintsuki_t* h) {
+  if(!h) return 0;
+  return (uint32_t)g_profileStats.size();
+}
+
+uint32_t kintsuki_profile_stats(kintsuki_t* h,
+                                kintsuki_fn_stat_t* out,
+                                uint32_t cap) {
+  if(!h || !out || cap == 0) return 0;
+  uint32_t i = 0;
+  for(auto const& kv : g_profileStats) {
+    if(i >= cap) break;
+    out[i].pc          = kv.first;
+    out[i].calls       = kv.second.calls;
+    out[i].incl_cycles = kv.second.incl;
+    out[i].excl_cycles = kv.second.excl;
+    out[i].max_cycles  = kv.second.max;
+    out[i].min_cycles  = kv.second.min == UINT64_MAX ? 0 : kv.second.min;
+    i++;
+  }
+  return i;
 }
 
 int kintsuki_load_adbg(kintsuki_t* h, const char* path) {

@@ -262,6 +262,19 @@ struct DebuggerView: View {
     /// Honour an `Emulator.disasmNavRequest` exactly once per nonce.
     /// Used by external panels (Labels, Bookmarks, DMA caller) to jump
     /// the disasm view without owning a binding into `displayPC`.
+    /// Scroll the disassembly so `pc` lands centered. The current row id
+    /// is `line.pc`; LazyVStack needs a layout pass between row insertion
+    /// and `scrollTo` resolving the id, so we punt to the next runloop
+    /// via Task. Without the defer, scrollTo runs against a stack that
+    /// hasn't materialized the target row yet and the highlight stays
+    /// off-screen.
+    private func centerScroll(_ scroller: ScrollViewProxy, on pc: UInt32) {
+        Task { @MainActor in
+            await Task.yield()
+            withAnimation(.none) { scroller.scrollTo(pc, anchor: .center) }
+        }
+    }
+
     private func handleDisasmNav(_ req: Emulator.DisasmNavRequest?) {
         guard let req, req.nonce != lastHandledDisasmNonce else { return }
         lastHandledDisasmNonce = req.nonce
@@ -443,20 +456,14 @@ struct DebuggerView: View {
                 .background(.background)
                 .font(.system(.body, design: .monospaced))
             }
-            .onChange(of: displayedPC) { _, _ in
-                if let target = lines.first(where: { $0.pc == centerPC }) {
-                    withAnimation(.none) { scroller.scrollTo(target.pc, anchor: .center) }
-                }
+            .onChange(of: displayedPC) { _, newPC in
+                centerScroll(scroller, on: newPC)
             }
-            .onChange(of: displayedActivePC) { _, _ in
-                if let target = lines.first(where: { $0.pc == centerPC }) {
-                    withAnimation(.none) { scroller.scrollTo(target.pc, anchor: .center) }
-                }
+            .onChange(of: displayedActivePC) { _, newPC in
+                centerScroll(scroller, on: newPC)
             }
             .onAppear {
-                if let target = lines.first(where: { $0.pc == centerPC }) {
-                    scroller.scrollTo(target.pc, anchor: .center)
-                }
+                centerScroll(scroller, on: displayedPC)
             }
         }
     }
@@ -721,7 +728,11 @@ struct DebuggerView: View {
             displayedLines.removeFirst(drop)
             prependBlocked = false
         }
-        refreshTick &+= 1
+        // Intentionally do NOT bump refreshTick: that's tied to .id() on
+        // the LazyVStack, which would full-rebuild the stack and re-fire
+        // the top/bottom sentinel onAppears — an infinite paging loop
+        // until pageCap. The displayedLines @State write already drives
+        // the lazy diff for the new rows.
     }
 
     /// Prepend more lines above the first visible row. 65816 isn't
@@ -757,7 +768,7 @@ struct DebuggerView: View {
             displayedLines.removeLast(drop)
             appendBlocked = false
         }
-        refreshTick &+= 1
+        // See loadMoreBottom for the rationale on not bumping refreshTick.
     }
 
     private func currentLines() -> [Emulator.DisasmLine] {
