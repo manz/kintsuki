@@ -70,6 +70,10 @@ struct KintsukiApp: App {
         Window("Project Bookmarks", id: "bookmarks") {
             ProjectBookmarksView(emulator: emulator)
         }
+
+        Window("Profiler", id: "profiler") {
+            ProfilerView(emulator: emulator)
+        }
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Open ROM…") {
@@ -133,6 +137,8 @@ struct KintsukiApp: App {
                     .keyboardShortcut("l", modifiers: [.command, .shift])
                 Button("Project Bookmarks") { toggleToolWindow("bookmarks") }
                     .keyboardShortcut("b", modifiers: [.command, .shift])
+                Button("Profiler") { toggleToolWindow("profiler") }
+                    .keyboardShortcut("f", modifiers: [.command, .shift])
             }
             CommandMenu("Project") {
                 if emulator.projectIsOpen, let dir = emulator.projectDir {

@@ -521,7 +521,7 @@ final class Emulator {
         }
     }
 
-    func loadROM(_ url: URL) {
+    func loadROM(_ url: URL, restoreAutosave: Bool = true) {
         guard let h = handle else {
             NSLog("kintsuki: loadROM called with nil handle")
             return
@@ -547,7 +547,7 @@ final class Emulator {
         // — `modelContext` is set by ContentView's onAppear, which can
         // run after this auto-load), the deferred trigger in
         // `setModelContext(_:)` covers that path.
-        if modelContext != nil { _ = loadAutosave() }
+        if restoreAutosave, modelContext != nil { _ = loadAutosave() }
         rememberRecent(url)
         // Auto-load a sibling `.adbg` so the halt overlay can resolve
         // crash callstacks without an explicit user action. a816 emits
@@ -1812,7 +1812,10 @@ final class Emulator {
         stopRunLoop()
         running = false
         pendingBreakpointHaltId = nil
-        loadROM(url)
+        // Reload-from-disk is the "fresh boot" affordance: skip the
+        // autosave restore so users testing an iterative build land at
+        // the reset vector instead of mid-game.
+        loadROM(url, restoreAutosave: false)
     }
 
     /// Reserved name for the per-ROM autosave slot. Hidden from the
@@ -2253,6 +2256,79 @@ final class Emulator {
         let ok = kintsuki_lookup_source(h, pc, &filePtr, &line, &col)
         guard ok != 0, let p = filePtr else { return nil }
         return (String(cString: p), line, col)
+    }
+
+    // ----- Per-function profiler ------------------------------------------
+    /// One row of a kintsuki function profile. Mirrors `kintsuki_fn_stat_t`
+    /// with the label resolved against the loaded `.adbg` table at the
+    /// moment of `profileStop`.
+    struct FnStat: Identifiable, Hashable {
+        let pc: UInt32
+        let name: String?
+        let calls: UInt32
+        let incl: UInt64
+        let excl: UInt64
+        let maxCycles: UInt64
+        let minCycles: UInt64
+        var id: UInt32 { pc }
+    }
+
+    /// True when `profileStart` has been called and `profileStop` has not.
+    /// Drives the menu label flip (Start ↔ Stop) and the panel placeholder.
+    private(set) var profileActive: Bool = false
+
+    /// Cached flat profile from the last `profileStop`. Stays around so the
+    /// panel can keep showing the previous window after the user stops
+    /// recording. Cleared by `profileReset`.
+    private(set) var profileStats: [FnStat] = []
+
+    /// Begin a profile window. Optional 24-bit PC range filter; pass
+    /// `(nil, nil)` (default) for unfiltered. Clears any prior cached
+    /// stats and resets internal counters.
+    func profileStart(lo: UInt32? = nil, hi: UInt32? = nil) {
+        guard let h = handle else { return }
+        kintsuki_profile_start(h, (lo ?? 0) & 0xFFFFFF, (hi ?? 0) & 0xFFFFFF)
+        profileActive = true
+        profileStats = []
+    }
+
+    /// Freeze the profile and pull the flat stat list. Labels are resolved
+    /// from the loaded `.adbg` table — same lookup the Debugger uses, so
+    /// rows light up as soon as symbols are loaded.
+    @discardableResult
+    func profileStop() -> [FnStat] {
+        guard let h = handle else { return [] }
+        kintsuki_profile_stop(h)
+        profileActive = false
+        let n = Int(kintsuki_profile_stats_count(h))
+        guard n > 0 else { profileStats = []; return [] }
+        var buf = [kintsuki_fn_stat_t](repeating: kintsuki_fn_stat_t(), count: n)
+        let wrote = buf.withUnsafeMutableBufferPointer { bp -> UInt32 in
+            kintsuki_profile_stats(h, bp.baseAddress, UInt32(n))
+        }
+        var out: [FnStat] = []
+        out.reserveCapacity(Int(wrote))
+        for i in 0..<Int(wrote) {
+            let r = buf[i]
+            let name: String? = {
+                guard let p = kintsuki_lookup_label(h, r.pc) else { return nil }
+                return String(cString: p)
+            }()
+            out.append(FnStat(pc: r.pc, name: name,
+                              calls: r.calls,
+                              incl: r.incl_cycles, excl: r.excl_cycles,
+                              maxCycles: r.max_cycles, minCycles: r.min_cycles))
+        }
+        profileStats = out
+        return out
+    }
+
+    /// Discard cached stats. Does not flip `profileActive` — start a new
+    /// window with `profileStart` if you want a fresh recording.
+    func profileReset() {
+        guard let h = handle else { return }
+        kintsuki_profile_reset(h)
+        profileStats = []
     }
 
     // ----- Crash recovery --------------------------------------------------

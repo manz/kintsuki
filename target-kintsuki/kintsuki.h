@@ -62,10 +62,24 @@ void        kintsuki_run_frames(kintsuki_t*, uint32_t n);
 void        kintsuki_step(kintsuki_t*);
 uint64_t    kintsuki_frame_count(kintsuki_t*);
 
+// Cycle accounting. `master_clock` is the ares Thread clock for the CPU
+// — monotonic, u64, in ares-scaled units (lcm of system frequencies).
+// For relative measurement ("did this routine save N ticks") raw deltas
+// are honest. `cpu_cycles` divides by 6 — the SNES CPU runs at master/6
+// in standard mode, so this approximates the classic 65816 cycle count.
+uint64_t    kintsuki_master_clock(kintsuki_t*);
+uint64_t    kintsuki_cpu_cycles(kintsuki_t*);
+
 // Mid-frame run-until. Yields the scheduler the moment the CPU is about
 // to execute target_pc — does NOT wait for vblank. Returns 1 on hit,
 // 0 if max_frames of emulated time elapsed without reaching the target.
 int         kintsuki_run_until(kintsuki_t*, uint32_t target_pc, uint32_t max_frames);
+// Same as kintsuki_run_until but writes the master-cycle delta consumed
+// between call and return into *out_cycles. Uses the same monotonic
+// widener as the profiler — survives scheduler reduce and the ares
+// internal counter's u32 wrap.
+int         kintsuki_run_until_ex(kintsuki_t*, uint32_t target_pc,
+                                  uint32_t max_frames, uint64_t* out_cycles);
 
 // Rearm the CPU coroutine. Use this between back-to-back test stubs that
 // end with STP — the CPU coroutine is suspended inside instructionStop's
@@ -196,6 +210,42 @@ uint32_t kintsuki_callstack_snapshot(kintsuki_t*,
                                      kintsuki_call_frame_t* out,
                                      uint32_t cap);
 void     kintsuki_callstack_clear(kintsuki_t*);
+
+// ---- Per-function profiler ---------------------------------------------
+// Aggregates inclusive/exclusive master-cycles per target_pc by hooking
+// into the JSR/JSL/RTS/RTL call chain. While active, every push stamps
+// `cpu.clock()`; every pop computes the delta and folds it into the
+// per-function stat bucket. excl = incl − sum(children's incl).
+//
+// Profiler uses master-cycle deltas which are invariant under the ares
+// scheduler's periodic reduce (subtracts same amount from all threads),
+// so absolute clock non-monotonicity does not corrupt aggregation.
+//
+// Optional PC range filter [lo, hi]: aggregate only when target_pc
+// falls in range. Frames outside the range still push/pop on the
+// profiler stack so excl math for in-range parents stays correct.
+// lo=hi=0 disables the filter.
+//
+// profile_start clears prior stats. profile_stop freezes them; stats
+// remain readable until profile_reset or another profile_start.
+typedef struct {
+  uint32_t pc;            // target_pc (24-bit) of the function
+  uint32_t calls;         // number of times called inside profile window
+  uint64_t incl_cycles;   // sum of inclusive master-cycle deltas
+  uint64_t excl_cycles;   // incl minus children's incl, summed per call
+  uint64_t max_cycles;    // largest single-call inclusive delta
+  uint64_t min_cycles;    // smallest single-call inclusive delta
+} kintsuki_fn_stat_t;
+
+void     kintsuki_profile_start(kintsuki_t*, uint32_t lo, uint32_t hi);
+void     kintsuki_profile_stop(kintsuki_t*);
+void     kintsuki_profile_reset(kintsuki_t*);
+uint32_t kintsuki_profile_stats_count(kintsuki_t*);
+// Drain stats into `out` (writes min(cap, count) entries). Returns count
+// actually written. Order is unspecified — caller sorts.
+uint32_t kintsuki_profile_stats(kintsuki_t*,
+                                kintsuki_fn_stat_t* out,
+                                uint32_t cap);
 
 // ---- a816 .adbg label table ---------------------------------------------
 // LABEL-only loader (constants/aliases ignored). Returns 1 on success,

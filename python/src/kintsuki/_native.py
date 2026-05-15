@@ -118,7 +118,11 @@ _bind("kintsuki_load_rom", c_int, [HANDLE, c_char_p])
 _bind("kintsuki_run_frames", None, [HANDLE, c_uint32])
 _bind("kintsuki_step", None, [HANDLE])
 _bind("kintsuki_frame_count", c_uint64, [HANDLE])
+_bind("kintsuki_master_clock", c_uint64, [HANDLE])
+_bind("kintsuki_cpu_cycles", c_uint64, [HANDLE])
 _bind("kintsuki_run_until", c_int, [HANDLE, c_uint32, c_uint32])
+_bind("kintsuki_run_until_ex", c_int,
+      [HANDLE, c_uint32, c_uint32, POINTER(c_uint64)])
 _bind("kintsuki_rearm_cpu", None, [HANDLE])
 
 # Memory
@@ -158,6 +162,26 @@ class CallFrame(Structure):
 _bind("kintsuki_callstack_snapshot", c_uint32,
       [HANDLE, POINTER(CallFrame), c_uint32])
 _bind("kintsuki_callstack_clear", None, [HANDLE])
+
+
+# Per-function profiler.
+class FnStatRaw(Structure):
+    _fields_ = [
+        ("pc",          c_uint32),
+        ("calls",       c_uint32),
+        ("incl_cycles", c_uint64),
+        ("excl_cycles", c_uint64),
+        ("max_cycles",  c_uint64),
+        ("min_cycles",  c_uint64),
+    ]
+
+
+_bind("kintsuki_profile_start",       None,     [HANDLE, c_uint32, c_uint32])
+_bind("kintsuki_profile_stop",        None,     [HANDLE])
+_bind("kintsuki_profile_reset",       None,     [HANDLE])
+_bind("kintsuki_profile_stats_count", c_uint32, [HANDLE])
+_bind("kintsuki_profile_stats",       c_uint32,
+      [HANDLE, POINTER(FnStatRaw), c_uint32])
 
 
 # DMA transfer log — populated by libkintsuki via the ares dmaHook.
