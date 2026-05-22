@@ -9,14 +9,10 @@ uses it to drive cross-ROM / size-mismatched restores.
 from __future__ import annotations
 
 import struct
-from pathlib import Path
 
 import pytest
 
 import kintsuki
-
-ROM = Path(__file__).parent / "asm" / "test_ppu_state.sfc"
-FF4 = Path("/Users/manz/PyCharmProjects/ff4-modules/build/ff4.sfc")
 
 
 def _parse_footer(blob: bytes) -> dict[str, tuple[int, int]]:
@@ -41,18 +37,19 @@ def _parse_footer(blob: bytes) -> dict[str, tuple[int, int]]:
     return regions
 
 
-def test_blob_has_no_footer_when_cart_has_no_sram():
+def test_blob_has_no_footer_when_cart_has_no_sram(assemble_rom):
+    rom = assemble_rom("test_ppu_state.s")
     emu = kintsuki.Emu()
-    emu.load_rom(str(ROM))
+    emu.load_rom(str(rom))
     emu.run_frames(2)
     blob = emu.save_state()
     assert blob[-4:] != b"KSSF", "ppu_state ROM has no SRAM; footer should be absent"
 
 
-@pytest.mark.skipif(not FF4.exists(), reason="ff4.sfc not available")
-def test_blob_has_footer_when_cart_has_sram():
-    emu = kintsuki.Emu(loadSrmSidecar=False) if False else kintsuki.Emu()
-    emu.load_rom(str(FF4))
+def test_blob_has_footer_when_cart_has_sram(assemble_rom):
+    rom = assemble_rom("test_sram.s")
+    emu = kintsuki.Emu()
+    emu.load_rom(str(rom))
     emu.run_frames(2)
     blob = emu.save_state()
     assert blob[-4:] == b"KSSF"
@@ -69,44 +66,41 @@ def test_blob_has_footer_when_cart_has_sram():
     assert offset + length <= ares_blob_len
 
 
-@pytest.mark.skipif(not FF4.exists(), reason="ff4.sfc not available")
-def test_legacy_load_state_strips_footer():
+def test_legacy_load_state_strips_footer(assemble_rom):
     """save_state writes a footer; load_state must still accept it."""
+    rom = assemble_rom("test_sram.s")
     emu = kintsuki.Emu()
-    emu.load_rom(str(FF4))
+    emu.load_rom(str(rom))
     emu.run_frames(2)
     blob = emu.save_state()
     emu.run_frames(10)
     emu.load_state(blob)
 
 
-@pytest.mark.skipif(not FF4.exists(), reason="ff4.sfc not available")
-def test_load_state_ex_inject_only_same_rom():
+def test_load_state_ex_inject_only_same_rom(assemble_rom):
     """INJECT_ONLY power-cycles and restores just the cart.sram region."""
+    rom = assemble_rom("test_sram.s")
     emu = kintsuki.Emu()
-    emu.load_rom(str(FF4))
+    emu.load_rom(str(rom))
     emu.run_frames(2)
-
-    # Stamp a known signature into the cart sram via inject_sram.
     blob = emu.save_state()
+
     regions = _parse_footer(blob)
     assert "cart.sram" in regions
     offset, length = regions["cart.sram"]
-    # Sanity-check: sram bytes at the recorded region are restorable.
     sram_bytes = blob[offset : offset + length]
     assert len(sram_bytes) == length
 
-    # INJECT_ONLY should succeed on a fresh emu bound to the same ROM.
     emu2 = kintsuki.Emu()
-    emu2.load_rom(str(FF4))
+    emu2.load_rom(str(rom))
     emu2.load_state_ex(blob, flags=kintsuki.Emu.LOAD_FLAG_INJECT_ONLY)
 
 
-@pytest.mark.skipif(not FF4.exists(), reason="ff4.sfc not available")
-def test_load_state_ex_strict_rejects_size_mismatch():
+def test_load_state_ex_strict_rejects_size_mismatch(assemble_rom):
     """STRICT must reject if expected_sram_size disagrees with cart."""
+    rom = assemble_rom("test_sram.s")
     emu = kintsuki.Emu()
-    emu.load_rom(str(FF4))
+    emu.load_rom(str(rom))
     emu.run_frames(2)
     blob = emu.save_state()
 
