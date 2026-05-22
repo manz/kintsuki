@@ -102,13 +102,14 @@ final class Emulator {
     /// pumps any auto-load that fired before the context was ready.
     private(set) var modelContext: ModelContext?
 
-    /// Wire up the SwiftData context. Triggers a deferred autosave load
-    /// when a ROM was already loaded before the context arrived
-    /// (cold-launch race: `loadROM` from `Emulator.init` can race the
-    /// ContentView onAppear that owns the SwiftData environment).
+    /// Wire up the SwiftData context. Previously triggered a deferred
+    /// autosave restore here to cover the cold-launch race, but a
+    /// corrupt or version-mismatched autosave blob locks the run loop
+    /// on first tick — no way for the user to intervene because the UI
+    /// is also blocked while ares spins on the bad state. Auto-restore
+    /// is now opt-in via the State menu; cold-launch boots fresh.
     func setModelContext(_ ctx: ModelContext) {
         modelContext = ctx
-        if loadedROM != nil { _ = loadAutosave() }
     }
 
     enum BreakKind: Int, CaseIterable, Identifiable {
@@ -432,9 +433,13 @@ final class Emulator {
         // Auto-reload the most recent ROM so a fresh app launch lands
         // straight back in the previous session's game. NSOpenPanel
         // only fires when the user explicitly wants a different ROM.
+        // Autosave restore is skipped here — a corrupt/incompatible
+        // slot would deadlock the run loop on the first tick and the
+        // user couldn't reach the menu to recover. The State menu
+        // ("Load Autosave") is the explicit recovery surface.
         if let last = recentROMs.first {
             DispatchQueue.main.async { [weak self] in
-                self?.loadROM(last)
+                self?.loadROM(last, restoreAutosave: false)
             }
         }
         // Persist the autosave slot whenever the app is on its way out
@@ -1866,6 +1871,35 @@ final class Emulator {
         ctx.insert(entry)
         do { try ctx.save() } catch { NSLog("kintsuki: autosave insert failed: \(error)") }
         return entry
+    }
+
+    /// Drop a PNG of the current framebuffer to `url`. Returns true on
+    /// successful write — the C side handles BGRA → PNG via stb_image.
+    @discardableResult
+    func saveScreenshot(url: URL) -> Bool {
+        guard let h = handle else { return false }
+        let ok = url.path.withCString { kintsuki_screenshot(h, $0) }
+        if ok != 0 {
+            NSLog("kintsuki: wrote screenshot to \(url.path)")
+            return true
+        }
+        NSLog("kintsuki: screenshot failed for \(url.path)")
+        return false
+    }
+
+    /// Wipe the per-ROM autosave slot. Use from the State menu when a
+    /// stale slot is hanging the boot (incompatible ares format, bad
+    /// CPU PC, etc.) so the next launch can't pick it up automatically.
+    func clearAutosave() {
+        guard let rom = loadedROM, let ctx = modelContext else { return }
+        let romPath = rom.path
+        let slot = Self.autosaveSlotName
+        let predicate = #Predicate<SaveStateEntry> { $0.romPath == romPath && $0.name == slot }
+        let descriptor = FetchDescriptor<SaveStateEntry>(predicate: predicate)
+        guard let entries = try? ctx.fetch(descriptor) else { return }
+        for e in entries { ctx.delete(e) }
+        do { try ctx.save() } catch { NSLog("kintsuki: clearAutosave save failed: \(error)") }
+        NSLog("kintsuki: cleared autosave slot for \(rom.lastPathComponent)")
     }
 
     /// Restore the per-ROM autosave slot. Returns false when no such
