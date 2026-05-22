@@ -164,8 +164,44 @@ void kintsuki_get_ppu_state(kintsuki_t*, kintsuki_ppu_state_t* out);
 // Savestate. Two-call style: pass buf=NULL,cap=0 to query required size,
 // then call again with a buffer of at least the returned size. Returns
 // the required size on success or 0 on failure.
+//
+// As of the KSSF footer revision, `kintsuki_save_state` writes a footer
+// after the ares blob describing the cart.sram region (offset+length).
+// `kintsuki_load_state` strips it before handing the inner blob to ares,
+// so the legacy entry point stays backwards-compatible: footer-less
+// blobs from older builds still load, and the resulting blob from the
+// new build still loads on a build that ignores the trailer.
 uint32_t    kintsuki_save_state(kintsuki_t*, void* buf, uint32_t cap);
 int         kintsuki_load_state(kintsuki_t*, const void* buf, uint32_t len);
+
+// Extended loader for cross-ROM / size-mismatched blobs. Flags:
+//
+//   STRICT      — reject if blob's cart.sram size differs from bound cart.
+//   REMAP       — pad/trim cart.sram region in-memory before ares unserialize.
+//                 Other regions (CPU/PPU/...) are passed through unchanged.
+//                 Requires a KSSF footer to locate the sram bytes.
+//   INJECT_ONLY — skip ares unserialize entirely; power-cycle the cart and
+//                 inject just the cart.sram bytes from the blob. Best for
+//                 cross-ROM "load this save data on a different ROM" cases
+//                 where the producer's CPU/PPU state wouldn't make sense
+//                 on the bound cart anyway. Requires a KSSF footer.
+//
+// `expected_sram_size`: if non-zero, overrides the footer's recorded
+// cart.sram length. Use 0 to fall back to footer / legacy assumption.
+//
+// Returns 1 on success, 0 on failure (bad blob, missing footer when
+// required, STRICT mismatch, no ROM loaded).
+#define KINTSUKI_LOAD_FLAG_STRICT       (1u << 0)
+#define KINTSUKI_LOAD_FLAG_REMAP        (1u << 1)
+#define KINTSUKI_LOAD_FLAG_INJECT_ONLY  (1u << 2)
+
+typedef struct {
+  uint32_t expected_sram_size;
+  uint32_t flags;
+} kintsuki_load_state_opts_t;
+
+int         kintsuki_load_state_ex(kintsuki_t*, const void* buf, uint32_t len,
+                                   const kintsuki_load_state_opts_t* opts);
 
 // Framebuffer. Returns pointer to internal RGBA buffer (0x00RRGGBB packed
 // in uint32) valid until next frame. Width and height filled out.

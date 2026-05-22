@@ -305,6 +305,21 @@ _bind("kintsuki_set_srm_sidecar", None, [HANDLE, c_int])
 _bind("kintsuki_save_state", c_uint32, [HANDLE, c_void_p, c_uint32])
 _bind("kintsuki_load_state", c_int, [HANDLE, c_void_p, c_uint32])
 
+
+class LoadStateOpts(Structure):
+    _fields_ = [
+        ("expected_sram_size", c_uint32),
+        ("flags", c_uint32),
+    ]
+
+
+LOAD_FLAG_STRICT = 1 << 0
+LOAD_FLAG_REMAP = 1 << 1
+LOAD_FLAG_INJECT_ONLY = 1 << 2
+
+_bind("kintsuki_load_state_ex", c_int,
+      [HANDLE, c_void_p, c_uint32, POINTER(LoadStateOpts)])
+
 # Framebuffer / screenshot
 _bind("kintsuki_framebuffer", POINTER(c_uint32), [HANDLE, POINTER(c_uint32), POINTER(c_uint32)])
 _bind("kintsuki_screenshot", c_int, [HANDLE, c_char_p])

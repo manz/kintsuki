@@ -890,6 +890,36 @@ class Emu:
         if not ok:
             raise RuntimeError("load_state failed")
 
+    # Re-exports for convenience.
+    LOAD_FLAG_STRICT = _native.LOAD_FLAG_STRICT
+    LOAD_FLAG_REMAP = _native.LOAD_FLAG_REMAP
+    LOAD_FLAG_INJECT_ONLY = _native.LOAD_FLAG_INJECT_ONLY
+
+    def load_state_ex(
+        self,
+        blob: bytes,
+        *,
+        flags: int = 0,
+        expected_sram_size: int = 0,
+    ) -> None:
+        """Cross-ROM / size-mismatched savestate loader.
+
+        ``flags`` is a bitmask of ``LOAD_FLAG_STRICT``, ``LOAD_FLAG_REMAP``,
+        ``LOAD_FLAG_INJECT_ONLY``. See the C header for semantics.
+
+        ``expected_sram_size``: override the producer's cart.sram size
+        recorded in the KSSF footer. Pass 0 to use the footer's value.
+        """
+        opts = _native.LoadStateOpts(
+            expected_sram_size=expected_sram_size,
+            flags=flags,
+        )
+        ok = _native.lib.kintsuki_load_state_ex(
+            self._handle, blob, len(blob), ctypes.byref(opts)
+        )
+        if not ok:
+            raise RuntimeError("load_state_ex failed")
+
     # ----------------------------------------------------------- Framebuffer
     def framebuffer(self) -> tuple[bytes, int, int]:
         """Returns ``(raw_bytes, width, height)``. Each pixel is a
