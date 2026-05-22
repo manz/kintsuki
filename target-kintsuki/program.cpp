@@ -162,10 +162,18 @@ auto Program::loadRom(const char* path) -> bool {
   // Two locations: <rom>.ips (preferred) and <rom-without-ext>.ips.
   auto tryPatch = [&](const std::string& patchPath) {
     auto ips = readFile(patchPath.c_str());
-    if(ips.empty()) return false;
+    if(ips.empty()) return false;   // missing or zero-byte file, silent
     bool ok = kintsuki::applyIpsPatch(romData, std::span<const uint8_t>(ips.data(), ips.size()));
-    if(ok) std::fprintf(stderr, "kintsuki: applied IPS %s (%zu bytes)\n",
-                        patchPath.c_str(), ips.size());
+    if(ok) {
+      std::fprintf(stderr, "kintsuki: applied IPS %s (%zu bytes)\n",
+                   patchPath.c_str(), ips.size());
+    } else {
+      // Existing file but malformed / truncated / wrong magic. Warn so
+      // users notice — a silent reject looks identical to "no patch
+      // present" and causes hours of "why isn't my fix loading".
+      std::fprintf(stderr, "kintsuki: rejected IPS %s (%zu bytes, invalid format)\n",
+                   patchPath.c_str(), ips.size());
+    }
     return ok;
   };
   std::string p = path;

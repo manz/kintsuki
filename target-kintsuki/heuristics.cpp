@@ -154,31 +154,56 @@ bool applyIpsPatch(std::vector<uint8_t>& rom, std::span<const uint8_t> ips) {
   //     if length > 0: `length` bytes of data
   //     if length == 0 (RLE): 2-byte BE rle-length + 1 byte fill value
   //   terminator "EOF" (3 bytes)
+  //
+  // Minimum valid blob = header + EOF = 8 bytes. Reject empty / runt
+  // patches and anything missing the magic up-front.
   if(ips.size() < 8) return false;
   if(std::memcmp(ips.data(), "PATCH", 5) != 0) return false;
 
+  // Pass 1: walk every record without mutating the ROM. Confirms the
+  // blob terminates cleanly with "EOF" so a malformed or truncated IPS
+  // can't leave the cart half-patched — silent partial application
+  // produces nondeterministic boot crashes that look like core bugs.
   size_t i = 5;
+  bool sawEof = false;
   while(i + 3 <= ips.size()) {
-    if(std::memcmp(ips.data() + i, "EOF", 3) == 0) return true;
+    if(std::memcmp(ips.data() + i, "EOF", 3) == 0) { sawEof = true; break; }
     if(i + 5 > ips.size()) return false;
-    uint32_t off = (uint32_t(ips[i]) << 16) | (uint32_t(ips[i+1]) << 8) | ips[i+2];
     uint32_t len = (uint32_t(ips[i+3]) << 8) | ips[i+4];
     i += 5;
     if(len == 0) {
       if(i + 3 > ips.size()) return false;
-      uint32_t rle = (uint32_t(ips[i]) << 8) | ips[i+1];
+      i += 3;
+    } else {
+      if(i + len > ips.size()) return false;
+      i += len;
+    }
+  }
+  if(!sawEof) return false;
+
+  // Pass 2: apply. Header validated, every record byte-bounded — no
+  // need to re-check sizes here, only the rom-side resize for records
+  // that extend the cart past its current end.
+  i = 5;
+  while(true) {
+    if(std::memcmp(ips.data() + i, "EOF", 3) == 0) return true;
+    uint32_t off = (uint32_t(ips[i])   << 16)
+                 | (uint32_t(ips[i+1]) << 8)
+                 |  uint32_t(ips[i+2]);
+    uint32_t len = (uint32_t(ips[i+3]) << 8) | ips[i+4];
+    i += 5;
+    if(len == 0) {
+      uint32_t rle  = (uint32_t(ips[i]) << 8) | ips[i+1];
       uint8_t  fill = ips[i+2];
       i += 3;
       if(off + rle > rom.size()) rom.resize(off + rle, 0);
       std::fill(rom.begin() + off, rom.begin() + off + rle, fill);
     } else {
-      if(i + len > ips.size()) return false;
       if(off + len > rom.size()) rom.resize(off + len, 0);
       std::memcpy(rom.data() + off, ips.data() + i, len);
       i += len;
     }
   }
-  return true;  // truncated, but treat as best-effort success
 }
 
 }  // namespace kintsuki
