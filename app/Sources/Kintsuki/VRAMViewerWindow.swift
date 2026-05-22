@@ -14,6 +14,15 @@ struct VRAMViewerView: View {
     @State private var paletteIndex: Int = 0
     @State private var selectedTile: Int? = nil
     @State private var snapshot: VRAMSnapshot? = nil
+    /// Which memory the tile grid is decoding right now. VRAM is the
+    /// historical default; SRAM / WRAM / ROM let the user inspect
+    /// graphics that live in cart or main RAM (e.g. decompressed font
+    /// glyphs the engine pulls into WRAM, or raw cart tile banks).
+    @State private var source: Emulator.MemRegion = .vram
+    /// 64 KB page within `source`. Always 0 for VRAM (single 64 KB
+    /// region); WRAM has 2, ROM has many, SRAM has up to 1.
+    @State private var page: Int = 0
+    private static let pageBytes: Int = 0x10000
     /// Cached DMA transfers — re-pulled on the same 2 Hz tick that
     /// rebuilds the snapshot so the sidebar shows current sources
     /// without subscribing to every emulator @Published change.
@@ -56,6 +65,17 @@ struct VRAMViewerView: View {
         .onChange(of: emulator.loadedROM) { _, _ in rebuildSnapshot() }
         .onChange(of: bpp) { _, _ in rebuildSnapshot() }
         .onChange(of: paletteIndex) { _, _ in rebuildSnapshot() }
+        .onChange(of: source) { _, _ in
+            // Different region size → reset page + selection rather
+            // than letting them dangle past the new region's bounds.
+            page = 0
+            selectedTile = nil
+            rebuildSnapshot()
+        }
+        .onChange(of: page) { _, _ in
+            selectedTile = nil
+            rebuildSnapshot()
+        }
         // 2 Hz auto-refresh — same cost model as the tilemap viewer.
         .onReceive(Timer.publish(every: 2.0, on: .main, in: .common).autoconnect()) { _ in
             rebuildSnapshot()
@@ -65,13 +85,35 @@ struct VRAMViewerView: View {
     // ----- Toolbar -----
     private var toolbar: some View {
         HStack(spacing: 10) {
+            Picker("Source", selection: $source) {
+                Text("VRAM").tag(Emulator.MemRegion.vram)
+                Text("SRAM").tag(Emulator.MemRegion.sram)
+                Text("WRAM").tag(Emulator.MemRegion.wram)
+                Text("ROM").tag(Emulator.MemRegion.rom)
+            }
+            .pickerStyle(.segmented)
+            .frame(width: 220)
+            .labelsHidden()
+
+            if pageCount > 1 {
+                HStack(spacing: 4) {
+                    Text("Page").font(.caption).foregroundStyle(.secondary)
+                    Stepper(value: $page, in: 0...(pageCount - 1)) {
+                        Text(String(format: "%d/%d  $%06X",
+                                    page + 1, pageCount, page * Self.pageBytes))
+                            .font(.system(.caption, design: .monospaced))
+                            .frame(width: 130, alignment: .leading)
+                    }
+                }
+            }
+
             Picker("Format", selection: $bpp) {
                 Text("2 bpp").tag(TileBpp.bpp2)
                 Text("4 bpp").tag(TileBpp.bpp4)
                 Text("8 bpp").tag(TileBpp.bpp8)
             }
             .pickerStyle(.segmented)
-            .frame(width: 220)
+            .frame(width: 180)
             .labelsHidden()
 
             HStack(spacing: 4) {
@@ -88,6 +130,16 @@ struct VRAMViewerView: View {
                 .keyboardShortcut("r", modifiers: [.command, .option])
         }
         .padding(8)
+    }
+
+    /// How many 64 KB pages the active source needs. VRAM = 1, WRAM = 2,
+    /// SRAM = 1 (mirrors past the cart's actual SRAM bytes are harmless
+    /// open-bus reads), ROM = whatever the current cart maps. Clamped
+    /// to at least 1 so the stepper picker never hides when nothing is
+    /// loaded.
+    private var pageCount: Int {
+        let total = Int(source.size)
+        return max(1, (total + Self.pageBytes - 1) / Self.pageBytes)
     }
 
     private func maxPaletteIndex(_ bpp: TileBpp) -> Int {
@@ -109,8 +161,10 @@ struct VRAMViewerView: View {
                     selectedTileSection(snap)
                     Divider()
                     paletteSection(snap)
-                    Divider()
-                    dmaSourcesSection
+                    if snap.source == .vram {
+                        Divider()
+                        dmaSourcesSection
+                    }
                 } else {
                     Text("No data").foregroundStyle(.secondary)
                 }
@@ -122,8 +176,11 @@ struct VRAMViewerView: View {
 
     private func metaSection(_ snap: VRAMSnapshot) -> some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("VRAM").font(.headline)
-            metaRow("Region", "$0000–$FFFF (64 KB)")
+            Text(snap.source.rawValue).font(.headline)
+            let last = snap.pageOffset + snap.vram.count - 1
+            metaRow("Region", String(format: "$%06X–$%06X (%d KB)",
+                                     snap.pageOffset, max(snap.pageOffset, last),
+                                     snap.vram.count / 1024))
             metaRow("Format", "\(snap.bpp.rawValue) bpp")
             metaRow("Tile size", "8×8")
             metaRow("Tile count", "\(snap.tileCount)")
@@ -136,10 +193,18 @@ struct VRAMViewerView: View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Selected Tile").font(.headline)
             if let t = selectedTile, t < snap.tileCount {
-                let addr = t * snap.bpp.tileBytes
+                let pageByteOff = t * snap.bpp.tileBytes
+                let regionAddr = snap.pageOffset + pageByteOff
                 tilePreview(snap: snap, tileIndex: t)
                 metaRow("Index", String(format: "$%04X", t))
-                metaRow("Address", String(format: "$%04X.w", addr >> 1))
+                // VRAM is word-addressed by the SNES PPU; everywhere else
+                // we want the byte address users expect from the Memory
+                // Viewer / Debugger.
+                if snap.source == .vram {
+                    metaRow("Address", String(format: "$%04X.w", regionAddr >> 1))
+                } else {
+                    metaRow("Address", String(format: "$%06X", regionAddr))
+                }
                 metaRow("Bytes", "\(snap.bpp.tileBytes)")
                 rawBytesRow(snap: snap, tileIndex: t)
             } else {
@@ -301,6 +366,10 @@ struct VRAMViewerView: View {
         case 8: newBpp = .bpp8
         default: newBpp = .bpp4
         }
+        // Tile-jump requests always target VRAM (DMA caller chip etc.);
+        // snap the source picker back so the request resolves against
+        // the right region even if the user was browsing ROM/WRAM.
+        if source != .vram { source = .vram; page = 0 }
         if bpp != newBpp { bpp = newBpp }
         let tile = req.byteOffset / newBpp.tileBytes
         selectedTile = tile
@@ -339,23 +408,42 @@ struct VRAMViewerView: View {
 
     // ----- Snapshot derivation -----
     private func rebuildSnapshot() {
-        // Pull DMA log alongside the VRAM/CGRAM snapshot — same cadence,
+        // Pull DMA log alongside the source snapshot — same cadence,
         // single touch of @State per refresh tick.
         dmaTransfers = emulator.dmaTransfers()
         guard emulator.loadedROM != nil else {
             snapshot = nil
             return
         }
-        let vram = emulator.vramSnapshot()
+        let bytes = bytesForCurrentPage()
         let cgram = emulator.cgramSnapshot()
         let palette = paletteFromCGRAM(cgram)
         let tileBytes = bpp.tileBytes
-        let tileCount = vram.count / tileBytes
+        let tileCount = bytes.count / tileBytes
         snapshot = VRAMSnapshot(bpp: bpp,
                                 paletteIndex: paletteIndex,
                                 tileCount: tileCount,
-                                vram: vram,
-                                paletteRGB: palette)
+                                vram: bytes,
+                                paletteRGB: palette,
+                                source: source,
+                                pageOffset: page * Self.pageBytes)
+    }
+
+    /// Read up to one 64 KB page from the active source, clamped to the
+    /// region's size so the final ROM page (which may be shorter than
+    /// 64 KB) doesn't pull in open-bus tail bytes that would render as
+    /// garbage tiles.
+    private func bytesForCurrentPage() -> Data {
+        let regionSize = Int(source.size)
+        let start = page * Self.pageBytes
+        guard start < regionSize else { return Data() }
+        let want = min(Self.pageBytes, regionSize - start)
+        if source == .vram {
+            // VRAM has a dedicated fast path that pulls the whole 64 KB
+            // through a single C call — keep using it when on page 0.
+            return emulator.vramSnapshot()
+        }
+        return emulator.readRegion(source, offset: UInt32(start), length: want)
     }
 
     private func paletteFromCGRAM(_ cgram: Data) -> [(UInt8, UInt8, UInt8)] {
@@ -407,6 +495,11 @@ struct VRAMSnapshot {
     let tileCount: Int
     let vram: Data
     let paletteRGB: [(UInt8, UInt8, UInt8)]
+    let source: Emulator.MemRegion
+    /// Byte offset of this page's first byte inside the underlying
+    /// region. Address computations for the sidebar add this so users
+    /// see a region-relative address rather than a per-page offset.
+    let pageOffset: Int
 }
 
 // ----- Tile grid canvas -----
