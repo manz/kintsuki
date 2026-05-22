@@ -402,16 +402,289 @@ auto Program::setCpuState(const CpuState& s) -> void {
   SuperFamicom::cpu.clearPendingInterrupts();
 }
 
+// =============================================================================
+// KSSF footer (v1.0)
+//
+// ares' serializer is a flat positional byte stream with no per-block size
+// markers: the cart's sram region length is determined by the *currently
+// bound* cart, not by anything in the blob. A cross-ROM load_state where
+// sram sizes differ silently misaligns every downstream field (cpu/ppu/...)
+// because the cart.sram chunk shifts in size.
+//
+// To make cross-ROM restores tractable, every blob produced by
+// saveStateBlob is suffixed with a footer mapping the cart.sram region
+// (offset + length) inside the ares blob. ares' reader stops when
+// System::unserialize returns, so the trailing bytes are inert to it.
+//
+// Layout:
+//
+//   [ares blob ............]
+//   [version_major:u16 LE][version_minor:u16 LE]
+//   [TLV stream ..........]
+//   [footer_len:u32 LE]      ← size of (version + TLV stream); excl. trailer
+//   [MAGIC:u32 "KSSF" LE]
+//
+// TLV entry:
+//
+//   name_len  : u8        (1..255; 0 reserved)
+//   name      : utf8[name_len]
+//   data_len  : u32 LE
+//   data      : u8[data_len]
+//
+// Unknown names are skipped (forward-compat). Reader is tail-first: check
+// magic, read footer_len, parse TLVs. Absent magic → legacy blob, fall
+// back to current ares-only behavior.
+// =============================================================================
+
+namespace {
+
+constexpr uint32_t KSSF_MAGIC = 0x4653534b;  // "KSSF" little-endian
+constexpr uint16_t KSSF_VER_MAJOR = 1;
+constexpr uint16_t KSSF_VER_MINOR = 0;
+
+// Mirror System::serialize's prefix (header + random) to learn the byte
+// offset at which Cartridge::serialize starts. Coupled to ares layout: if
+// ares grows new fields before cartridge, this probe needs the same fields
+// added to stay correct.
+auto probeCartSramOffset() -> uint32_t {
+  serializer probe;
+  u32  sig = ares::SerializerSignature;
+  bool sync = true;
+  char ver[16] = {};
+  char desc[512] = {};
+  bool ppuAcc = SuperFamicom::ppu.accurate;
+  probe(sig);
+  probe(sync);
+  probe(ver);
+  probe(desc);
+  probe(ppuAcc);
+  SuperFamicom::random.serialize(probe);
+  return (uint32_t)probe.size();
+}
+
+auto writeU16LE(std::vector<uint8_t>& out, uint16_t v) -> void {
+  out.push_back((uint8_t)(v & 0xff));
+  out.push_back((uint8_t)((v >> 8) & 0xff));
+}
+
+auto writeU32LE(std::vector<uint8_t>& out, uint32_t v) -> void {
+  out.push_back((uint8_t)(v & 0xff));
+  out.push_back((uint8_t)((v >> 8) & 0xff));
+  out.push_back((uint8_t)((v >> 16) & 0xff));
+  out.push_back((uint8_t)((v >> 24) & 0xff));
+}
+
+auto writeTLV(std::vector<uint8_t>& out, const char* name,
+              const uint8_t* data, uint32_t dataLen) -> void {
+  size_t nameLen = std::strlen(name);
+  if(nameLen == 0 || nameLen > 255) return;
+  out.push_back((uint8_t)nameLen);
+  for(size_t i = 0; i < nameLen; i++) out.push_back((uint8_t)name[i]);
+  writeU32LE(out, dataLen);
+  for(uint32_t i = 0; i < dataLen; i++) out.push_back(data[i]);
+}
+
+auto readU16LE(const uint8_t* p) -> uint16_t {
+  return (uint16_t)p[0] | ((uint16_t)p[1] << 8);
+}
+
+auto readU32LE(const uint8_t* p) -> uint32_t {
+  return  (uint32_t)p[0]
+       | ((uint32_t)p[1] << 8)
+       | ((uint32_t)p[2] << 16)
+       | ((uint32_t)p[3] << 24);
+}
+
+struct KssfRegion {
+  uint32_t offset = 0;
+  uint32_t length = 0;
+  bool     present = false;
+};
+
+struct KssfFooter {
+  bool        present  = false;   // false if blob has no recognised footer
+  bool        valid    = false;   // false if magic present but parse failed
+  uint16_t    verMajor = 0;
+  uint16_t    verMinor = 0;
+  uint32_t    aresBlobLen = 0;    // bytes before footer (or total len if absent)
+  KssfRegion  cartSram;
+};
+
+auto parseKssfFooter(const uint8_t* data, uint32_t size) -> KssfFooter {
+  KssfFooter f;
+  f.aresBlobLen = size;
+  if(size < 8) return f;
+  if(readU32LE(data + size - 4) != KSSF_MAGIC) return f;
+  uint32_t footerLen = readU32LE(data + size - 8);
+  if(footerLen < 4 || footerLen + 8 > size) {
+    f.present = true;   // magic matched but layout broken
+    return f;
+  }
+  const uint8_t* footer = data + size - 8 - footerLen;
+  f.present     = true;
+  f.verMajor    = readU16LE(footer + 0);
+  f.verMinor    = readU16LE(footer + 2);
+  f.aresBlobLen = size - 8 - footerLen;
+
+  // v1: only major must match; unknown minors are forward-compat.
+  if(f.verMajor != KSSF_VER_MAJOR) return f;
+
+  uint32_t cursor = 4;
+  while(cursor < footerLen) {
+    if(cursor + 1 > footerLen) return f;
+    uint8_t nameLen = footer[cursor++];
+    if(nameLen == 0 || cursor + nameLen + 4 > footerLen) return f;
+    std::string name((const char*)(footer + cursor), nameLen);
+    cursor += nameLen;
+    uint32_t dataLen = readU32LE(footer + cursor);
+    cursor += 4;
+    if(cursor + dataLen > footerLen) return f;
+    const uint8_t* tlvData = footer + cursor;
+    cursor += dataLen;
+
+    if(name == "cart.sram" && dataLen == 8) {
+      f.cartSram.offset  = readU32LE(tlvData + 0);
+      f.cartSram.length  = readU32LE(tlvData + 4);
+      f.cartSram.present = true;
+    }
+    // unknown TLVs: skip silently (forward-compat)
+  }
+  f.valid = true;
+  return f;
+}
+
+}  // anonymous namespace
+
 auto Program::saveStateBlob() -> std::vector<uint8_t> {
   serializer s = SuperFamicom::system.serialize(true);
   std::vector<uint8_t> out(s.size());
   std::memcpy(out.data(), s.data(), s.size());
+
+  // Append KSSF footer with cart.sram region, when there is one.
+  uint32_t sramSize = (uint32_t)SuperFamicom::cartridge.ram.size();
+  if(sramSize == 0) return out;
+
+  uint32_t sramOffset = probeCartSramOffset();
+  // Sanity: offset+length must fit inside the ares blob; otherwise the
+  // probe doesn't match this ares revision and we shouldn't lie about it.
+  if(sramOffset + sramSize > out.size()) return out;
+
+  std::vector<uint8_t> footer;
+  writeU16LE(footer, KSSF_VER_MAJOR);
+  writeU16LE(footer, KSSF_VER_MINOR);
+
+  uint8_t region[8];
+  region[0] = (uint8_t)(sramOffset & 0xff);
+  region[1] = (uint8_t)((sramOffset >> 8) & 0xff);
+  region[2] = (uint8_t)((sramOffset >> 16) & 0xff);
+  region[3] = (uint8_t)((sramOffset >> 24) & 0xff);
+  region[4] = (uint8_t)(sramSize & 0xff);
+  region[5] = (uint8_t)((sramSize >> 8) & 0xff);
+  region[6] = (uint8_t)((sramSize >> 16) & 0xff);
+  region[7] = (uint8_t)((sramSize >> 24) & 0xff);
+  writeTLV(footer, "cart.sram", region, 8);
+
+  uint32_t footerLen = (uint32_t)footer.size();
+  out.insert(out.end(), footer.begin(), footer.end());
+  writeU32LE(out, footerLen);
+  writeU32LE(out, KSSF_MAGIC);
   return out;
 }
 
 auto Program::loadStateBlob(const uint8_t* data, u32 size) -> bool {
-  serializer s(data, size);
+  // Footer is opt-in for the legacy entry point: if present, just strip it
+  // before handing the inner blob to ares. No size reconciliation happens
+  // here — callers wanting cross-ROM behavior go through loadStateBlobEx.
+  auto footer = parseKssfFooter(data, size);
+  u32 aresLen = footer.present ? footer.aresBlobLen : size;
+  serializer s(data, aresLen);
   return SuperFamicom::system.unserialize(s);
+}
+
+auto Program::loadStateBlobEx(const uint8_t* data, u32 size,
+                              u32 flags, u32 expectedSramSize) -> int {
+  if(!loaded || !data || size == 0) return 0;
+
+  constexpr u32 FLAG_STRICT      = 1u << 0;
+  constexpr u32 FLAG_REMAP       = 1u << 1;
+  constexpr u32 FLAG_INJECT_ONLY = 1u << 2;
+
+  auto footer = parseKssfFooter(data, size);
+
+  // Resolve producer sram size:
+  //   1. explicit expectedSramSize from caller
+  //   2. footer's cart.sram region length
+  //   3. assume equal to bound cart (legacy)
+  u32 producerSram = 0;
+  if(expectedSramSize != 0) {
+    producerSram = expectedSramSize;
+  } else if(footer.valid && footer.cartSram.present) {
+    producerSram = footer.cartSram.length;
+  }
+
+  u32 cartSram = (u32)SuperFamicom::cartridge.ram.size();
+
+  if(flags & FLAG_INJECT_ONLY) {
+    // Need a footer to know where sram lives in the blob. (Or, in the
+    // future, an explicit offset field in opts.)
+    if(!footer.valid || !footer.cartSram.present) return 0;
+    u32 srcOff = footer.cartSram.offset;
+    u32 srcLen = footer.cartSram.length;
+    if(srcOff + srcLen > footer.aresBlobLen) return 0;
+
+    std::vector<uint8_t> slice(cartSram, 0);
+    u32 n = srcLen < cartSram ? srcLen : cartSram;
+    std::memcpy(slice.data(), data + srcOff, n);
+
+    if(flags & FLAG_STRICT) {
+      if(srcLen != cartSram && producerSram != cartSram) return 0;
+    }
+
+    SuperFamicom::system.power(false);
+    if(cartSram > 0) {
+      std::memcpy(SuperFamicom::cartridge.ram.data(), slice.data(), cartSram);
+    }
+    return 1;
+  }
+
+  // Non-inject path: drive ares unserialize. STRICT and REMAP need
+  // producer/cart sram comparison.
+  bool sizeMismatch = (producerSram != 0 && producerSram != cartSram);
+
+  if(flags & FLAG_STRICT) {
+    if(sizeMismatch) return 0;
+    if(producerSram == 0) return 0;  // STRICT requires a known producer size
+  }
+
+  if(sizeMismatch && (flags & FLAG_REMAP)) {
+    // Rewrite the ares blob: pad-or-trim the cart.sram region to the
+    // bound cart's size, then hand it to ares. Needs the footer to know
+    // where the sram bytes live.
+    if(!footer.valid || !footer.cartSram.present) return 0;
+    u32 srcOff = footer.cartSram.offset;
+    u32 srcLen = footer.cartSram.length;
+    if(srcOff + srcLen > footer.aresBlobLen) return 0;
+
+    std::vector<uint8_t> patched;
+    patched.reserve(footer.aresBlobLen - srcLen + cartSram);
+    patched.insert(patched.end(), data, data + srcOff);
+    u32 copyLen = srcLen < cartSram ? srcLen : cartSram;
+    patched.insert(patched.end(), data + srcOff, data + srcOff + copyLen);
+    if(cartSram > copyLen) patched.insert(patched.end(), cartSram - copyLen, 0);
+    patched.insert(patched.end(),
+                   data + srcOff + srcLen,
+                   data + footer.aresBlobLen);
+
+    serializer s(patched.data(), (u32)patched.size());
+    return SuperFamicom::system.unserialize(s) ? 1 : 0;
+  }
+
+  if(sizeMismatch) return 0;  // no flag covers this case → reject
+
+  // Default path: equivalent to loadStateBlob.
+  u32 aresLen = footer.present ? footer.aresBlobLen : size;
+  serializer s(data, aresLen);
+  return SuperFamicom::system.unserialize(s) ? 1 : 0;
 }
 
 auto Program::saveStateFile(const char* path) -> bool {

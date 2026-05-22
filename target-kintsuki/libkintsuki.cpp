@@ -551,6 +551,18 @@ int kintsuki_load_state(kintsuki_t* h, const void* buf, uint32_t len) {
   return 1;
 }
 
+int kintsuki_load_state_ex(kintsuki_t* h, const void* buf, uint32_t len,
+                           const kintsuki_load_state_opts_t* opts) {
+  if(!h || !buf) return 0;
+  uint32_t flags = opts ? opts->flags : 0;
+  uint32_t expected = opts ? opts->expected_sram_size : 0;
+  if(!h->program->loadStateBlobEx((const uint8_t*)buf, len, flags, expected)) {
+    return 0;
+  }
+  g_callstack.clear();
+  return 1;
+}
+
 const uint32_t* kintsuki_framebuffer(kintsuki_t* h, uint32_t* out_w, uint32_t* out_h) {
   if(!h) return nullptr;
   if(out_w) *out_w = h->program->fbWidth;

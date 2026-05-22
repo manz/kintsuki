@@ -77,11 +77,19 @@ struct Program : ares::Platform {
   auto getCpuState() const -> CpuState;
   auto setCpuState(const CpuState& s) -> void;
 
-  // Savestate
+  // Savestate. saveStateBlob appends a KSSF footer (region map for
+  // cross-ROM load_state_ex). loadStateBlob strips the footer if present
+  // and is otherwise backwards-compatible with footer-less blobs.
   auto saveStateBlob() -> std::vector<uint8_t>;
   auto loadStateBlob(const uint8_t* data, u32 size) -> bool;
   auto saveStateFile(const char* path) -> bool;
   auto loadStateFile(const char* path) -> bool;
+
+  // Extended loader. flags = bitmask of KINTSUKI_LOAD_FLAG_*.
+  // expectedSramSize: 0 = use footer / no override.
+  // Returns 1 on success, 0 on failure.
+  auto loadStateBlobEx(const uint8_t* data, u32 size,
+                       u32 flags, u32 expectedSramSize) -> int;
 
   // Screenshot
   auto writePNG(const char* path) -> bool;
