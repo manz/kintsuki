@@ -596,13 +596,25 @@ extension RewindBuffer {
     func serializedFrames() -> [SerializedFrame] {
         var out: [SerializedFrame] = []
         out.reserveCapacity(ringSize)
+        // Maps ring position → output array index. Skipping orphans
+        // (deltas whose owning keyframe predates the ring) shifts
+        // subsequent indices, so we can't reuse ring positions as
+        // serialized kfIndex values — re-key against this map.
+        var ringToOut: [Int: Int] = [:]
         for i in 0..<ringSize {
             switch entry(at: i) {
             case .keyframe(let h):
+                ringToOut[i] = out.count
                 out.append(.keyframe(bytes: keyframePool.bytes(for: h)))
             case .delta(let kfLogical, let compressed):
-                let kfIdx = kfLogical - firstLogicalIdx
-                out.append(.delta(kfIndex: kfIdx, compressed: compressed))
+                // Orphan check: owning keyframe may have been evicted
+                // from the ring already. kfLogical < firstLogicalIdx
+                // makes kfIdx negative, which traps on UInt32(kfIdx)
+                // at crash-dump write time. Such a delta can't replay
+                // without its keyframe anyway.
+                let kfRing = kfLogical - firstLogicalIdx
+                guard kfRing >= 0, let kfOut = ringToOut[kfRing] else { continue }
+                out.append(.delta(kfIndex: kfOut, compressed: compressed))
             }
         }
         return out

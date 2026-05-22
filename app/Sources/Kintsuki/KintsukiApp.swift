@@ -139,6 +139,10 @@ struct KintsukiApp: App {
                     .keyboardShortcut("b", modifiers: [.command, .shift])
                 Button("Profiler") { toggleToolWindow("profiler") }
                     .keyboardShortcut("f", modifiers: [.command, .shift])
+                Divider()
+                Button("Save Screenshot") { saveScreenshotToPicturesFolder() }
+                    .keyboardShortcut("p", modifiers: [.command, .shift])
+                    .disabled(emulator.loadedROM == nil)
             }
             CommandMenu("Project") {
                 if emulator.projectIsOpen, let dir = emulator.projectDir {
@@ -181,6 +185,11 @@ struct KintsukiApp: App {
                 Button("Manage Save States…") { showStateBrowser = true }
                     .keyboardShortcut("s", modifiers: [.command, .shift])
                     .disabled(emulator.loadedROM == nil)
+                Button("Resume Last Session") { _ = emulator.loadAutosave() }
+                    .keyboardShortcut("l", modifiers: [.command, .shift])
+                    .disabled(emulator.loadedROM == nil)
+                Button("Clear Autosave") { emulator.clearAutosave() }
+                    .disabled(emulator.loadedROM == nil)
                 Divider()
                 Button("Export State to File…") { exportStateViaPanel() }
                     .disabled(emulator.loadedROM == nil)
@@ -188,6 +197,23 @@ struct KintsukiApp: App {
                     .disabled(emulator.loadedROM == nil)
             }
         }
+    }
+
+    /// Drop the screenshot in `~/Pictures/Kintsuki/<rom>-<timestamp>.png`
+    /// without an NSSavePanel — the dialog adds friction for what is
+    /// usually a "grab this frame, keep playing" action. Folder is
+    /// created on demand so a fresh install just works.
+    private func saveScreenshotToPicturesFolder() {
+        let fm = FileManager.default
+        let pictures = fm.urls(for: .picturesDirectory, in: .userDomainMask).first
+            ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Pictures")
+        let dir = pictures.appendingPathComponent("Kintsuki", isDirectory: true)
+        try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
+        let stem = emulator.loadedROM?.deletingPathExtension().lastPathComponent ?? "screenshot"
+        let f = DateFormatter()
+        f.dateFormat = "yyyyMMdd-HHmmss"
+        let url = dir.appendingPathComponent("\(stem)-\(f.string(from: .now)).png")
+        _ = emulator.saveScreenshot(url: url)
     }
 
     /// Honour `--recover <path>` on launch by loading a `.kcr` dump
