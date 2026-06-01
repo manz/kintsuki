@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import CKintsuki
 
 /// Mesen-S-style BG tilemap viewer. Per-layer canvas, tile-grid overlay,
 /// scroll-window overlay, sidebar with tilemap meta + selected-tile detail.
@@ -20,6 +21,12 @@ struct TilemapViewerView: View {
     /// layer change. nil while no ROM is loaded or current BG mode has
     /// no data for the selected layer.
     @State private var cachedSnapshot: LayerSnapshot? = nil
+    /// When set, BGMODE + BGxSC are resolved as they'd be at this visible
+    /// scanline by walking the live HDMA tables, so per-scanline base
+    /// swaps (CT battle HUD, mid-frame mode changes) become browsable.
+    /// Off uses the latched end-of-frame registers, as before.
+    @State private var sampleAtScanline: Bool = false
+    @State private var sampleScanline: Double = 16
 
     var body: some View {
         HSplitView {
@@ -55,6 +62,16 @@ struct TilemapViewerView: View {
                 HStack {
                     Toggle("Show tile grid", isOn: $showGrid)
                     Toggle("Show scroll overlay", isOn: $showScrollOverlay)
+                    Divider().frame(height: 16)
+                    Toggle("Scanline", isOn: $sampleAtScanline)
+                        .help("Resolve BGMODE/BGxSC via the live HDMA tables at this scanline")
+                    if sampleAtScanline {
+                        Slider(value: $sampleScanline, in: 0...261, step: 1)
+                            .frame(width: 130)
+                        Text("L\(Int(sampleScanline))")
+                            .font(.system(.caption, design: .monospaced))
+                            .frame(width: 38, alignment: .leading)
+                    }
                     Spacer()
                     Button("Refresh") { rebuildSnapshot() }
                         .keyboardShortcut("r", modifiers: [.command, .option])
@@ -76,6 +93,8 @@ struct TilemapViewerView: View {
         }
         .onChange(of: emulator.loadedROM) { _, _ in rebuildSnapshot() }
         .onChange(of: selectedLayer) { _, _ in rebuildSnapshot() }
+        .onChange(of: sampleAtScanline) { _, _ in rebuildSnapshot() }
+        .onChange(of: sampleScanline) { _, _ in rebuildSnapshot() }
         // 2 Hz auto-refresh while running so the canvas tracks tilemap
         // edits without forcing the user to pause. Cheap: each rebuild
         // is one PPU snapshot + one tilemap CGImage build, far below
@@ -118,6 +137,9 @@ struct TilemapViewerView: View {
             vramLinkRow(label: "Tileset", byteOffset: snap.charBaseByte)
             metaRow("Format", "\(snap.bpp.rawValue) bpp")
             metaRow("Mode", "BG\(snap.layer) (mode \(snap.bgMode))")
+            if let sl = snap.sampledScanline {
+                metaRow("Sampled @", "line \(sl) (HDMA)")
+            }
         }
     }
 
@@ -338,18 +360,94 @@ struct TilemapViewerView: View {
         }
     }
 
+    // ----- HDMA register resolution -----
+    /// SNES HDMA bytes-transferred-per-line, indexed by transfer mode
+    /// (`$43xa & 7`): 1 reg, 2 regs, 1 reg x2, 2 regs x2, 4 regs, etc.
+    private static let hdmaUnit: [Int] = [1, 2, 2, 4, 4, 4, 2, 4]
+
+    /// The 8 HDMA channel descriptors, lifted out of the C tuple.
+    private func hdmaChannels(_ ppu: kintsuki_ppu_state_t) -> [kintsuki_dma_channel_t] {
+        var p = ppu
+        return withUnsafeBytes(of: &p.dma) { raw in
+            Array(raw.bindMemory(to: kintsuki_dma_channel_t.self))
+        }
+    }
+
+    /// Resolve the byte an enabled HDMA channel writes to PPU register
+    /// `$21<destLow>` at visible `scanline`, walking its table exactly as
+    /// the PPU would (A1Tx is the stable table base; HDMA advances an
+    /// internal pointer, not A1Tx). `byteIndex` selects a sub-byte for
+    /// multi-register transfer modes. nil if no channel drives that reg
+    /// at that line, so callers fall back to the latched register.
+    private func hdmaByteAtLine(_ chans: [kintsuki_dma_channel_t],
+                                destLow: UInt8, scanline: Int,
+                                byteIndex: Int = 0) -> UInt8? {
+        for ch in chans where ch.enabled != 0 && ch.dest == destLow {
+            let mode = Int(ch.ctrl & 0x07)
+            let indirect = (ch.ctrl & 0x40) != 0
+            let unit = Self.hdmaUnit[mode]
+            var p = (UInt32(ch.src_bank) << 16) | UInt32(ch.src_addr)
+            var line = 0
+            for _ in 0..<256 {
+                guard let l = emulator.readBus(p) else { return nil }
+                p &+= 1
+                if l == 0 { break }
+                let lines = (l & 0x7F) == 0 ? 128 : Int(l & 0x7F)
+                let repeatMode = (l & 0x80) != 0
+                let inBand = scanline >= line && scanline < line + lines
+                if indirect {
+                    guard let lo = emulator.readBus(p),
+                          let hi = emulator.readBus(p &+ 1) else { return nil }
+                    p &+= 2
+                    if inBand {
+                        let dptr = (UInt32(ch.ind_bank) << 16) | (UInt32(hi) << 8) | UInt32(lo)
+                        let k = repeatMode ? (scanline - line) : 0
+                        return emulator.readBus(dptr &+ UInt32(k * unit + byteIndex))
+                    }
+                } else if repeatMode {
+                    if inBand {
+                        return emulator.readBus(p &+ UInt32((scanline - line) * unit + byteIndex))
+                    }
+                    p &+= UInt32(lines * unit)
+                } else {
+                    if inBand { return emulator.readBus(p &+ UInt32(byteIndex)) }
+                    p &+= UInt32(unit)
+                }
+                line += lines
+                if line > 240 { break }
+            }
+        }
+        return nil
+    }
+
     // ----- Snapshot derivation -----
     private func layerSnapshot(layer: Int) -> LayerSnapshot? {
         guard let ppu = emulator.ppuState() else { return nil }
-        let mode = Int(ppu.bgmode & 0x07)
+        let line = Int(sampleScanline)
+        let chans = sampleAtScanline ? hdmaChannels(ppu) : []
+        // BGMODE may itself be HDMA-swapped mid-frame (CT battle ch6).
+        let mode: Int = {
+            if sampleAtScanline,
+               let m = hdmaByteAtLine(chans, destLow: 0x05, scanline: line) {
+                return Int(m & 0x07)
+            }
+            return Int(ppu.bgmode & 0x07)
+        }()
         guard let bpp = bppFor(layer: layer, mode: mode) else { return nil }
-        let bgsc: UInt8
-        switch layer {
-        case 1: bgsc = ppu.bg1sc
-        case 2: bgsc = ppu.bg2sc
-        case 3: bgsc = ppu.bg3sc
-        default: bgsc = ppu.bg4sc
-        }
+        // BGxSC ($2107..$210A) is the one CT swaps per scanline to drop the
+        // HUD tilemap into the band: resolve it from HDMA when sampling.
+        let bgsc: UInt8 = {
+            if sampleAtScanline,
+               let v = hdmaByteAtLine(chans, destLow: UInt8(0x07 + layer - 1), scanline: line) {
+                return v
+            }
+            switch layer {
+            case 1: return ppu.bg1sc
+            case 2: return ppu.bg2sc
+            case 3: return ppu.bg3sc
+            default: return ppu.bg4sc
+            }
+        }()
         let size = TilemapSize(bgsc: bgsc)
         let mapBaseWord = Int(bgsc & 0xFC) << 8     // bits 7..2 → word base
         let mapBaseByte = mapBaseWord << 1
@@ -381,7 +479,8 @@ struct TilemapViewerView: View {
                              scrollX: hofs,
                              scrollY: vofs,
                              vram: vram,
-                             paletteRGB: paletteFromCGRAM(cgram))
+                             paletteRGB: paletteFromCGRAM(cgram),
+                             sampledScanline: sampleAtScanline ? line : nil)
     }
 
     private func bppFor(layer: Int, mode: Int) -> TileBpp? {
@@ -467,6 +566,8 @@ struct LayerSnapshot {
     let scrollY: UInt16
     let vram: Data
     let paletteRGB: [(UInt8, UInt8, UInt8)]
+    /// Non-nil when BGMODE/BGxSC were resolved via HDMA at this scanline.
+    let sampledScanline: Int?
 
     func cell(row: Int, col: Int) -> TilemapCell {
         let off = tilemapCellByteOffset(size: size, mapBaseByte: mapBaseByte,
