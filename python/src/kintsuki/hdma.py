@@ -4,7 +4,7 @@ Walks a direct-mode HDMA table the same way the SNES PPU would, so tests
 can assert what value the destination register would see on each
 scanline of the visible frame, without rendering or even running the
 emulator. Useful when the actual bug is "all bands wrote the same value
-because the modulo math collapsed" — pixel oracles can't distinguish
+because the modulo math collapsed" - pixel oracles can't distinguish
 that from "the right value happened to render the same."
 
 Entry format (per fullsnes / SnesLab):
@@ -19,43 +19,38 @@ Transfer mode dictates bytes-per-unit:
     0: 1 byte  (1 reg)
     2: 2 bytes (1 reg, e.g. BG?VOFS double-write semantics)
 
-Other modes (1, 3, 4, ...) raise NotImplementedError until needed —
-better to fail loudly than silently return wrong values.
+Other modes (1, 3, 4, ...) raise NotImplementedError until needed - better to fail loudly than silently return wrong values.
 """
 
 from __future__ import annotations
 
-import struct
-
 NTSC_VISIBLE_SCANLINES = 224
 
-_BYTES_PER_UNIT = {
-    0: 1,  # 1 byte to 1 register
-    2: 2,  # 2 bytes to 1 register (BG?VOFS, etc.)
-}
+# Bytes per write-unit by transfer mode (fullsnes). Modes 3/4/5/7 are
+# multi-register (BGxSC mode 4 = $2107-$210A; scroll mode 3 = 2 regs x 2-byte
+# double-write), so a "unit" is several bytes - use simulate_units for those.
+_BYTES_PER_UNIT = {0: 1, 1: 2, 2: 2, 3: 4, 4: 4, 5: 4, 6: 2, 7: 4}
 
 
-def simulate_direct(table: bytes, *, transfer_mode: int = 2,
-                    visible_scanlines: int = NTSC_VISIBLE_SCANLINES) -> list[int]:
-    """Walk a direct-mode HDMA table; return one value per visible scanline.
+def simulate_units(table: bytes, *, transfer_mode: int,
+                   visible_scanlines: int = NTSC_VISIBLE_SCANLINES) -> list[bytes]:
+    """Walk a direct-mode HDMA table; return the raw write-unit (``bytes`` of
+    length bytes-per-unit) seen on each visible scanline.
 
-    Each entry: 1-byte line counter + N-byte unit data (N = bytes-per-unit
-    for the given transfer mode). Output is `visible_scanlines` long,
-    padded with the last seen value once the table terminates.
+    Supports every transfer mode, including the multi-register ones CT uses for
+    its window band (BGxSC mode 4, scroll mode 3, TM/TS mode 4). The caller
+    splits the unit bytes across the destination registers ($21xx, $21xx+1, ...).
+    Direct mode only - for indirect tables (ctrl & 0x40) the entries are
+    pointers and the data lives elsewhere; decode that separately.
     """
     if transfer_mode not in _BYTES_PER_UNIT:
         raise NotImplementedError(
-            f"transfer_mode {transfer_mode} not supported yet "
+            f"transfer_mode {transfer_mode} unknown "
             f"(supported: {sorted(_BYTES_PER_UNIT)})")
     bpu = _BYTES_PER_UNIT[transfer_mode]
-    fmt = "<B" if bpu == 1 else "<H"
 
-    def _read_unit(buf: bytes, off: int) -> tuple[int, int]:
-        (val,) = struct.unpack_from(fmt, buf, off)
-        return val, off + bpu
-
-    out: list[int] = []
-    last_value = 0
+    out: list[bytes] = []
+    last = bytes(bpu)
     pos = 0
     while pos < len(table) and len(out) < visible_scanlines:
         line_counter = table[pos]
@@ -63,27 +58,44 @@ def simulate_direct(table: bytes, *, transfer_mode: int = 2,
         if line_counter == 0:
             break  # terminator
         if line_counter & 0x80:
-            # Repeat mode: write fresh unit each scanline.
+            # Repeat: a fresh unit per scanline for (count) lines.
             count = line_counter & 0x7F
             for _ in range(count):
-                if len(out) >= visible_scanlines:
+                if len(out) >= visible_scanlines or pos + bpu > len(table):
                     break
-                if pos + bpu > len(table):
-                    break
-                last_value, pos = _read_unit(table, pos)
-                out.append(last_value)
+                last = bytes(table[pos:pos + bpu])
+                pos += bpu
+                out.append(last)
         else:
-            # Non-repeat: write once, hold for `count` scanlines.
+            # Non-repeat: read ONE unit (it follows the count byte), hold it.
             count = line_counter
             if pos + bpu > len(table):
                 break
-            last_value, pos = _read_unit(table, pos)
+            last = bytes(table[pos:pos + bpu])
+            pos += bpu
             for _ in range(count):
                 if len(out) >= visible_scanlines:
                     break
-                out.append(last_value)
+                out.append(last)
 
-    # Pad remaining scanlines with the last latched value.
     while len(out) < visible_scanlines:
-        out.append(last_value)
+        out.append(last)
     return out
+
+
+def simulate_direct(table: bytes, *, transfer_mode: int = 2,
+                    visible_scanlines: int = NTSC_VISIBLE_SCANLINES) -> list[int]:
+    """Walk a direct-mode HDMA table; return one int value per visible scanline.
+
+    Convenience over :func:`simulate_units` for the 1- and 2-byte modes (a
+    single destination register). For multi-register modes (3/4/...) use
+    :func:`simulate_units` and split the unit bytes yourself.
+    """
+    bpu = _BYTES_PER_UNIT.get(transfer_mode)
+    if bpu not in (1, 2):
+        raise NotImplementedError(
+            f"transfer_mode {transfer_mode} is multi-register; "
+            f"use simulate_units (supported here: modes with 1-2 byte units)")
+    units = simulate_units(table, transfer_mode=transfer_mode,
+                           visible_scanlines=visible_scanlines)
+    return [int.from_bytes(u, "little") for u in units]
