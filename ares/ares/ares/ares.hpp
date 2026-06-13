@@ -59,7 +59,14 @@ namespace ares {
   }
 
   namespace Video {
-    static constexpr bool Threaded = true;
+    // kintsuki runs video synchronously. Threaded video refreshes (and thus
+    // the platform->video frame-count callback) on a separate thread, so
+    // `framesRendered` lags the scheduler; run_frames' `while(framesRendered
+    // < target)` then races and overshoots by a frame whenever a savestate
+    // serialize perturbs the timing (per-frame rewind capture = 2x speed).
+    // Synchronous refresh keeps frame production on the scheduler thread,
+    // which a headless/deterministic harness wants regardless.
+    static constexpr bool Threaded = false;
   }
 
   namespace Constants {
