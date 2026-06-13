@@ -37,6 +37,11 @@ kintsuki_t* kintsuki_create(void);
 void        kintsuki_destroy(kintsuki_t*);
 int         kintsuki_load_rom(kintsuki_t*, const char* path);
 
+// Mapper of the currently loaded cart. 1 => HiROM, 0 => LoROM (or no ROM
+// loaded). ExHiROM currently reports as HiROM (detectRom falls through);
+// coprocessor carts use whichever base mapper the manifest specifies.
+int         kintsuki_rom_is_hirom(kintsuki_t*);
+
 // Soft reset. Power-cycles the emulator without re-reading the ROM
 // from disk. Equivalent to physically tapping the SNES reset button.
 // Preserves cart SRAM contents. No-op if no ROM loaded.
@@ -211,6 +216,30 @@ int         kintsuki_screenshot(kintsuki_t*, const char* path);
 // Python `framebuffer()` uses this to collapse ares' always-doubled
 // 564-wide output back to single columns in normal mode.
 int         kintsuki_ppu_hires(kintsuki_t*);
+
+// ---- Audio output -------------------------------------------------------
+// ares resamples the SPC/DSP output to a fixed stereo stream that the core
+// pushes during `kintsuki_run_frames`. Samples accumulate in an internal
+// lock-free ring; a host audio thread drains it with `kintsuki_audio_read`.
+//
+// Disabled by default (headless / Python paths produce no audio overhead).
+// Enable it, start pulling from your audio device's render callback, and
+// you have sound. The producer is the thread calling `kintsuki_run_frames`;
+// the consumer is your audio thread; these may differ, and the ring is the
+// single-producer/single-consumer handoff between them.
+//
+// Fixed output format: interleaved stereo float32 at the rate reported by
+// `kintsuki_audio_sample_rate` (48000 Hz).
+void     kintsuki_audio_set_enabled(kintsuki_t*, int enable);
+int      kintsuki_audio_is_enabled(kintsuki_t*);
+double   kintsuki_audio_sample_rate(kintsuki_t*);
+// Copy up to `frames` interleaved stereo frames into `out` (which must hold
+// at least `frames*2` floats). Returns the number of frames written; a
+// short return means the ring underran and the caller should zero-fill the
+// remainder. Safe to call from a real-time audio thread (no locks/allocs).
+uint32_t kintsuki_audio_read(kintsuki_t*, float* out, uint32_t frames);
+// Stereo frames currently queued.
+uint32_t kintsuki_audio_available(kintsuki_t*);
 
 // Input. mask bits: Up=0 Down=1 Left=2 Right=3 B=4 A=5 Y=6 X=7 L=8 R=9 Select=10 Start=11
 void        kintsuki_set_input(kintsuki_t*, int port, uint16_t mask);

@@ -6,6 +6,7 @@
 #include <ares/ares.hpp>
 #include <sfc/sfc.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -101,6 +102,25 @@ struct Program : ares::Platform {
   // renderer happy.
   auto frameOutputWidth() const -> u32;
 
+  // ---- Audio output -----------------------------------------------------
+  // ares pushes resampled stereo samples (at audioSampleRate) through the
+  // `audio()` platform callback as the SPC/DSP runs. We funnel them into a
+  // lock-free SPSC ring drained by the host's real-time audio thread
+  // (CoreAudio render callback in the macOS app). Disabled by default so
+  // headless / Python use accrues no overhead; the app flips it on.
+  static constexpr double   audioSampleRate = 48000.0;
+  // Power-of-two stereo-frame capacity (~170ms @ 48kHz), big enough to
+  // absorb the jitter between the 60Hz emulation tick and the audio clock.
+  static constexpr uint32_t audioRingFrames = 8192;
+
+  auto setAudioEnabled(bool enable) -> void;
+  auto audioEnabledState() const -> bool { return audioEnabled; }
+  // Consumer side (host audio thread): copy up to `frames` interleaved
+  // stereo frames into `out` (length >= frames*2). Returns frames written.
+  auto audioRead(float* out, uint32_t frames) -> uint32_t;
+  // Stereo frames currently queued.
+  auto audioAvailable() const -> uint32_t;
+
   // Input. Bits indexed by Gamepad enum
   // (Up=0, Down=1, Left=2, Right=3, B=4, A=5, Y=6, X=7, L=8, R=9, Select=10, Start=11).
   auto setButton(u32 port, u32 button, bool pressed) -> void;
@@ -131,6 +151,16 @@ private:
 
   // System pak (boards.bml + ipl.rom) built at construction.
   std::shared_ptr<vfs::directory> systemPak;
+
+  // Audio ring (interleaved stereo f32). Single producer (emulation thread,
+  // via the `audio()` callback) / single consumer (host audio thread).
+  // Free-running u32 indices; capacity is a power of two so wrap is a mask.
+  std::vector<float>    audioRing;
+  std::atomic<uint32_t> audioWriteIdx{0};
+  std::atomic<uint32_t> audioReadIdx{0};
+  bool                  audioEnabled = false;
+
+  auto audioPushFrame(float l, float r) -> void;
 
   // Track which pak() call we're on. ares calls pak() once for the system
   // node and once for the cartridge peripheral; we identify by node name.

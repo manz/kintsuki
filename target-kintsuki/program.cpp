@@ -71,6 +71,7 @@ auto makeSystemPak() -> std::shared_ptr<vfs::directory> {
 Program::Program() {
   ares::platform = this;
   fb.resize(512 * 480);
+  audioRing.assign(size_t(audioRingFrames) * 2, 0.0f);
   systemPak = makeSystemPak();
 }
 
@@ -110,7 +111,63 @@ auto Program::video(Node::Video::Screen, const u32* data, u32 pitch, u32 width, 
   framesRendered++;
 }
 
-auto Program::audio(Node::Audio::Stream) -> void {}
+auto Program::audio(Node::Audio::Stream stream) -> void {
+  // ares calls this once a stream has resampled samples pending. Drain them
+  // into the host ring; the resampler queue is bounded so when audio output
+  // is disabled we simply leave the samples to be overwritten (the prior
+  // no-op behaviour) rather than burning cycles copying bytes nobody reads.
+  if(!audioEnabled || !stream) return;
+  f64 samples[8];  // SFC stream is stereo; size generously for safety.
+  while(stream->pending()) {
+    u32 channels = stream->read(samples);
+    float l = (float)samples[0];
+    float r = channels > 1 ? (float)samples[1] : l;
+    audioPushFrame(l, r);
+  }
+}
+
+auto Program::audioPushFrame(float l, float r) -> void {
+  uint32_t w  = audioWriteIdx.load(std::memory_order_relaxed);
+  uint32_t rd = audioReadIdx.load(std::memory_order_acquire);
+  // Ring full: drop the newest frame. An overrun is the lesser evil: the
+  // host fell behind, and dropping is silent whereas blocking would stall
+  // the emulation tick.
+  if(w - rd >= audioRingFrames) return;
+  uint32_t idx = (w & (audioRingFrames - 1)) * 2;
+  audioRing[idx]     = l;
+  audioRing[idx + 1] = r;
+  audioWriteIdx.store(w + 1, std::memory_order_release);
+}
+
+auto Program::audioRead(float* out, uint32_t frames) -> uint32_t {
+  if(!out) return 0;
+  uint32_t rd = audioReadIdx.load(std::memory_order_relaxed);
+  uint32_t w  = audioWriteIdx.load(std::memory_order_acquire);
+  uint32_t avail = w - rd;
+  uint32_t n = frames < avail ? frames : avail;
+  for(uint32_t i = 0; i < n; i++) {
+    uint32_t idx = ((rd + i) & (audioRingFrames - 1)) * 2;
+    out[i * 2]     = audioRing[idx];
+    out[i * 2 + 1] = audioRing[idx + 1];
+  }
+  audioReadIdx.store(rd + n, std::memory_order_release);
+  return n;
+}
+
+auto Program::audioAvailable() const -> uint32_t {
+  uint32_t w  = audioWriteIdx.load(std::memory_order_acquire);
+  uint32_t rd = audioReadIdx.load(std::memory_order_acquire);
+  return w - rd;
+}
+
+auto Program::setAudioEnabled(bool enable) -> void {
+  if(enable == audioEnabled) return;
+  audioEnabled = enable;
+  // Flush stale samples on either transition so re-enabling doesn't replay
+  // a buffer of silence (or audio) captured before the gap.
+  audioReadIdx.store(audioWriteIdx.load(std::memory_order_acquire),
+                  std::memory_order_release);
+}
 
 auto Program::input(Node::Input::Input node) -> void {
   // node is shared_ptr<Core::Input::Input>; downcast to Button.

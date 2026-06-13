@@ -352,6 +352,11 @@ final class Emulator {
     private(set) var fbHeight: UInt32 = 0
 
     private var handle: OpaquePointer?
+    /// CoreAudio output, lazily created once the emulator handle exists.
+    /// Driven alongside the run loop: started on resume, stopped on pause
+    /// so a halted/breakpointed emulator falls silent instead of looping
+    /// the last buffered samples.
+    private var audioOutput: AudioOutput?
     private var runTimer: Timer?
     private var lastFpsTime: Date = .now
     /// Snapshot of `kintsuki_frame_count` at the last fps tick. Diffing
@@ -427,6 +432,9 @@ final class Emulator {
             NSLog("kintsuki: WARN no Bundle.main.resourcePath")
         }
         handle = kintsuki_create()
+        if let h = handle {
+            audioOutput = AudioOutput(handle: h)
+        }
         loadRecents()
         installRewindKeyMonitor()
         installPauseKeyMonitor()
@@ -466,6 +474,12 @@ final class Emulator {
             if let mon = pauseKeyMonitor {
                 NSEvent.removeMonitor(mon)
             }
+            // Tear down audio before the handle: the render callback reads
+            // through `handle`, and `engine.stop()` blocks until the audio
+            // thread has quiesced, so no callback can be mid-read when we
+            // free the core.
+            audioOutput?.stop()
+            audioOutput = nil
             if let h = handle {
                 kintsuki_destroy(h)
             }
@@ -1205,12 +1219,14 @@ final class Emulator {
         timer.tolerance = 1.0 / 240.0
         RunLoop.main.add(timer, forMode: .common)
         runTimer = timer
+        audioOutput?.start()
         NSLog("kintsuki: run loop started")
     }
 
     private func stopRunLoop() {
         runTimer?.invalidate()
         runTimer = nil
+        audioOutput?.stop()
         NSLog("kintsuki: run loop stopped")
     }
 

@@ -254,6 +254,12 @@ void kintsuki_reset(kintsuki_t* h) {
   g_callstack.clear();
 }
 
+int kintsuki_rom_is_hirom(kintsuki_t* h) {
+  if(!h || !h->program) return 0;
+  if(h->program->romSize() == 0) return 0;
+  return h->program->romIsHiRom() ? 1 : 0;
+}
+
 void kintsuki_set_srm_sidecar(kintsuki_t* h, int enable) {
   if(!h) return;
   h->program->loadSrmSidecar = (enable != 0);
@@ -572,6 +578,31 @@ const uint32_t* kintsuki_framebuffer(kintsuki_t* h, uint32_t* out_w, uint32_t* o
 
 int kintsuki_screenshot(kintsuki_t* h, const char* path) {
   return (h && h->program->writeScreenshot(path)) ? 1 : 0;
+}
+
+void kintsuki_audio_set_enabled(kintsuki_t* h, int enable) {
+  if(!h) return;
+  h->program->setAudioEnabled(enable != 0);
+}
+
+int kintsuki_audio_is_enabled(kintsuki_t* h) {
+  if(!h) return 0;
+  return h->program->audioEnabledState() ? 1 : 0;
+}
+
+double kintsuki_audio_sample_rate(kintsuki_t* h) {
+  (void)h;
+  return Program::audioSampleRate;
+}
+
+uint32_t kintsuki_audio_read(kintsuki_t* h, float* out, uint32_t frames) {
+  if(!h) return 0;
+  return h->program->audioRead(out, frames);
+}
+
+uint32_t kintsuki_audio_available(kintsuki_t* h) {
+  if(!h) return 0;
+  return h->program->audioAvailable();
 }
 
 // 1 when the PPU is in BGMODE 5/6 or pseudo-hires (each emitted column
