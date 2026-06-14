@@ -400,6 +400,30 @@ final class Emulator {
     /// savestate without fighting menu shortcuts.
     private let escKeyCode: UInt16 = 0x35
     private var pauseKeyMonitor: Any?
+    /// Virtual key code for Tab. Held = fast-forward (frame limiter
+    /// bypassed, emulate as fast as the host allows); released = normal
+    /// real-time pacing resumes.
+    private let tabKeyCode: UInt16 = 0x30
+    private var fastForwardKeyMonitor: Any?
+
+    // ----- Frame limiter ---------------------------------------------------
+    /// Target wall-clock interval per emulated frame (SNES NTSC =
+    /// 60.0988 Hz). `tick()` paces emulation to this so a fast host
+    /// doesn't run the game faster than the console did.
+    private let targetFrameInterval: TimeInterval = 1.0 / 60.0988
+    /// Wall-clock anchor the paced scheduler advances one frame-interval
+    /// at a time. nil = resync to now on the next tick (set on resume and
+    /// when leaving fast-forward).
+    private var pacingAnchor: Date?
+    /// Upper bound on frames run in a single paced tick. Caps catch-up
+    /// after a host stall so a hitch doesn't trigger a runaway burst.
+    private let maxCatchupFrames = 4
+    /// Wall-clock budget for one fast-forward tick. Bounds how long the
+    /// main actor stays inside the emulation burst so the UI keeps
+    /// painting (and key/menu events still land) while Tab is held.
+    private let fastForwardBudget: TimeInterval = 0.010
+    /// True while Tab is held: the limiter is bypassed.
+    private(set) var fastForward = false
     /// True while the user is actively scrubbing backwards (a CMD+←
     /// fired in the last `rewindHoldTimeout` seconds). While held, the
     /// run loop suspends forward emulation so `tick()` doesn't re-push
@@ -438,6 +462,7 @@ final class Emulator {
         loadRecents()
         installRewindKeyMonitor()
         installPauseKeyMonitor()
+        installFastForwardKeyMonitor()
         // Auto-reload the most recent ROM so a fresh app launch lands
         // straight back in the previous session's game. NSOpenPanel
         // only fires when the user explicitly wants a different ROM.
@@ -472,6 +497,9 @@ final class Emulator {
                 NSEvent.removeMonitor(mon)
             }
             if let mon = pauseKeyMonitor {
+                NSEvent.removeMonitor(mon)
+            }
+            if let mon = fastForwardKeyMonitor {
                 NSEvent.removeMonitor(mon)
             }
             // Tear down audio before the handle: the render callback reads
@@ -520,6 +548,37 @@ final class Emulator {
                 self.rewindBy(frames: stride)
                 return nil  // consume so the menu shortcut doesn't double-fire
             }
+    }
+
+    /// Tab held = fast-forward. Watches keyDown/keyUp so the bypass is
+    /// active only while the key is physically down (classic emulator
+    /// fast-forward UX). Passes the event through untouched when a text
+    /// field is being edited so Tab still does focus traversal in the
+    /// debugger's "Go to..." field, the memory editor, etc.
+    private func installFastForwardKeyMonitor() {
+        fastForwardKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp])
+            { [weak self] event in
+                guard let self else { return event }
+                guard event.keyCode == self.tabKeyCode,
+                      event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
+                      self.loadedROM != nil,
+                      !self.isEditingText
+                else { return event }
+                if event.type == .keyDown {
+                    // isARepeat fires while held; setting the flag is
+                    // idempotent so we just swallow the repeats.
+                    self.fastForward = true
+                } else {
+                    self.fastForward = false
+                }
+                return nil  // consume so Tab doesn't also traverse focus
+            }
+    }
+
+    /// True when the key window's first responder is a text field / field
+    /// editor, so a typed Tab belongs to text editing, not the emulator.
+    private var isEditingText: Bool {
+        NSApp.keyWindow?.firstResponder is NSText
     }
 
     // ----- ROM lifecycle ---------------------------------------------------
@@ -1240,15 +1299,82 @@ final class Emulator {
         ticking = true
         defer { ticking = false }
         if rewindHolding { return }
+
+        // The Timer fires at ~60Hz; the limiter decides how many frames
+        // that fire is actually allowed to advance. Paced mode runs the
+        // frames whose wall-clock deadline has passed (normally 1, zero
+        // when we're ahead of schedule, which is the speed cap). Fast-
+        // forward bypasses the clock and emulates flat-out within a time
+        // budget.
+        let framesRun = fastForward ? runUnlimited(h) : runPaced(h)
+
+        // Only repaint / re-read registers when a frame actually advanced
+        // so an early "ahead of schedule" tick costs nothing. The halting
+        // breakpoint path inside advanceOneFrame already re-snapshots CPU
+        // state at the bail boundary.
+        if framesRun > 0 {
+            snapshotFramebuffer()
+            snapshotCpuState()
+        }
+        updateFps(h)
+    }
+
+    /// Real-time scheduler: advance only the frames whose wall-clock
+    /// deadline has elapsed since `pacingAnchor`, capped at
+    /// `maxCatchupFrames`. Returns the number of frames advanced.
+    private func runPaced(_ h: OpaquePointer) -> Int {
+        let now = Date.now
+        guard let anchor = pacingAnchor else {
+            // First tick after a resume / fast-forward release: anchor to
+            // now and emit one frame so the picture moves immediately.
+            pacingAnchor = now
+            _ = advanceOneFrame(h, captureRewind: true)
+            return 1
+        }
+        let due = Int(now.timeIntervalSince(anchor) / targetFrameInterval)
+        if due < 1 { return 0 }  // ahead of schedule: the limiter holds
+        let toRun = min(due, maxCatchupFrames)
+        var run = 0
+        for _ in 0..<toRun {
+            run += 1
+            if advanceOneFrame(h, captureRewind: true) { break }
+        }
+        // Advance the anchor by the frames we were due. When the host fell
+        // behind by more than the cap, resync to now rather than letting
+        // an unbounded deficit accumulate into a perpetual catch-up burst.
+        pacingAnchor = due > maxCatchupFrames
+            ? now
+            : anchor.addingTimeInterval(Double(due) * targetFrameInterval)
+        return run
+    }
+
+    /// Fast-forward scheduler: emulate frames back-to-back until the
+    /// wall-clock budget for this tick is spent (or the CPU halts). Rewind
+    /// capture is skipped so the buffer isn't flooded with skipped frames.
+    /// Returns the number of frames advanced.
+    private func runUnlimited(_ h: OpaquePointer) -> Int {
+        let deadline = Date.now.addingTimeInterval(fastForwardBudget)
+        var run = 0
+        repeat {
+            run += 1
+            if advanceOneFrame(h, captureRewind: false) { break }
+        } while Date.now < deadline
+        // Leaving fast-forward should resync the real-time clock cleanly.
+        pacingAnchor = nil
+        return run
+    }
+
+    /// Advance exactly one emulated frame. Returns true when the burst
+    /// should stop: either the CPU is STP-halted or a halting breakpoint
+    /// fired this frame (in which case the run loop is paused here).
+    private func advanceOneFrame(_ h: OpaquePointer, captureRewind: Bool) -> Bool {
         // Read CPU state cheaply before runFrames so we can short-circuit
         // when the CPU is already halted — runFrames would otherwise spin
         // a full frame's worth of cycles on STP for no progress.
         var rawCpu = kintsuki_cpu_state_t()
         kintsuki_get_state(h, &rawCpu)
-        if rawCpu.stp != 0 {
-            snapshotCpuState()
-            return
-        }
+        if rawCpu.stp != 0 { return true }
+
         kintsuki_run_frames(h, 1)
         // Rewind capture goes through `kintsuki_save_state` which calls
         // `System::serialize(true)` → `scheduler.enter(Synchronize)`,
@@ -1257,34 +1383,31 @@ final class Emulator {
         // address to wherever the sync lands. Skip capture this tick
         // when a halt is pending; the next normal tick (post-resume)
         // will resume capture.
-        if pendingBreakpointHaltId == nil {
+        if captureRewind && pendingBreakpointHaltId == nil {
             captureRewindFrame()
         }
-        snapshotFramebuffer()
-        snapshotCpuState()
         // Halting breakpoint hit during this frame? Pause the run loop
         // so the user can inspect. The callback's hop to main has
-        // already updated `pendingBreakpointHaltId` by the time the
-        // bail-induced early return lands here.
+        // already updated `pendingBreakpointHaltId` by now.
         if pendingBreakpointHaltId != nil && running {
             // Drop any one-shot run-to-cursor breakpoints so they don't
             // accumulate in the user-visible BP list.
             consumeRunToCursorBPs()
-            // Re-snapshot the CPU register file at the bail boundary —
-            // the earlier `snapshotCpuState()` runs before the halt
-            // bookkeeping below, but we want to make absolutely sure
-            // the @Published `cpuState` matches the BP address before
-            // the debugger's onReceive subscribers fire.
+            // Snapshot the CPU register file at the bail boundary so the
+            // @Published `cpuState` matches the BP address before the
+            // debugger's onReceive subscribers fire.
             snapshotCpuState()
             running = false
             stopRunLoop()
-            // Populate the backtrace snapshot the debugger surface
-            // reads. Without this the sidebar showed
-            // "(running — pause to capture)" even though we'd just
-            // halted on a breakpoint.
+            // Populate the backtrace snapshot the debugger surface reads.
             refreshBacktrace()
             NSLog(String(format: "kintsuki: paused on breakpoint at %06X", cpuState.pc))
+            return true
         }
+        return false
+    }
+
+    private func updateFps(_ h: OpaquePointer) {
         let now = Date.now
         let elapsed = now.timeIntervalSince(lastFpsTime)
         if elapsed >= 0.5 {
