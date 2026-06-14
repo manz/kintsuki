@@ -605,6 +605,51 @@ uint32_t kintsuki_audio_available(kintsuki_t* h) {
   return h->program->audioAvailable();
 }
 
+// ---- ROM-free SPC700 audio path -----------------------------------------
+// See kintsuki.h for the boot/install/run/drain contract.
+
+int kintsuki_spc_boot(kintsuki_t* h) {
+  if(!h) return 0;
+  if(!h->program->bootSpc()) return 0;
+  // Fresh power-up: any retained call frames describe a chain that no
+  // longer exists. Keep parity with kintsuki_load_rom.
+  g_callstack.clear();
+  return 1;
+}
+
+void kintsuki_spc_write_aram(kintsuki_t* h, uint32_t addr,
+                             const uint8_t* data, uint32_t len) {
+  if(!h) return;
+  h->program->aramWrite(addr, data, len);
+}
+
+uint32_t kintsuki_spc_read_aram(kintsuki_t* h, uint32_t addr,
+                                uint8_t* out, uint32_t len) {
+  if(!h || !out) return 0;
+  h->program->aramRead(addr, out, len);
+  return len;
+}
+
+void kintsuki_spc_set_pc(kintsuki_t* h, uint16_t pc) {
+  if(!h) return;
+  h->program->smpSetPc(pc);
+}
+
+void kintsuki_spc_write_port(kintsuki_t* h, int port, uint8_t value) {
+  if(!h) return;
+  h->program->smpWritePort(port, value);
+}
+
+uint8_t kintsuki_spc_read_port(kintsuki_t* h, int port) {
+  if(!h) return 0;
+  return h->program->smpReadPort(port);
+}
+
+uint32_t kintsuki_spc_run_samples(kintsuki_t* h, uint32_t frames) {
+  if(!h) return 0;
+  return h->program->runSpcSamples(frames);
+}
+
 // 1 when the PPU is in BGMODE 5/6 or pseudo-hires (each emitted column
 // is a real pixel), 0 in normal mode (every other column is a dupe).
 // Lets Python `framebuffer()` collapse the doubled output the same way

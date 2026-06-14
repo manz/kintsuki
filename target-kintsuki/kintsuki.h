@@ -241,6 +241,84 @@ uint32_t kintsuki_audio_read(kintsuki_t*, float* out, uint32_t frames);
 // Stereo frames currently queued.
 uint32_t kintsuki_audio_available(kintsuki_t*);
 
+// ---- ROM-free SPC700 audio path -----------------------------------------
+// Drive ONLY the SPC700 (smp) + S-DSP (dsp) over a 64KB ARAM image, with no
+// SNES cartridge loaded. Intended for hosts (e.g. a music tracker) that want
+// to audition a SNES sound driver + samples + song without a full game ROM.
+//
+// Backing store: the 64KB ARAM is `dsp.apuram`, the single array both the
+// SPC700 and the S-DSP read and write. `kintsuki_spc_write_aram` copies into
+// it directly; the SPC700 sees those bytes through its normal memory map.
+//
+// How ROM-free boot works: `kintsuki_spc_boot` powers the emulator with the
+// System pak only (boards.bml + ipl.rom). The IPL ROM is the SPC700's own
+// 64-byte boot ROM and is legitimately required - SMP power reseeds the SPC
+// reset vector from it. NO cartridge slot is connected, so the 65816 main CPU
+// has no program mapped and idle-runs on open-bus. That is harmless: the
+// SPC700 and S-DSP run on their own Thread clocks and produce audio
+// independently of what the main CPU does. (The ares scheduler still uses the
+// CPU as master clock; it just executes nothing useful. This is the documented
+// limitation of the ROM-free path - we idle-run the CPU.)
+//
+// Typical sequence:
+//   kintsuki_t* k = kintsuki_create();
+//   kintsuki_audio_set_enabled(k, 1);
+//   kintsuki_spc_boot(k);
+//   kintsuki_spc_write_aram(k, 0x0400, driver,  driver_len);   // driver code
+//   kintsuki_spc_write_aram(k, 0x2000, samples, samples_len);  // BRR bank
+//   kintsuki_spc_write_aram(k, 0xC000, song,    song_len);     // song stream
+//   kintsuki_spc_set_pc(k, 0x0400);          // jump the driver into action
+//   kintsuki_spc_write_port(k, 0, 0x01);     // optional: "play song 1" cmd
+//   // render loop:
+//   kintsuki_spc_run_samples(k, 800);        // advance ~800 stereo frames
+//   float buf[800*2];
+//   uint32_t got = kintsuki_audio_read(k, buf, 800);  // drain the ring
+//
+// Output format is identical to the ROM audio path: interleaved stereo
+// float32 at `kintsuki_audio_sample_rate` (48000 Hz).
+
+// Power up smp + dsp with no cartridge (System pak / IPL only). Returns 1 on
+// success, 0 on failure (System pak missing, etc.). Additive: does not touch
+// the ROM path - you can still kintsuki_load_rom on a fresh handle instead.
+int      kintsuki_spc_boot(kintsuki_t*);
+
+// Copy `len` bytes of `data` into ARAM at `addr`. Wraps at the 64KB boundary
+// (addr is masked per-byte to 16 bits). Use this to install the driver code,
+// the BRR sample bank, the song event stream, and any DSP register shadow.
+void     kintsuki_spc_write_aram(kintsuki_t*, uint32_t addr,
+                                 const uint8_t* data, uint32_t len);
+// Read `len` bytes of ARAM at `addr` into `out` (wraps at 64KB). Returns
+// bytes copied. Handy for verifying an install or reading driver scratch.
+uint32_t kintsuki_spc_read_aram(kintsuki_t*, uint32_t addr,
+                                uint8_t* out, uint32_t len);
+
+// Set the SPC700 program counter. Simplest way to start a driver running:
+// after installing it in ARAM, point the SPC at its entry (e.g. 0x0400) and
+// it begins executing on the next `kintsuki_spc_run_samples`. This bypasses
+// the real IPL upload handshake - we just set PC directly.
+void     kintsuki_spc_set_pc(kintsuki_t*, uint16_t pc);
+
+// Poke / peek the four CPU<->SPC communication ports. `port` is 0..3:
+//   write -> CPU->SPC direction ($2140-$2143 host side, read at $F4-$F7 on
+//            the SPC). This is how the main CPU hands the driver a command,
+//            e.g. "play song N" or "set volume".
+//   read  -> SPC->CPU direction (what the driver wrote back at $F4-$F7),
+//            useful for reading a handshake / ack / status byte.
+// Out-of-range ports are ignored (write) / return 0 (read).
+void     kintsuki_spc_write_port(kintsuki_t*, int port, uint8_t value);
+uint8_t  kintsuki_spc_read_port(kintsuki_t*, int port);
+
+// Advance smp + dsp until at least `frames` additional stereo frames have
+// been pushed into the audio ring (or an internal safety cap is hit), then
+// return the number of frames actually produced. Requires audio to be
+// enabled - returns 0 otherwise (the ring is the only sink). The host drains
+// the produced audio with the existing `kintsuki_audio_read`.
+//
+// Render in chunks no larger than the ring capacity (~8192 frames). If you
+// ask for more than the ring can hold without draining, the surplus is
+// dropped on overrun and the call returns once it stops making progress.
+uint32_t kintsuki_spc_run_samples(kintsuki_t*, uint32_t frames);
+
 // Input. mask bits: Up=0 Down=1 Left=2 Right=3 B=4 A=5 Y=6 X=7 L=8 R=9 Select=10 Start=11
 void        kintsuki_set_input(kintsuki_t*, int port, uint16_t mask);
 void        kintsuki_press(kintsuki_t*, int port, int button, int pressed);

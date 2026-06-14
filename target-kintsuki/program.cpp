@@ -344,6 +344,87 @@ auto Program::softReset() -> void {
   SuperFamicom::system.power(true);
 }
 
+auto Program::bootSpc() -> bool {
+  // Same core bring-up as bootRom but with NO cartridge connected. The
+  // System pak still supplies ipl.rom, which is the SPC700 boot ROM that
+  // SMP::power() copies into smp.iplrom and uses to seed the SPC reset
+  // vector ($FFFE/$FFFF -> iplrom[62..63]). The cartridge slot is left
+  // unallocated, so Cartridge::connect() never runs and the CPU bus has no
+  // ROM mapped; the 65816 then idle-runs on open-bus, which is harmless -
+  // the SPC700 + S-DSP tick on their own Thread clocks and produce audio
+  // regardless of what the CPU master does.
+  SuperFamicom::ppu.setAccurate(false);
+
+  Node::System root;
+  string profile = "[Nintendo] Super Famicom (NTSC)";
+  if(!SuperFamicom::load(root, profile)) return false;
+
+  // Deliberately skip the Cartridge port allocate/connect. Controller ports
+  // are irrelevant to audio playback, so we leave them alone too.
+  SuperFamicom::system.power(false);
+  loaded = true;
+  return true;
+}
+
+auto Program::aramWrite(u32 addr, const u8* data, u32 len) -> void {
+  if(!data) return;
+  auto& aram = SuperFamicom::dsp.apuram;
+  for(u32 i = 0; i < len; i++) {
+    aram[(addr + i) & 0xffff] = data[i];
+  }
+}
+
+auto Program::aramRead(u32 addr, u8* out, u32 len) -> void {
+  if(!out) return;
+  auto& aram = SuperFamicom::dsp.apuram;
+  for(u32 i = 0; i < len; i++) {
+    out[i] = aram[(addr + i) & 0xffff];
+  }
+}
+
+auto Program::smpSetPc(u16 pc) -> void {
+  SuperFamicom::smp.r.pc.w = pc;
+}
+
+auto Program::smpWritePort(int port, u8 value) -> void {
+  if(port < 0 || port > 3) return;
+  // portWrite is the CPU->SPC direction: it sets io.apu0..3, which the
+  // SPC reads back at $F4-$F7. This is exactly how the main CPU hands the
+  // sound driver a command (e.g. "play song N").
+  SuperFamicom::smp.portWrite((unsigned)port, value);
+}
+
+auto Program::smpReadPort(int port) const -> u8 {
+  if(port < 0 || port > 3) return 0;
+  // portRead is the SPC->CPU direction: io.cpu0..3, what the driver wrote
+  // back for the host to observe (handshake / status).
+  return SuperFamicom::smp.portRead((unsigned)port);
+}
+
+auto Program::runSpcSamples(u32 frames) -> u32 {
+  if(!loaded || frames == 0) return 0;
+  if(!audioEnabled) return 0;
+  SuperFamicom::kintsukiHaltRequested = false;
+  uint32_t start = audioAvailable();
+  uint32_t target = frames;  // frames to accumulate on top of whatever is queued
+  // The DSP emits one stereo frame every 768 apu clocks (32kHz native),
+  // resampled to 48kHz before hitting the ring. Spin the scheduler until
+  // the ring has grown by `frames`. Cap generously so a misconfigured run
+  // (audio draining concurrently, etc.) cannot wedge forever.
+  uint64_t spin = 0;
+  uint64_t spinCap = (uint64_t)frames * 100'000ull + 1'000'000ull;
+  uint32_t produced = 0;
+  while(produced < target && spin++ < spinCap) {
+    SuperFamicom::system.run();
+    uint32_t now = audioAvailable();
+    // audioAvailable is unsigned ring depth; if the host drains between
+    // iterations it can shrink, so track the high-water delta from start.
+    produced = now >= start ? (now - start) : 0;
+    if(SuperFamicom::kintsukiHaltRequested) break;
+  }
+  return produced;
+}
+
 auto Program::injectSram(const u8* data, u32 len) -> u32 {
   if(!loaded || !data) return 0;
   auto& ram = SuperFamicom::cartridge.ram;

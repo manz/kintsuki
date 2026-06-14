@@ -60,6 +60,30 @@ struct Program : ares::Platform {
   auto bootRom() -> bool;
   auto runFrames(u32 n) -> void;
   auto softReset() -> void;
+
+  // ---- ROM-free SPC700 audio path ---------------------------------------
+  // Bring the emulator up with the System pak (boards.bml + ipl.rom) but no
+  // cartridge, so the SPC700 (smp) + S-DSP (dsp) are powered and tickable.
+  // See kintsuki.h for the full boot/install/run/drain contract.
+  auto bootSpc() -> bool;
+  // Copy `len` bytes of `data` into the shared 64KB ARAM (dsp.apuram) at
+  // `addr`, wrapping at the 64KB boundary. ARAM is the single backing store
+  // both smp and dsp read/write.
+  auto aramWrite(u32 addr, const u8* data, u32 len) -> void;
+  auto aramRead(u32 addr, u8* out, u32 len) -> void;
+  // Set the SPC700 program counter (jump the driver into action).
+  auto smpSetPc(u16 pc) -> void;
+  // Poke a CPU->SPC communication port. `port` 0..3 maps to $2140-$2143 on
+  // the CPU side / $F4-$F7 on the SPC side.
+  auto smpWritePort(int port, u8 value) -> void;
+  auto smpReadPort(int port) const -> u8;
+  // Advance smp+dsp (driven by the scheduler) until at least `frames`
+  // additional stereo audio frames have been pushed into the ring, or a
+  // safety spin cap is hit. Returns frames actually produced. Requires
+  // audio to be enabled (otherwise the ring never fills; returns 0).
+  auto runSpcSamples(u32 frames) -> u32;
+  // True once bootSpc (or bootRom) has powered the system.
+  auto isLoaded() const -> bool { return loaded; }
   auto injectSram(const u8* data, u32 len) -> u32;
 
   // Memory: CPU bus (24-bit address)
