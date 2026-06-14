@@ -9,6 +9,7 @@
 
 from __future__ import annotations
 
+import array
 import ctypes
 import os
 import re
@@ -963,6 +964,57 @@ class Emu:
 
     def screenshot(self, path: str) -> bool:
         return bool(_native.lib.kintsuki_screenshot(self._handle, path.encode("utf-8")))
+
+    # ---------------------------------------------------------------- audio
+    # ares resamples the SPC/DSP output to a fixed stereo stream the core
+    # buffers in a ring. Enable capture, run frames, then drain with
+    # :meth:`read_audio` to assert against the emulated sound / music.
+    def enable_audio(self, enabled: bool = True) -> None:
+        """Toggle audio capture. Off by default; when off, ``run_frames``
+        produces no samples and the ring stays empty (zero overhead for
+        non-audio tests). Toggling flushes any buffered samples so a fresh
+        capture starts clean."""
+        _native.lib.kintsuki_audio_set_enabled(self._handle, 1 if enabled else 0)
+
+    @property
+    def audio_enabled(self) -> bool:
+        return bool(_native.lib.kintsuki_audio_is_enabled(self._handle))
+
+    @property
+    def audio_sample_rate(self) -> float:
+        """Output sample rate in Hz (48000). One emulated NTSC frame is
+        roughly ``sample_rate / 60.0988`` ≈ 799 stereo frames."""
+        return float(_native.lib.kintsuki_audio_sample_rate(self._handle))
+
+    def audio_available(self) -> int:
+        """Stereo frames currently queued in the capture ring."""
+        return int(_native.lib.kintsuki_audio_available(self._handle))
+
+    def read_audio(self, max_frames: int | None = None) -> array.array:
+        """Drain up to ``max_frames`` stereo frames (default: all queued)
+        from the capture ring. Returns an ``array('f')`` of interleaved
+        left/right float32 samples in ``[-1.0, 1.0]`` (length =
+        ``frames * 2``). Empty when capture is disabled or nothing is
+        buffered.
+
+        Typical test shape::
+
+            emu.enable_audio()
+            emu.run_frames(60)
+            buf = emu.read_audio()          # ~96000 floats (1s stereo)
+            assert max(abs(s) for s in buf) > 0.01   # not silent
+        """
+        avail = self.audio_available()
+        frames = avail if max_frames is None else min(avail, max_frames)
+        out = array.array("f", bytes(frames * 2 * 4))
+        if frames == 0:
+            return out
+        buf = (ctypes.c_float * (frames * 2)).from_buffer(out)
+        got = int(_native.lib.kintsuki_audio_read(self._handle, buf, frames))
+        if got != frames:
+            del buf
+            return out[: got * 2]
+        return out
 
     # ----------------------------------------------------------------- Input
     def set_input(self, port: int, mask: int) -> None:

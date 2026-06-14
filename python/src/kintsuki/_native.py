@@ -13,6 +13,8 @@ from ctypes import (
     POINTER,
     Structure,
     c_char_p,
+    c_double,
+    c_float,
     c_int,
     c_int8,
     c_size_t,
@@ -319,6 +321,13 @@ LOAD_FLAG_INJECT_ONLY = 1 << 2
 
 _bind("kintsuki_load_state_ex", c_int,
       [HANDLE, c_void_p, c_uint32, POINTER(LoadStateOpts)])
+
+# Audio
+_bind("kintsuki_audio_set_enabled", None, [HANDLE, c_int])
+_bind("kintsuki_audio_is_enabled", c_int, [HANDLE])
+_bind("kintsuki_audio_sample_rate", c_double, [HANDLE])
+_bind("kintsuki_audio_read", c_uint32, [HANDLE, POINTER(c_float), c_uint32])
+_bind("kintsuki_audio_available", c_uint32, [HANDLE])
 
 # Framebuffer / screenshot
 _bind("kintsuki_framebuffer", POINTER(c_uint32), [HANDLE, POINTER(c_uint32), POINTER(c_uint32)])
