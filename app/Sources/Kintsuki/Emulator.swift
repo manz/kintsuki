@@ -1708,6 +1708,26 @@ final class Emulator {
         }
     }
 
+    /// True when the loaded cart uses HiROM mapping. False for LoROM or
+    /// when no ROM is bound. Used by viewers to convert linear ROM
+    /// offsets to bus addresses correctly.
+    var romIsHiRom: Bool {
+        guard let h = handle else { return false }
+        return kintsuki_rom_is_hirom(h) != 0
+    }
+
+    /// Map a linear ROM offset to a 24-bit CPU bus address using the
+    /// currently bound cart's mapper. HiROM uses the $C0-$FF mirror
+    /// (full $0000-$FFFF window); LoROM uses banks $00+/$8000-$FFFF.
+    func romOffsetToBus(_ offset: UInt32) -> UInt32 {
+        if romIsHiRom {
+            let bank = (offset >> 16) & 0x3F
+            return ((0xC0 | bank) << 16) | (offset & 0xFFFF)
+        }
+        let bank = offset / 0x8000
+        return (bank << 16) | 0x8000 | (offset & 0x7FFF)
+    }
+
     func readRegion(_ region: MemRegion, offset: UInt32, length: Int) -> Data {
         guard let h = handle else { return Data() }
         var buf = [UInt8](repeating: 0, count: length)
@@ -1716,13 +1736,11 @@ final class Emulator {
             case .wram:
                 _ = kintsuki_read_range(h, 0x7E0000 + offset, UInt32(length), ptr.baseAddress)
             case .rom:
-                // LoROM: bank 00-7D, $8000-$FFFF. Walk the bus to surface
-                // whatever the cart mapping sees.
+                // Walk the bus through the active mapper so the viewer
+                // surfaces exactly what the CPU would see.
                 for i in 0..<length {
                     let abs = offset + UInt32(i)
-                    let bank = abs / 0x8000
-                    let addr = (bank << 16) | 0x8000 | (abs & 0x7FFF)
-                    ptr[i] = kintsuki_read_u8(h, addr)
+                    ptr[i] = kintsuki_read_u8(h, romOffsetToBus(abs))
                 }
             case .sram:
                 // LoROM SRAM: $70:0000-$7D:FFFF. Mirror per-bank.
@@ -1755,9 +1773,7 @@ final class Emulator {
         case .wram:
             kintsuki_write_u8(h, 0x7E0000 + offset, byte)
         case .rom:
-            let bank = offset / 0x8000
-            let addr = (bank << 16) | 0x8000 | (offset & 0x7FFF)
-            kintsuki_write_u8(h, addr, byte)
+            kintsuki_write_u8(h, romOffsetToBus(offset), byte)
         case .sram:
             let addr = (UInt32(0x70) << 16) | (offset & 0xFFFF)
             kintsuki_write_u8(h, addr, byte)
