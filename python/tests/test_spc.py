@@ -60,3 +60,72 @@ def test_spc_program_sets_dsp_register():
         # PC is parked on the spin (BRA at $0408); a run can stop mid-
         # instruction, so accept the opcode or its operand byte.
         assert emu.spc_state().pc in (0x0408, 0x0409)
+
+
+def _install_program(emu):
+    # MOV A,#$0C / MOV $F2,A / MOV A,#$7F / MOV $F3,A / BRA *  @ $0400
+    prog = bytes([0xE8, 0x0C, 0xC4, 0xF2, 0xE8, 0x7F, 0xC4, 0xF3, 0x2F, 0xFE])
+    emu.spc_boot()
+    emu.enable_audio()
+    emu.aram_write(0x0400, prog)
+    emu.spc_set_pc(0x0400)
+    return prog
+
+
+def test_spc_disassemble():
+    from kintsuki import Emu
+    with Emu() as emu:
+        _install_program(emu)
+        lines = emu.spc_disassemble(0x0400, 5)
+        assert [ln.pc for ln in lines] == [0x0400, 0x0402, 0x0404, 0x0406, 0x0408]
+        assert [ln.length for ln in lines] == [2, 2, 2, 2, 2]
+        assert lines[0].text.startswith("lda #$0c")   # MOV A,#imm
+        assert lines[4].text.startswith("bra")        # the spin
+
+
+def test_spc_step():
+    from kintsuki import Emu
+    with Emu() as emu:
+        _install_program(emu)
+        assert emu.spc_state().pc == 0x0400
+        emu.spc_step()                 # MOV A,#$0C
+        assert emu.spc_state().pc == 0x0402
+        assert emu.spc_state().a == 0x0C
+        emu.spc_step()                 # MOV $F2,A
+        assert emu.spc_state().pc == 0x0404
+
+
+def test_spc_run_until():
+    from kintsuki import Emu
+    with Emu() as emu:
+        _install_program(emu)
+        hit = emu.spc_run_until(0x0408, max_insns=100)
+        assert hit
+        assert emu.spc_state().pc == 0x0408
+        # The driver wrote MVOLL on the way.
+        assert emu.dsp_global().main_vol_l == 0x7F
+
+
+def test_spc_exec_breakpoint():
+    from kintsuki import Emu
+    hits = []
+    with Emu() as emu:
+        _install_program(emu)
+        emu.spc_add_exec_callback(0x0406, 0x0406,
+                                  lambda pc, v: hits.append(pc), halt=True)
+        emu.spc_run_samples(64)
+        assert hits == [0x0406]
+        # Stopped at the breakpoint before executing $0406.
+        assert emu.spc_state().pc == 0x0406
+
+
+def test_spc_write_watch():
+    from kintsuki import Emu
+    writes = []
+    with Emu() as emu:
+        _install_program(emu)
+        # $F3 is the DSP data port; watch the driver poke it.
+        emu.spc_add_write_callback(0x00F3, 0x00F3,
+                                   lambda addr, val: writes.append((addr, val)))
+        emu.spc_run_samples(64)
+        assert (0x00F3, 0x7F) in writes

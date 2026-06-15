@@ -339,6 +339,43 @@ void kintsuki_spc_set_state(kintsuki_t*, const kintsuki_spc_state_t* in);
 // kintsuki_spc_read_aram window.
 uint32_t kintsuki_dsp_registers(kintsuki_t*, uint8_t* out, uint32_t len);
 
+// ---- SPC700 execution debug ---------------------------------------------
+// Breakpoints / single-step / run-until / disassembly for the audio CPU,
+// the SMP-side analogue of the main-CPU debug surface. `kind` reuses the
+// KINTSUKI_CB_* enum (exec / read / write); addresses are 16-bit ARAM.
+
+// Register a SPC700 callback. Fires fn(addr, value, userdata) on exec (value
+// 0), read (byte read), or write (byte written) within [lo, hi]. Returns a
+// 1-based id (pass to remove), 0 on failure.
+int  kintsuki_spc_add_callback(kintsuki_t*, int kind, uint32_t lo, uint32_t hi,
+                               kintsuki_cb_t fn, void* userdata);
+// Same, but when `halt` is non-zero the run stops at the next safe SMP
+// instruction boundary after the callback fires (a real breakpoint).
+int  kintsuki_spc_add_callback_ex(kintsuki_t*, int kind, uint32_t lo, uint32_t hi,
+                                  int halt, kintsuki_cb_t fn, void* userdata);
+void kintsuki_spc_remove_callback(kintsuki_t*, int kind, int id);
+
+// Execute exactly one SPC700 instruction (the one at the current SMP PC).
+void kintsuki_spc_step(kintsuki_t*);
+
+// Run the SMP until its PC reaches `pc`, capped at `max_insns` SPC700
+// instructions (0 = a large internal default). Returns 1 if the target was
+// hit, 0 if the cap tripped first.
+int  kintsuki_spc_run_until(kintsuki_t*, uint16_t pc, uint32_t max_insns);
+
+// Disassemble `count` consecutive SPC700 instructions starting at `pc`.
+// Renders via ares' own SPC700 disassembler; the direct-page base follows
+// the live P flag. Returns the number of entries written.
+typedef struct {
+  uint16_t pc;
+  uint8_t  length;   // 1..3 bytes
+  uint8_t  _pad;
+  char     text[64];
+} kintsuki_spc_disasm_line_t;
+
+uint32_t kintsuki_spc_disassemble_at(kintsuki_t*, uint16_t pc, uint32_t count,
+                                     kintsuki_spc_disasm_line_t* out);
+
 // Input. mask bits: Up=0 Down=1 Left=2 Right=3 B=4 A=5 Y=6 X=7 L=8 R=9 Select=10 Start=11
 void        kintsuki_set_input(kintsuki_t*, int port, uint16_t mask);
 void        kintsuki_press(kintsuki_t*, int port, int button, int pressed);

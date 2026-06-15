@@ -286,6 +286,18 @@ class SpcState:
 
 
 @dataclass(frozen=True)
+class SpcInsn:
+    """One disassembled SPC700 instruction."""
+
+    pc: int
+    length: int
+    text: str
+
+    def __str__(self) -> str:
+        return f"{self.pc:04X}: {self.text}"
+
+
+@dataclass(frozen=True)
 class DspVoice:
     """One of the 8 S-DSP voices, decoded from its 16-byte register block."""
 
@@ -1204,6 +1216,74 @@ class Emu:
             echo_delay=r[0x7D],
             fir=tuple(_s8(r[0x0F + i * 0x10]) for i in range(8)),
         )
+
+    # --- SPC700 execution debug: step / run-until / disasm / breakpoints ---
+    def spc_step(self) -> SpcState:
+        """Execute exactly one SPC700 instruction; returns the new state."""
+        _native.lib.kintsuki_spc_step(self._handle)
+        return self.spc_state()
+
+    def spc_run_until(self, pc: int, max_insns: int = 0) -> bool:
+        """Run the SMP until its PC reaches `pc` (capped at `max_insns`
+        SPC700 instructions; 0 = large default). True if hit."""
+        return bool(_native.lib.kintsuki_spc_run_until(
+            self._handle, pc & 0xFFFF, max_insns))
+
+    def spc_disassemble(self, pc: int | None = None, count: int = 1) -> list[SpcInsn]:
+        """Disassemble `count` SPC700 instructions from `pc` (default: the
+        current SMP PC)."""
+        if pc is None:
+            pc = self.spc_state().pc
+        buf = (_native.SpcDisasmLine * count)()
+        n = _native.lib.kintsuki_spc_disassemble_at(
+            self._handle, pc & 0xFFFF, count, buf)
+        return [
+            SpcInsn(pc=buf[i].pc, length=buf[i].length,
+                    text=buf[i].text.decode("ascii", "replace").rstrip())
+            for i in range(n)
+        ]
+
+    def _spc_add_callback(self, kind: int, lo: int, hi: int,
+                          fn: Callable[[int, int], None], halt: bool) -> int:
+        def trampoline(addr, value, _ud):
+            fn(int(addr), int(value))
+
+        c_fn = _native.CALLBACK(trampoline)
+        cb_id = _native.lib.kintsuki_spc_add_callback_ex(
+            self._handle, kind, lo & 0xFFFF, hi & 0xFFFF, 1 if halt else 0, c_fn, None)
+        if cb_id == 0:
+            raise RuntimeError("spc add_callback failed")
+        # kind is offset by 0x100 in the registry bookkeeping so SPC and CPU
+        # callback ids don't collide in self._registered.
+        self._registered.append(
+            _Registered(kind=0x100 | kind, cb_id=cb_id, trampoline=c_fn))
+        return cb_id
+
+    def spc_add_exec_callback(self, lo: int, hi: int,
+                              fn: Callable[[int, int], None],
+                              halt: bool = False) -> int:
+        """Fire `fn(pc, 0)` before each SPC700 instruction in [lo, hi].
+        `halt=True` stops the run at that instruction (breakpoint)."""
+        return self._spc_add_callback(CB_EXEC, lo, hi, fn, halt)
+
+    def spc_add_read_callback(self, lo: int, hi: int,
+                              fn: Callable[[int, int], None],
+                              halt: bool = False) -> int:
+        """Fire `fn(addr, value)` on each SPC700 ARAM read in [lo, hi]."""
+        return self._spc_add_callback(CB_READ, lo, hi, fn, halt)
+
+    def spc_add_write_callback(self, lo: int, hi: int,
+                               fn: Callable[[int, int], None],
+                               halt: bool = False) -> int:
+        """Fire `fn(addr, value)` on each SPC700 ARAM write in [lo, hi]."""
+        return self._spc_add_callback(CB_WRITE, lo, hi, fn, halt)
+
+    def spc_remove_callback(self, kind: int, cb_id: int) -> None:
+        _native.lib.kintsuki_spc_remove_callback(self._handle, kind, cb_id)
+        self._registered = [
+            r for r in self._registered
+            if not (r.kind == (0x100 | kind) and r.cb_id == cb_id)
+        ]
 
     # ----------------------------------------------------------------- Input
     def set_input(self, port: int, mask: int) -> None:

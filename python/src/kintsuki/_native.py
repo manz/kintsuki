@@ -347,6 +347,29 @@ _bind("kintsuki_spc_get_state", None, [HANDLE, POINTER(SpcStateRaw)])
 _bind("kintsuki_spc_set_state", None, [HANDLE, POINTER(SpcStateRaw)])
 _bind("kintsuki_dsp_registers", c_uint32, [HANDLE, POINTER(c_uint8), c_uint32])
 
+
+class SpcDisasmLine(Structure):
+    """One disassembled SPC700 instruction."""
+
+    _fields_ = [
+        ("pc", c_uint16),
+        ("length", c_uint8),
+        ("_pad", c_uint8),
+        ("text", ctypes.c_char * 64),
+    ]
+
+
+# SPC700 execution debug (breakpoints reuse the CB_* enum / CALLBACK type).
+_bind("kintsuki_spc_add_callback", c_int,
+      [HANDLE, c_int, c_uint32, c_uint32, CALLBACK, c_void_p])
+_bind("kintsuki_spc_add_callback_ex", c_int,
+      [HANDLE, c_int, c_uint32, c_uint32, c_int, CALLBACK, c_void_p])
+_bind("kintsuki_spc_remove_callback", None, [HANDLE, c_int, c_int])
+_bind("kintsuki_spc_step", None, [HANDLE])
+_bind("kintsuki_spc_run_until", c_int, [HANDLE, c_uint16, c_uint32])
+_bind("kintsuki_spc_disassemble_at", c_uint32,
+      [HANDLE, c_uint16, c_uint32, POINTER(SpcDisasmLine)])
+
 # Audio
 _bind("kintsuki_audio_set_enabled", None, [HANDLE, c_int])
 _bind("kintsuki_audio_is_enabled", c_int, [HANDLE])

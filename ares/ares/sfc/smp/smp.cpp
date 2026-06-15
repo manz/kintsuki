@@ -25,6 +25,13 @@ auto SMP::main() -> void {
   if(r.stop) return instructionStop();
 
   debugger.instruction();
+  if(smpExecHook) smpExecHook(r.pc.w);
+  // kintsuki: an SMP hook may flag a bail to stop emulation at this safe
+  // instruction boundary (breakpoint / step). Yield so system.run() returns.
+  if(kintsukiSmpBailRequested) {
+    kintsukiSmpBailRequested = false;
+    scheduler.exit(Event::Frame);
+  }
   instruction();
 }
 
