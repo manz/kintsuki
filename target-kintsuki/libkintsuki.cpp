@@ -650,6 +650,26 @@ uint32_t kintsuki_spc_run_samples(kintsuki_t* h, uint32_t frames) {
   return h->program->runSpcSamples(frames);
 }
 
+void kintsuki_spc_get_state(kintsuki_t* h, kintsuki_spc_state_t* out) {
+  if(!h || !out) return;
+  SpcState s = h->program->spcGetState();
+  out->pc = s.pc; out->a = s.a; out->x = s.x; out->y = s.y;
+  out->sp = s.sp; out->psw = s.psw;
+}
+
+void kintsuki_spc_set_state(kintsuki_t* h, const kintsuki_spc_state_t* in) {
+  if(!h || !in) return;
+  SpcState s;
+  s.pc = in->pc; s.a = in->a; s.x = in->x; s.y = in->y;
+  s.sp = in->sp; s.psw = in->psw;
+  h->program->spcSetState(s);
+}
+
+uint32_t kintsuki_dsp_registers(kintsuki_t* h, uint8_t* out, uint32_t len) {
+  if(!h) return 0;
+  return h->program->dspRegisters(out, len);
+}
+
 // 1 when the PPU is in BGMODE 5/6 or pseudo-hires (each emitted column
 // is a real pixel), 0 in normal mode (every other column is a dupe).
 // Lets Python `framebuffer()` collapse the doubled output the same way

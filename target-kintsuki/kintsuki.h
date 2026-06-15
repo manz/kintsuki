@@ -319,6 +319,26 @@ uint8_t  kintsuki_spc_read_port(kintsuki_t*, int port);
 // dropped on overrun and the call returns once it stops making progress.
 uint32_t kintsuki_spc_run_samples(kintsuki_t*, uint32_t frames);
 
+// SPC700 (audio CPU) register snapshot. `psw` is the raw status byte
+// (bit0 C, 1 Z, 2 I, 3 H, 4 B, 5 P, 6 V, 7 N). A/Y are the low/high
+// halves of the YA word. Valid after kintsuki_spc_boot (or any boot).
+typedef struct {
+  uint16_t pc;
+  uint8_t  a, x, y, sp;
+  uint8_t  psw;
+} kintsuki_spc_state_t;
+
+void kintsuki_spc_get_state(kintsuki_t*, kintsuki_spc_state_t* out);
+void kintsuki_spc_set_state(kintsuki_t*, const kintsuki_spc_state_t* in);
+
+// S-DSP register file: 128 bytes ($00-$7F). Per-voice block at voice*0x10
+// (VOLL VOLR PITCHL PITCHH SRCN ADSR1 ADSR2 GAIN ENVX OUTX); globals at
+// the $.C/$.D/$.F columns (MVOL EVOL KON KOF FLG ENDX EFB PMON NON EON DIR
+// ESA EDL + 8-tap FIR). Copies min(len, 128) into `out`; returns bytes
+// copied. ARAM (the 64KB sample/echo store) is the separate
+// kintsuki_spc_read_aram window.
+uint32_t kintsuki_dsp_registers(kintsuki_t*, uint8_t* out, uint32_t len);
+
 // Input. mask bits: Up=0 Down=1 Left=2 Right=3 B=4 A=5 Y=6 X=7 L=8 R=9 Select=10 Start=11
 void        kintsuki_set_input(kintsuki_t*, int port, uint16_t mask);
 void        kintsuki_press(kintsuki_t*, int port, int button, int pressed);

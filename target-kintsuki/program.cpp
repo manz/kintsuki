@@ -401,6 +401,35 @@ auto Program::smpReadPort(int port) const -> u8 {
   return SuperFamicom::smp.portRead((unsigned)port);
 }
 
+auto Program::spcGetState() const -> SpcState {
+  auto& r = SuperFamicom::smp.r;
+  SpcState s;
+  s.pc  = r.pc.w;
+  s.a   = r.ya.byte.l;
+  s.y   = r.ya.byte.h;
+  s.x   = r.x;
+  s.sp  = r.s;
+  s.psw = (uint8_t)(u32)r.p;
+  return s;
+}
+
+auto Program::spcSetState(const SpcState& s) -> void {
+  auto& r = SuperFamicom::smp.r;
+  r.pc.w      = s.pc;
+  r.ya.byte.l = s.a;
+  r.ya.byte.h = s.y;
+  r.x         = s.x;
+  r.s         = s.sp;
+  r.p         = (n8)s.psw;
+}
+
+auto Program::dspRegisters(u8* out, u32 len) const -> u32 {
+  if(!out) return 0;
+  u32 n = len < 128 ? len : 128;
+  for(u32 i = 0; i < n; i++) out[i] = SuperFamicom::dsp.registers[i];
+  return n;
+}
+
 auto Program::runSpcSamples(u32 frames) -> u32 {
   if(!loaded || frames == 0) return 0;
   if(!audioEnabled) return 0;

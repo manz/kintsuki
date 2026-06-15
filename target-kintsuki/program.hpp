@@ -23,6 +23,13 @@ struct CpuState {
   bool     wai;  // WAI waiting for IRQ
 };
 
+// Plain SPC700 (audio CPU) register snapshot.
+struct SpcState {
+  uint16_t pc;
+  uint8_t  a, x, y, sp;
+  uint8_t  psw;   // raw status byte (c z i h b p v n, bit 0..7)
+};
+
 struct Program : ares::Platform {
   Program();
   ~Program();
@@ -77,6 +84,11 @@ struct Program : ares::Platform {
   // the CPU side / $F4-$F7 on the SPC side.
   auto smpWritePort(int port, u8 value) -> void;
   auto smpReadPort(int port) const -> u8;
+  // SPC700 register snapshot + restore, and the 128-byte S-DSP register
+  // file. Read-side inspection for tests / debuggers driving the audio core.
+  auto spcGetState() const -> SpcState;
+  auto spcSetState(const SpcState& s) -> void;
+  auto dspRegisters(u8* out, u32 len) const -> u32;
   // Advance smp+dsp (driven by the scheduler) until at least `frames`
   // additional stereo audio frames have been pushed into the ring, or a
   // safety spin cap is hit. Returns frames actually produced. Requires

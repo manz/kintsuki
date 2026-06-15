@@ -322,6 +322,31 @@ LOAD_FLAG_INJECT_ONLY = 1 << 2
 _bind("kintsuki_load_state_ex", c_int,
       [HANDLE, c_void_p, c_uint32, POINTER(LoadStateOpts)])
 
+# SPC700 / S-DSP
+class SpcStateRaw(Structure):
+    """SPC700 (audio CPU) register snapshot."""
+
+    _fields_ = [
+        ("pc", c_uint16),
+        ("a", c_uint8),
+        ("x", c_uint8),
+        ("y", c_uint8),
+        ("sp", c_uint8),
+        ("psw", c_uint8),
+    ]
+
+
+_bind("kintsuki_spc_boot", c_int, [HANDLE])
+_bind("kintsuki_spc_write_aram", None, [HANDLE, c_uint32, POINTER(c_uint8), c_uint32])
+_bind("kintsuki_spc_read_aram", c_uint32, [HANDLE, c_uint32, POINTER(c_uint8), c_uint32])
+_bind("kintsuki_spc_set_pc", None, [HANDLE, c_uint16])
+_bind("kintsuki_spc_write_port", None, [HANDLE, c_int, c_uint8])
+_bind("kintsuki_spc_read_port", c_uint8, [HANDLE, c_int])
+_bind("kintsuki_spc_run_samples", c_uint32, [HANDLE, c_uint32])
+_bind("kintsuki_spc_get_state", None, [HANDLE, POINTER(SpcStateRaw)])
+_bind("kintsuki_spc_set_state", None, [HANDLE, POINTER(SpcStateRaw)])
+_bind("kintsuki_dsp_registers", c_uint32, [HANDLE, POINTER(c_uint8), c_uint32])
+
 # Audio
 _bind("kintsuki_audio_set_enabled", None, [HANDLE, c_int])
 _bind("kintsuki_audio_is_enabled", c_int, [HANDLE])

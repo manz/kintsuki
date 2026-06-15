@@ -242,6 +242,85 @@ class _Registered:
 VRAM_BYTES = 0x10000   # 64 KB, byte-addressed
 CGRAM_BYTES = 0x200    # 256 colors × 2 bytes
 OAM_BYTES = 0x220      # 512 B sprite table + 32 B high table
+ARAM_BYTES = 0x10000   # 64 KB SPC700 / S-DSP audio RAM
+
+
+def _s8(v: int) -> int:
+    """Interpret a byte as a signed int8."""
+    return v - 256 if v >= 128 else v
+
+
+@dataclass(frozen=True)
+class SpcState:
+    """SPC700 (audio CPU) register snapshot. ``psw`` is the raw status
+    byte; the individual flags are exposed as bool properties."""
+
+    pc: int
+    a: int
+    x: int
+    y: int
+    sp: int
+    psw: int
+
+    @property
+    def c(self) -> bool: return bool(self.psw & 0x01)   # carry
+    @property
+    def z(self) -> bool: return bool(self.psw & 0x02)   # zero
+    @property
+    def i(self) -> bool: return bool(self.psw & 0x04)   # interrupt disable
+    @property
+    def h(self) -> bool: return bool(self.psw & 0x08)   # half-carry
+    @property
+    def b(self) -> bool: return bool(self.psw & 0x10)   # break
+    @property
+    def p(self) -> bool: return bool(self.psw & 0x20)   # direct-page
+    @property
+    def v(self) -> bool: return bool(self.psw & 0x40)   # overflow
+    @property
+    def n(self) -> bool: return bool(self.psw & 0x80)   # negative
+
+    @property
+    def ya(self) -> int:
+        """The 16-bit YA word (Y high, A low)."""
+        return (self.y << 8) | self.a
+
+
+@dataclass(frozen=True)
+class DspVoice:
+    """One of the 8 S-DSP voices, decoded from its 16-byte register block."""
+
+    index: int
+    vol_l: int      # signed int8
+    vol_r: int      # signed int8
+    pitch: int      # 14-bit
+    srcn: int       # sample source (BRR directory index)
+    adsr1: int
+    adsr2: int
+    gain: int
+    envx: int       # current envelope (0..127)
+    outx: int       # current sample output (signed int8)
+
+
+@dataclass(frozen=True)
+class DspGlobal:
+    """S-DSP global (non per-voice) register state."""
+
+    main_vol_l: int     # signed
+    main_vol_r: int     # signed
+    echo_vol_l: int     # signed
+    echo_vol_r: int     # signed
+    kon: int            # key-on bitmask (1 bit per voice)
+    kof: int            # key-off bitmask
+    flg: int            # reset/mute/echo-write/noise-clock
+    endx: int           # BRR end-of-sample bitmask
+    echo_feedback: int  # signed
+    pitch_mod: int      # PMON bitmask
+    noise_enable: int   # NON bitmask
+    echo_enable: int    # EON bitmask
+    src_dir: int        # sample directory page (×0x100 in ARAM)
+    echo_start: int     # echo buffer page (×0x100 in ARAM)
+    echo_delay: int     # EDL (echo buffer length)
+    fir: tuple[int, ...]  # 8 signed FIR coefficients
 
 
 class Emu:
@@ -1015,6 +1094,116 @@ class Emu:
             del buf
             return out[: got * 2]
         return out
+
+    # ----------------------------------------------------------- SPC700 / DSP
+    # Drive and inspect the audio subsystem (SPC700 + S-DSP) over its 64KB
+    # ARAM, with or without a cartridge. `spc_boot` brings the audio core up
+    # standalone; the inspection accessors also work on a normally-booted ROM.
+    def spc_boot(self) -> None:
+        """Power the SPC700 + S-DSP with no cartridge (System pak / IPL
+        only), so a driver can be installed straight into ARAM. Raises on
+        failure (e.g. missing System pak)."""
+        if not _native.lib.kintsuki_spc_boot(self._handle):
+            raise RuntimeError("spc_boot failed (System pak missing?)")
+
+    def aram_write(self, addr: int, data: bytes | bytearray) -> None:
+        """Write `data` into ARAM at `addr` (wraps at 64 KB)."""
+        buf = (ctypes.c_uint8 * len(data))(*data)
+        _native.lib.kintsuki_spc_write_aram(self._handle, addr, buf, len(data))
+
+    def aram_read(self, addr: int = 0, length: int | None = None) -> memoryview:
+        """Read ARAM. Default: the full 64 KB from `addr`. Returns a
+        ``memoryview`` over a freshly-allocated buffer (zero-copy)."""
+        if length is None:
+            length = ARAM_BYTES - addr
+        buf = (ctypes.c_uint8 * length)()
+        n = _native.lib.kintsuki_spc_read_aram(self._handle, addr, buf, length)
+        return memoryview(buf)[:n]
+
+    def spc_set_pc(self, pc: int) -> None:
+        """Point the SPC700 program counter at `pc` (driver entry)."""
+        _native.lib.kintsuki_spc_set_pc(self._handle, pc & 0xFFFF)
+
+    def spc_write_port(self, port: int, value: int) -> None:
+        """Write a CPU->SPC comm port (0..3 -> $2140-$2143 / $F4-$F7)."""
+        _native.lib.kintsuki_spc_write_port(self._handle, port, value & 0xFF)
+
+    def spc_read_port(self, port: int) -> int:
+        """Read an SPC->CPU comm port (what the driver wrote back)."""
+        return int(_native.lib.kintsuki_spc_read_port(self._handle, port))
+
+    def spc_run_samples(self, frames: int) -> int:
+        """Advance smp + dsp until at least `frames` stereo audio frames
+        are produced; returns the count actually pushed. Requires audio
+        enabled (the ring is the only sink). Drain with :meth:`read_audio`."""
+        return int(_native.lib.kintsuki_spc_run_samples(self._handle, frames))
+
+    def spc_state(self) -> SpcState:
+        """Snapshot the SPC700 registers."""
+        raw = _native.SpcStateRaw()
+        _native.lib.kintsuki_spc_get_state(self._handle, ctypes.byref(raw))
+        return SpcState(pc=raw.pc, a=raw.a, x=raw.x, y=raw.y, sp=raw.sp, psw=raw.psw)
+
+    def spc_set_state(self, state: SpcState) -> None:
+        """Restore SPC700 registers from a :class:`SpcState`."""
+        raw = _native.SpcStateRaw(
+            pc=state.pc & 0xFFFF, a=state.a & 0xFF, x=state.x & 0xFF,
+            y=state.y & 0xFF, sp=state.sp & 0xFF, psw=state.psw & 0xFF,
+        )
+        _native.lib.kintsuki_spc_set_state(self._handle, ctypes.byref(raw))
+
+    def dsp_registers(self) -> bytes:
+        """The raw 128-byte S-DSP register file ($00-$7F)."""
+        buf = (ctypes.c_uint8 * 128)()
+        n = _native.lib.kintsuki_dsp_registers(self._handle, buf, 128)
+        return bytes(buf[:n])
+
+    def dsp_voice(self, index: int, regs: bytes | None = None) -> DspVoice:
+        """Decode one S-DSP voice (0..7). Pass `regs` from a prior
+        :meth:`dsp_registers` to decode several voices off one snapshot."""
+        if not 0 <= index <= 7:
+            raise ValueError("voice index must be 0..7")
+        r = regs if regs is not None else self.dsp_registers()
+        b = index * 0x10
+        return DspVoice(
+            index=index,
+            vol_l=_s8(r[b + 0x0]),
+            vol_r=_s8(r[b + 0x1]),
+            pitch=(r[b + 0x2] | (r[b + 0x3] << 8)) & 0x3FFF,
+            srcn=r[b + 0x4],
+            adsr1=r[b + 0x5],
+            adsr2=r[b + 0x6],
+            gain=r[b + 0x7],
+            envx=r[b + 0x8] & 0x7F,
+            outx=_s8(r[b + 0x9]),
+        )
+
+    def dsp_voices(self, regs: bytes | None = None) -> list[DspVoice]:
+        """Decode all 8 voices from one register snapshot."""
+        r = regs if regs is not None else self.dsp_registers()
+        return [self.dsp_voice(i, r) for i in range(8)]
+
+    def dsp_global(self, regs: bytes | None = None) -> DspGlobal:
+        """Decode the S-DSP global register state."""
+        r = regs if regs is not None else self.dsp_registers()
+        return DspGlobal(
+            main_vol_l=_s8(r[0x0C]),
+            main_vol_r=_s8(r[0x1C]),
+            echo_vol_l=_s8(r[0x2C]),
+            echo_vol_r=_s8(r[0x3C]),
+            kon=r[0x4C],
+            kof=r[0x5C],
+            flg=r[0x6C],
+            endx=r[0x7C],
+            echo_feedback=_s8(r[0x0D]),
+            pitch_mod=r[0x2D],
+            noise_enable=r[0x3D],
+            echo_enable=r[0x4D],
+            src_dir=r[0x5D],
+            echo_start=r[0x6D],
+            echo_delay=r[0x7D],
+            fir=tuple(_s8(r[0x0F + i * 0x10]) for i in range(8)),
+        )
 
     # ----------------------------------------------------------------- Input
     def set_input(self, port: int, mask: int) -> None:
