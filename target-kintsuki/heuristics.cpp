@@ -90,7 +90,10 @@ bool detectRom(std::span<const uint8_t> rom, RomInfo& info) {
 
   uint8_t map = rom[off + 0x15];
   info.fastRom = (map & 0x10) != 0;
-  info.exHiRom = (map & 0x20) != 0;   // bit5 = ExHiROM
+  // Map mode is the LOW nibble: 0=LoROM, 1=HiROM, 5=ExHiROM. The high
+  // nibble is 0x2/0x3 on every normal cart, so testing bit5 flagged all
+  // of them as ExHiROM and mapped them at base=0x400000.
+  info.exHiRom = (map & 0x0f) == 0x05;
 
   // SRAM size byte at $D8: bytes = 1024 << val (Nintendo SHVC convention).
   // val=3 → 8 KB (typical), val=5 → 32 KB. Cap to 256 KB.
