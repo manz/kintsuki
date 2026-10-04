@@ -30,6 +30,11 @@ final class AudioOutput {
     private static let maxRenderFrames = 4096
     private var scratch: UnsafeMutablePointer<Float>?
 
+    /// Mute gates the mixer, not sample production: the core keeps
+    /// filling the ring and the render callback keeps draining it, so
+    /// unmuting resumes in sync instead of replaying a stale backlog.
+    private(set) var muted = false
+
     init(handle: OpaquePointer) {
         self.handle = handle
     }
@@ -85,6 +90,7 @@ final class AudioOutput {
 
         engine.attach(node)
         engine.connect(node, to: engine.mainMixerNode, format: format)
+        engine.mainMixerNode.outputVolume = muted ? 0 : 1
         sourceNode = node
 
         kintsuki_audio_set_enabled(handle, 1)
@@ -96,6 +102,13 @@ final class AudioOutput {
             kintsuki_audio_set_enabled(handle, 0)
             NSLog("kintsuki: audio engine start failed: \(error.localizedDescription)")
         }
+    }
+
+    /// Silence (or restore) the output without tearing the engine down.
+    /// Safe to call before ``start()``; the level is applied on start.
+    func setMuted(_ value: Bool) {
+        muted = value
+        if running { engine.mainMixerNode.outputVolume = value ? 0 : 1 }
     }
 
     /// Stop output and gate sample production in the core. Idempotent.

@@ -12,6 +12,15 @@ final class Emulator {
     private(set) var loadedROM: URL?
     private(set) var recentROMs: [URL] = []
     private let recentsKey = "kintsuki.recentROMs"
+    private let mutedKey = "kintsuki.audioMuted"
+    /// Audio mute, persisted across launches. Applied to the mixer, so
+    /// pausing/resuming or reloading a ROM keeps the user's choice.
+    var muted: Bool = UserDefaults.standard.bool(forKey: "kintsuki.audioMuted") {
+        didSet {
+            UserDefaults.standard.set(muted, forKey: mutedKey)
+            audioOutput?.setMuted(muted)
+        }
+    }
     private let recentsLimit = 10
     private(set) var lastFrameID: UInt64 = 0
     private(set) var fps: Double = 0
@@ -457,7 +466,9 @@ final class Emulator {
         }
         handle = kintsuki_create()
         if let h = handle {
-            audioOutput = AudioOutput(handle: h)
+            let out = AudioOutput(handle: h)
+            out.setMuted(muted)
+            audioOutput = out
         }
         loadRecents()
         installRewindKeyMonitor()
@@ -1701,7 +1712,7 @@ final class Emulator {
             case .wram:  return 0x20000   // 128 KB
             case .rom:   return 0x800000  // generous; reads return open bus past end
             case .sram:  return 0x10000   // up to 64 KB SRAM (mapped via bus)
-            case .vram:  return 0x10000
+            case .vram:  return 0x20000   // upper bound; live size is Emulator.vramBytes
             case .cgram: return 0x200
             case .oam:   return 0x220
             }
@@ -1788,7 +1799,14 @@ final class Emulator {
     }
 
     // ----- Cached PPU dumps (rebuilt at most ~6 Hz) -----------------------
-    private var vramCache = Data(count: 0x10000)
+    /// Live PPU VRAM size: 64 KB stock, 128 KB with the VA15 mod. Set on the
+    /// core before the ROM is loaded; viewers size their pages off this.
+    var vramBytes: Int {
+        guard let h = handle else { return 0x10000 }
+        return Int(kintsuki_vram_size(h))
+    }
+
+    private var vramCache = Data(count: 0x20000)   // max; trimmed to vramBytes on refresh
     private var cgramCache = Data(count: 0x200)
     private var paletteCache = [(UInt8, UInt8, UInt8)](repeating: (0,0,0), count: 256)
     private var tileImageCache: [Int: NSImage] = [:]      // keyed by base+sub-palette
@@ -1801,8 +1819,10 @@ final class Emulator {
         if lastFrameID < lastInspectorRefresh + 10 { return false }
         lastInspectorRefresh = lastFrameID
         guard let h = handle else { return false }
+        let vbytes = Int(kintsuki_vram_size(h))
+        if vramCache.count != vbytes { vramCache = Data(count: vbytes) }
         vramCache.withUnsafeMutableBytes {
-            _ = kintsuki_vram_dump(h, $0.bindMemory(to: UInt8.self).baseAddress, 0x10000)
+            _ = kintsuki_vram_dump(h, $0.bindMemory(to: UInt8.self).baseAddress, UInt32(vbytes))
         }
         cgramCache.withUnsafeMutableBytes {
             _ = kintsuki_cgram_dump(h, $0.bindMemory(to: UInt8.self).baseAddress, 0x200)

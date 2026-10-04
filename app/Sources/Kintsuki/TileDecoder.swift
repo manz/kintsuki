@@ -39,25 +39,25 @@ struct TileDecoder {
                          out: UnsafeMutablePointer<UInt8>, dstStride: Int,
                          dstX: Int, dstY: Int) {
         let bytes = bpp.tileBytes
-        // VRAM is a 64KB ring; tile bases wrap.
-        let base = (charBase + tileIndex * bytes) & 0xFFFF
-        // Fast path: tile entirely inside [0, 0x10000).
+        // VRAM is a ring sized by vramSize (64KB or 128KB w/ the VA15 mod); tile bases wrap.
+        let bmask = vramSize - 1                       // 0xFFFF @64KB, 0x1FFFF @128KB
+        let base = (charBase + tileIndex * bytes) & bmask
         for y in 0..<8 {
             let srcY = vflip ? (7 - y) : y
-            let p01_lo = vram[(base + srcY * 2)     & 0xFFFF]
-            let p01_hi = vram[(base + srcY * 2 + 1) & 0xFFFF]
+            let p01_lo = vram[(base + srcY * 2)     & bmask]
+            let p01_hi = vram[(base + srcY * 2 + 1) & bmask]
             var p23_lo: UInt8 = 0, p23_hi: UInt8 = 0
             var p45_lo: UInt8 = 0, p45_hi: UInt8 = 0
             var p67_lo: UInt8 = 0, p67_hi: UInt8 = 0
             if bpp == .bpp4 || bpp == .bpp8 {
-                p23_lo = vram[(base + 16 + srcY * 2)     & 0xFFFF]
-                p23_hi = vram[(base + 16 + srcY * 2 + 1) & 0xFFFF]
+                p23_lo = vram[(base + 16 + srcY * 2)     & bmask]
+                p23_hi = vram[(base + 16 + srcY * 2 + 1) & bmask]
             }
             if bpp == .bpp8 {
-                p45_lo = vram[(base + 32 + srcY * 2)     & 0xFFFF]
-                p45_hi = vram[(base + 32 + srcY * 2 + 1) & 0xFFFF]
-                p67_lo = vram[(base + 48 + srcY * 2)     & 0xFFFF]
-                p67_hi = vram[(base + 48 + srcY * 2 + 1) & 0xFFFF]
+                p45_lo = vram[(base + 32 + srcY * 2)     & bmask]
+                p45_hi = vram[(base + 32 + srcY * 2 + 1) & bmask]
+                p67_lo = vram[(base + 48 + srcY * 2)     & bmask]
+                p67_hi = vram[(base + 48 + srcY * 2 + 1) & bmask]
             }
             for x in 0..<8 {
                 let srcX = hflip ? x : (7 - x)
@@ -86,7 +86,6 @@ struct TileDecoder {
                 out[off + 1] = c.1
                 out[off + 2] = c.2
                 out[off + 3] = 0xFF
-                _ = vramSize  // silence unused, asserts at boundary not needed (VRAM is 64KB ring)
             }
         }
     }
