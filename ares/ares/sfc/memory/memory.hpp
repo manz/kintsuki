@@ -63,3 +63,16 @@ extern BusHook memWriteHook;
 // 24-bit PC (cpu.r.pc.d).
 using ExecHook = void (*)(u32 pc);
 extern ExecHook execHook;
+
+// SPC700 (audio CPU) hooks, the SMP-side analogue of the CPU hooks above.
+// smpExecHook fires before each SPC700 instruction with the 16-bit SMP PC;
+// smpReadHook/smpWriteHook fire on every SMP bus read/write (16-bit ARAM
+// address + byte). Null by default; branch folded out when unset.
+using SmpExecHook = void (*)(u16 pc);
+using SmpBusHook  = void (*)(u16 addr, u8 value);
+extern SmpExecHook smpExecHook;
+extern SmpBusHook  smpReadHook;
+extern SmpBusHook  smpWriteHook;
+// Sticky bail: an SMP hook sets this to stop emulation at a safe SMP
+// instruction boundary (breakpoint / step). Checked in SMP::main.
+extern volatile bool kintsukiSmpBailRequested;

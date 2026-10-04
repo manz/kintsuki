@@ -71,6 +71,7 @@ auto makeSystemPak() -> std::shared_ptr<vfs::directory> {
 Program::Program() {
   ares::platform = this;
   fb.resize(512 * 480);
+  audioRing.assign(size_t(audioRingFrames) * 2, 0.0f);
   systemPak = makeSystemPak();
 }
 
@@ -110,7 +111,63 @@ auto Program::video(Node::Video::Screen, const u32* data, u32 pitch, u32 width, 
   framesRendered++;
 }
 
-auto Program::audio(Node::Audio::Stream) -> void {}
+auto Program::audio(Node::Audio::Stream stream) -> void {
+  // ares calls this once a stream has resampled samples pending. Drain them
+  // into the host ring; the resampler queue is bounded so when audio output
+  // is disabled we simply leave the samples to be overwritten (the prior
+  // no-op behaviour) rather than burning cycles copying bytes nobody reads.
+  if(!audioEnabled || !stream) return;
+  f64 samples[8];  // SFC stream is stereo; size generously for safety.
+  while(stream->pending()) {
+    u32 channels = stream->read(samples);
+    float l = (float)samples[0];
+    float r = channels > 1 ? (float)samples[1] : l;
+    audioPushFrame(l, r);
+  }
+}
+
+auto Program::audioPushFrame(float l, float r) -> void {
+  uint32_t w  = audioWriteIdx.load(std::memory_order_relaxed);
+  uint32_t rd = audioReadIdx.load(std::memory_order_acquire);
+  // Ring full: drop the newest frame. An overrun is the lesser evil: the
+  // host fell behind, and dropping is silent whereas blocking would stall
+  // the emulation tick.
+  if(w - rd >= audioRingFrames) return;
+  uint32_t idx = (w & (audioRingFrames - 1)) * 2;
+  audioRing[idx]     = l;
+  audioRing[idx + 1] = r;
+  audioWriteIdx.store(w + 1, std::memory_order_release);
+}
+
+auto Program::audioRead(float* out, uint32_t frames) -> uint32_t {
+  if(!out) return 0;
+  uint32_t rd = audioReadIdx.load(std::memory_order_relaxed);
+  uint32_t w  = audioWriteIdx.load(std::memory_order_acquire);
+  uint32_t avail = w - rd;
+  uint32_t n = frames < avail ? frames : avail;
+  for(uint32_t i = 0; i < n; i++) {
+    uint32_t idx = ((rd + i) & (audioRingFrames - 1)) * 2;
+    out[i * 2]     = audioRing[idx];
+    out[i * 2 + 1] = audioRing[idx + 1];
+  }
+  audioReadIdx.store(rd + n, std::memory_order_release);
+  return n;
+}
+
+auto Program::audioAvailable() const -> uint32_t {
+  uint32_t w  = audioWriteIdx.load(std::memory_order_acquire);
+  uint32_t rd = audioReadIdx.load(std::memory_order_acquire);
+  return w - rd;
+}
+
+auto Program::setAudioEnabled(bool enable) -> void {
+  if(enable == audioEnabled) return;
+  audioEnabled = enable;
+  // Flush stale samples on either transition so re-enabling doesn't replay
+  // a buffer of silence (or audio) captured before the gap.
+  audioReadIdx.store(audioWriteIdx.load(std::memory_order_acquire),
+                  std::memory_order_release);
+}
 
 auto Program::input(Node::Input::Input node) -> void {
   // node is shared_ptr<Core::Input::Input>; downcast to Button.
@@ -277,6 +334,10 @@ auto Program::bootRom() -> bool {
     }
   }
 
+  // PPU::power() latches vram.mask from this setting, so it has to be set
+  // between load() (which creates the node) and the first power().
+  SuperFamicom::ppuPerformanceImpl.vramSize->setValue(vramSizeBytes);
+
   SuperFamicom::system.power(false);
   loaded = true;
   return true;
@@ -285,6 +346,116 @@ auto Program::bootRom() -> bool {
 auto Program::softReset() -> void {
   if(!loaded) return;
   SuperFamicom::system.power(true);
+}
+
+auto Program::bootSpc() -> bool {
+  // Same core bring-up as bootRom but with NO cartridge connected. The
+  // System pak still supplies ipl.rom, which is the SPC700 boot ROM that
+  // SMP::power() copies into smp.iplrom and uses to seed the SPC reset
+  // vector ($FFFE/$FFFF -> iplrom[62..63]). The cartridge slot is left
+  // unallocated, so Cartridge::connect() never runs and the CPU bus has no
+  // ROM mapped; the 65816 then idle-runs on open-bus, which is harmless -
+  // the SPC700 + S-DSP tick on their own Thread clocks and produce audio
+  // regardless of what the CPU master does.
+  SuperFamicom::ppu.setAccurate(false);
+
+  Node::System root;
+  string profile = "[Nintendo] Super Famicom (NTSC)";
+  if(!SuperFamicom::load(root, profile)) return false;
+
+  // Deliberately skip the Cartridge port allocate/connect. Controller ports
+  // are irrelevant to audio playback, so we leave them alone too.
+  SuperFamicom::system.power(false);
+  loaded = true;
+  return true;
+}
+
+auto Program::aramWrite(u32 addr, const u8* data, u32 len) -> void {
+  if(!data) return;
+  auto& aram = SuperFamicom::dsp.apuram;
+  for(u32 i = 0; i < len; i++) {
+    aram[(addr + i) & 0xffff] = data[i];
+  }
+}
+
+auto Program::aramRead(u32 addr, u8* out, u32 len) -> void {
+  if(!out) return;
+  auto& aram = SuperFamicom::dsp.apuram;
+  for(u32 i = 0; i < len; i++) {
+    out[i] = aram[(addr + i) & 0xffff];
+  }
+}
+
+auto Program::smpSetPc(u16 pc) -> void {
+  SuperFamicom::smp.r.pc.w = pc;
+}
+
+auto Program::smpWritePort(int port, u8 value) -> void {
+  if(port < 0 || port > 3) return;
+  // portWrite is the CPU->SPC direction: it sets io.apu0..3, which the
+  // SPC reads back at $F4-$F7. This is exactly how the main CPU hands the
+  // sound driver a command (e.g. "play song N").
+  SuperFamicom::smp.portWrite((unsigned)port, value);
+}
+
+auto Program::smpReadPort(int port) const -> u8 {
+  if(port < 0 || port > 3) return 0;
+  // portRead is the SPC->CPU direction: io.cpu0..3, what the driver wrote
+  // back for the host to observe (handshake / status).
+  return SuperFamicom::smp.portRead((unsigned)port);
+}
+
+auto Program::spcGetState() const -> SpcState {
+  auto& r = SuperFamicom::smp.r;
+  SpcState s;
+  s.pc  = r.pc.w;
+  s.a   = r.ya.byte.l;
+  s.y   = r.ya.byte.h;
+  s.x   = r.x;
+  s.sp  = r.s;
+  s.psw = (uint8_t)(u32)r.p;
+  return s;
+}
+
+auto Program::spcSetState(const SpcState& s) -> void {
+  auto& r = SuperFamicom::smp.r;
+  r.pc.w      = s.pc;
+  r.ya.byte.l = s.a;
+  r.ya.byte.h = s.y;
+  r.x         = s.x;
+  r.s         = s.sp;
+  r.p         = (n8)s.psw;
+}
+
+auto Program::dspRegisters(u8* out, u32 len) const -> u32 {
+  if(!out) return 0;
+  u32 n = len < 128 ? len : 128;
+  for(u32 i = 0; i < n; i++) out[i] = SuperFamicom::dsp.registers[i];
+  return n;
+}
+
+auto Program::runSpcSamples(u32 frames) -> u32 {
+  if(!loaded || frames == 0) return 0;
+  if(!audioEnabled) return 0;
+  SuperFamicom::kintsukiHaltRequested = false;
+  uint32_t start = audioAvailable();
+  uint32_t target = frames;  // frames to accumulate on top of whatever is queued
+  // The DSP emits one stereo frame every 768 apu clocks (32kHz native),
+  // resampled to 48kHz before hitting the ring. Spin the scheduler until
+  // the ring has grown by `frames`. Cap generously so a misconfigured run
+  // (audio draining concurrently, etc.) cannot wedge forever.
+  uint64_t spin = 0;
+  uint64_t spinCap = (uint64_t)frames * 100'000ull + 1'000'000ull;
+  uint32_t produced = 0;
+  while(produced < target && spin++ < spinCap) {
+    SuperFamicom::system.run();
+    uint32_t now = audioAvailable();
+    // audioAvailable is unsigned ring depth; if the host drains between
+    // iterations it can shrink, so track the high-water delta from start.
+    produced = now >= start ? (now - start) : 0;
+    if(SuperFamicom::kintsukiHaltRequested) break;
+  }
+  return produced;
 }
 
 auto Program::injectSram(const u8* data, u32 len) -> u32 {
@@ -330,14 +501,15 @@ auto Program::memWrite(u32 addr, u8 val) -> void {
   SuperFamicom::bus.write(addr & 0xffffff, val);
 }
 
-// VRAM lives in the performance PPU's vram member (n16[64K]).
+// VRAM lives in the performance PPU's vram member (n16[64K] array = 128KB phys).
+// Mask-track vram.mask so tooling reaches the upper bank when 128K VRAM is enabled.
 auto Program::vramRead(u32 addr) -> u8 {
-  uint16_t word = SuperFamicom::ppuPerformanceImpl.vram.data[(addr >> 1) & 0x7fff];
+  uint16_t word = SuperFamicom::ppuPerformanceImpl.vram.data[(addr >> 1) & SuperFamicom::ppuPerformanceImpl.vram.mask];
   return (addr & 1) ? (word >> 8) : (word & 0xff);
 }
 
 auto Program::vramWrite(u32 addr, u8 val) -> void {
-  u32 idx = (addr >> 1) & 0x7fff;
+  u32 idx = (addr >> 1) & SuperFamicom::ppuPerformanceImpl.vram.mask;
   auto& word = SuperFamicom::ppuPerformanceImpl.vram.data[idx];
   uint16_t w = word;
   if(addr & 1) w = (w & 0x00ff) | (uint16_t(val) << 8);

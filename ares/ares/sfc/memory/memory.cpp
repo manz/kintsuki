@@ -8,6 +8,11 @@ BusHook memReadHook = nullptr;
 BusHook memWriteHook = nullptr;
 ExecHook execHook = nullptr;
 
+SmpExecHook smpExecHook = nullptr;
+SmpBusHook  smpReadHook = nullptr;
+SmpBusHook  smpWriteHook = nullptr;
+volatile bool kintsukiSmpBailRequested = false;
+
 Bus::~Bus() {
   if(lookup) delete[] lookup;
   if(target) delete[] target;

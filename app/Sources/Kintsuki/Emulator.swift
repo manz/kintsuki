@@ -12,6 +12,15 @@ final class Emulator {
     private(set) var loadedROM: URL?
     private(set) var recentROMs: [URL] = []
     private let recentsKey = "kintsuki.recentROMs"
+    private let mutedKey = "kintsuki.audioMuted"
+    /// Audio mute, persisted across launches. Applied to the mixer, so
+    /// pausing/resuming or reloading a ROM keeps the user's choice.
+    var muted: Bool = UserDefaults.standard.bool(forKey: "kintsuki.audioMuted") {
+        didSet {
+            UserDefaults.standard.set(muted, forKey: mutedKey)
+            audioOutput?.setMuted(muted)
+        }
+    }
     private let recentsLimit = 10
     private(set) var lastFrameID: UInt64 = 0
     private(set) var fps: Double = 0
@@ -352,6 +361,11 @@ final class Emulator {
     private(set) var fbHeight: UInt32 = 0
 
     private var handle: OpaquePointer?
+    /// CoreAudio output, lazily created once the emulator handle exists.
+    /// Driven alongside the run loop: started on resume, stopped on pause
+    /// so a halted/breakpointed emulator falls silent instead of looping
+    /// the last buffered samples.
+    private var audioOutput: AudioOutput?
     private var runTimer: Timer?
     private var lastFpsTime: Date = .now
     /// Snapshot of `kintsuki_frame_count` at the last fps tick. Diffing
@@ -395,6 +409,30 @@ final class Emulator {
     /// savestate without fighting menu shortcuts.
     private let escKeyCode: UInt16 = 0x35
     private var pauseKeyMonitor: Any?
+    /// Virtual key code for Tab. Held = fast-forward (frame limiter
+    /// bypassed, emulate as fast as the host allows); released = normal
+    /// real-time pacing resumes.
+    private let tabKeyCode: UInt16 = 0x30
+    private var fastForwardKeyMonitor: Any?
+
+    // ----- Frame limiter ---------------------------------------------------
+    /// Target wall-clock interval per emulated frame (SNES NTSC =
+    /// 60.0988 Hz). `tick()` paces emulation to this so a fast host
+    /// doesn't run the game faster than the console did.
+    private let targetFrameInterval: TimeInterval = 1.0 / 60.0988
+    /// Wall-clock anchor the paced scheduler advances one frame-interval
+    /// at a time. nil = resync to now on the next tick (set on resume and
+    /// when leaving fast-forward).
+    private var pacingAnchor: Date?
+    /// Upper bound on frames run in a single paced tick. Caps catch-up
+    /// after a host stall so a hitch doesn't trigger a runaway burst.
+    private let maxCatchupFrames = 4
+    /// Wall-clock budget for one fast-forward tick. Bounds how long the
+    /// main actor stays inside the emulation burst so the UI keeps
+    /// painting (and key/menu events still land) while Tab is held.
+    private let fastForwardBudget: TimeInterval = 0.010
+    /// True while Tab is held: the limiter is bypassed.
+    private(set) var fastForward = false
     /// True while the user is actively scrubbing backwards (a CMD+←
     /// fired in the last `rewindHoldTimeout` seconds). While held, the
     /// run loop suspends forward emulation so `tick()` doesn't re-push
@@ -427,9 +465,15 @@ final class Emulator {
             NSLog("kintsuki: WARN no Bundle.main.resourcePath")
         }
         handle = kintsuki_create()
+        if let h = handle {
+            let out = AudioOutput(handle: h)
+            out.setMuted(muted)
+            audioOutput = out
+        }
         loadRecents()
         installRewindKeyMonitor()
         installPauseKeyMonitor()
+        installFastForwardKeyMonitor()
         // Auto-reload the most recent ROM so a fresh app launch lands
         // straight back in the previous session's game. NSOpenPanel
         // only fires when the user explicitly wants a different ROM.
@@ -466,6 +510,15 @@ final class Emulator {
             if let mon = pauseKeyMonitor {
                 NSEvent.removeMonitor(mon)
             }
+            if let mon = fastForwardKeyMonitor {
+                NSEvent.removeMonitor(mon)
+            }
+            // Tear down audio before the handle: the render callback reads
+            // through `handle`, and `engine.stop()` blocks until the audio
+            // thread has quiesced, so no callback can be mid-read when we
+            // free the core.
+            audioOutput?.stop()
+            audioOutput = nil
             if let h = handle {
                 kintsuki_destroy(h)
             }
@@ -506,6 +559,37 @@ final class Emulator {
                 self.rewindBy(frames: stride)
                 return nil  // consume so the menu shortcut doesn't double-fire
             }
+    }
+
+    /// Tab held = fast-forward. Watches keyDown/keyUp so the bypass is
+    /// active only while the key is physically down (classic emulator
+    /// fast-forward UX). Passes the event through untouched when a text
+    /// field is being edited so Tab still does focus traversal in the
+    /// debugger's "Go to..." field, the memory editor, etc.
+    private func installFastForwardKeyMonitor() {
+        fastForwardKeyMonitor = NSEvent.addLocalMonitorForEvents(matching: [.keyDown, .keyUp])
+            { [weak self] event in
+                guard let self else { return event }
+                guard event.keyCode == self.tabKeyCode,
+                      event.modifierFlags.intersection([.command, .option, .control, .shift]).isEmpty,
+                      self.loadedROM != nil,
+                      !self.isEditingText
+                else { return event }
+                if event.type == .keyDown {
+                    // isARepeat fires while held; setting the flag is
+                    // idempotent so we just swallow the repeats.
+                    self.fastForward = true
+                } else {
+                    self.fastForward = false
+                }
+                return nil  // consume so Tab doesn't also traverse focus
+            }
+    }
+
+    /// True when the key window's first responder is a text field / field
+    /// editor, so a typed Tab belongs to text editing, not the emulator.
+    private var isEditingText: Bool {
+        NSApp.keyWindow?.firstResponder is NSText
     }
 
     // ----- ROM lifecycle ---------------------------------------------------
@@ -1205,12 +1289,14 @@ final class Emulator {
         timer.tolerance = 1.0 / 240.0
         RunLoop.main.add(timer, forMode: .common)
         runTimer = timer
+        audioOutput?.start()
         NSLog("kintsuki: run loop started")
     }
 
     private func stopRunLoop() {
         runTimer?.invalidate()
         runTimer = nil
+        audioOutput?.stop()
         NSLog("kintsuki: run loop stopped")
     }
 
@@ -1224,15 +1310,82 @@ final class Emulator {
         ticking = true
         defer { ticking = false }
         if rewindHolding { return }
+
+        // The Timer fires at ~60Hz; the limiter decides how many frames
+        // that fire is actually allowed to advance. Paced mode runs the
+        // frames whose wall-clock deadline has passed (normally 1, zero
+        // when we're ahead of schedule, which is the speed cap). Fast-
+        // forward bypasses the clock and emulates flat-out within a time
+        // budget.
+        let framesRun = fastForward ? runUnlimited(h) : runPaced(h)
+
+        // Only repaint / re-read registers when a frame actually advanced
+        // so an early "ahead of schedule" tick costs nothing. The halting
+        // breakpoint path inside advanceOneFrame already re-snapshots CPU
+        // state at the bail boundary.
+        if framesRun > 0 {
+            snapshotFramebuffer()
+            snapshotCpuState()
+        }
+        updateFps(h)
+    }
+
+    /// Real-time scheduler: advance only the frames whose wall-clock
+    /// deadline has elapsed since `pacingAnchor`, capped at
+    /// `maxCatchupFrames`. Returns the number of frames advanced.
+    private func runPaced(_ h: OpaquePointer) -> Int {
+        let now = Date.now
+        guard let anchor = pacingAnchor else {
+            // First tick after a resume / fast-forward release: anchor to
+            // now and emit one frame so the picture moves immediately.
+            pacingAnchor = now
+            _ = advanceOneFrame(h, captureRewind: true)
+            return 1
+        }
+        let due = Int(now.timeIntervalSince(anchor) / targetFrameInterval)
+        if due < 1 { return 0 }  // ahead of schedule: the limiter holds
+        let toRun = min(due, maxCatchupFrames)
+        var run = 0
+        for _ in 0..<toRun {
+            run += 1
+            if advanceOneFrame(h, captureRewind: true) { break }
+        }
+        // Advance the anchor by the frames we were due. When the host fell
+        // behind by more than the cap, resync to now rather than letting
+        // an unbounded deficit accumulate into a perpetual catch-up burst.
+        pacingAnchor = due > maxCatchupFrames
+            ? now
+            : anchor.addingTimeInterval(Double(due) * targetFrameInterval)
+        return run
+    }
+
+    /// Fast-forward scheduler: emulate frames back-to-back until the
+    /// wall-clock budget for this tick is spent (or the CPU halts). Rewind
+    /// capture is skipped so the buffer isn't flooded with skipped frames.
+    /// Returns the number of frames advanced.
+    private func runUnlimited(_ h: OpaquePointer) -> Int {
+        let deadline = Date.now.addingTimeInterval(fastForwardBudget)
+        var run = 0
+        repeat {
+            run += 1
+            if advanceOneFrame(h, captureRewind: false) { break }
+        } while Date.now < deadline
+        // Leaving fast-forward should resync the real-time clock cleanly.
+        pacingAnchor = nil
+        return run
+    }
+
+    /// Advance exactly one emulated frame. Returns true when the burst
+    /// should stop: either the CPU is STP-halted or a halting breakpoint
+    /// fired this frame (in which case the run loop is paused here).
+    private func advanceOneFrame(_ h: OpaquePointer, captureRewind: Bool) -> Bool {
         // Read CPU state cheaply before runFrames so we can short-circuit
         // when the CPU is already halted — runFrames would otherwise spin
         // a full frame's worth of cycles on STP for no progress.
         var rawCpu = kintsuki_cpu_state_t()
         kintsuki_get_state(h, &rawCpu)
-        if rawCpu.stp != 0 {
-            snapshotCpuState()
-            return
-        }
+        if rawCpu.stp != 0 { return true }
+
         kintsuki_run_frames(h, 1)
         // Rewind capture goes through `kintsuki_save_state` which calls
         // `System::serialize(true)` → `scheduler.enter(Synchronize)`,
@@ -1241,34 +1394,31 @@ final class Emulator {
         // address to wherever the sync lands. Skip capture this tick
         // when a halt is pending; the next normal tick (post-resume)
         // will resume capture.
-        if pendingBreakpointHaltId == nil {
+        if captureRewind && pendingBreakpointHaltId == nil {
             captureRewindFrame()
         }
-        snapshotFramebuffer()
-        snapshotCpuState()
         // Halting breakpoint hit during this frame? Pause the run loop
         // so the user can inspect. The callback's hop to main has
-        // already updated `pendingBreakpointHaltId` by the time the
-        // bail-induced early return lands here.
+        // already updated `pendingBreakpointHaltId` by now.
         if pendingBreakpointHaltId != nil && running {
             // Drop any one-shot run-to-cursor breakpoints so they don't
             // accumulate in the user-visible BP list.
             consumeRunToCursorBPs()
-            // Re-snapshot the CPU register file at the bail boundary —
-            // the earlier `snapshotCpuState()` runs before the halt
-            // bookkeeping below, but we want to make absolutely sure
-            // the @Published `cpuState` matches the BP address before
-            // the debugger's onReceive subscribers fire.
+            // Snapshot the CPU register file at the bail boundary so the
+            // @Published `cpuState` matches the BP address before the
+            // debugger's onReceive subscribers fire.
             snapshotCpuState()
             running = false
             stopRunLoop()
-            // Populate the backtrace snapshot the debugger surface
-            // reads. Without this the sidebar showed
-            // "(running — pause to capture)" even though we'd just
-            // halted on a breakpoint.
+            // Populate the backtrace snapshot the debugger surface reads.
             refreshBacktrace()
             NSLog(String(format: "kintsuki: paused on breakpoint at %06X", cpuState.pc))
+            return true
         }
+        return false
+    }
+
+    private func updateFps(_ h: OpaquePointer) {
         let now = Date.now
         let elapsed = now.timeIntervalSince(lastFpsTime)
         if elapsed >= 0.5 {
@@ -1562,11 +1712,31 @@ final class Emulator {
             case .wram:  return 0x20000   // 128 KB
             case .rom:   return 0x800000  // generous; reads return open bus past end
             case .sram:  return 0x10000   // up to 64 KB SRAM (mapped via bus)
-            case .vram:  return 0x10000
+            case .vram:  return 0x20000   // upper bound; live size is Emulator.vramBytes
             case .cgram: return 0x200
             case .oam:   return 0x220
             }
         }
+    }
+
+    /// True when the loaded cart uses HiROM mapping. False for LoROM or
+    /// when no ROM is bound. Used by viewers to convert linear ROM
+    /// offsets to bus addresses correctly.
+    var romIsHiRom: Bool {
+        guard let h = handle else { return false }
+        return kintsuki_rom_is_hirom(h) != 0
+    }
+
+    /// Map a linear ROM offset to a 24-bit CPU bus address using the
+    /// currently bound cart's mapper. HiROM uses the $C0-$FF mirror
+    /// (full $0000-$FFFF window); LoROM uses banks $00+/$8000-$FFFF.
+    func romOffsetToBus(_ offset: UInt32) -> UInt32 {
+        if romIsHiRom {
+            let bank = (offset >> 16) & 0x3F
+            return ((0xC0 | bank) << 16) | (offset & 0xFFFF)
+        }
+        let bank = offset / 0x8000
+        return (bank << 16) | 0x8000 | (offset & 0x7FFF)
     }
 
     func readRegion(_ region: MemRegion, offset: UInt32, length: Int) -> Data {
@@ -1577,13 +1747,11 @@ final class Emulator {
             case .wram:
                 _ = kintsuki_read_range(h, 0x7E0000 + offset, UInt32(length), ptr.baseAddress)
             case .rom:
-                // LoROM: bank 00-7D, $8000-$FFFF. Walk the bus to surface
-                // whatever the cart mapping sees.
+                // Walk the bus through the active mapper so the viewer
+                // surfaces exactly what the CPU would see.
                 for i in 0..<length {
                     let abs = offset + UInt32(i)
-                    let bank = abs / 0x8000
-                    let addr = (bank << 16) | 0x8000 | (abs & 0x7FFF)
-                    ptr[i] = kintsuki_read_u8(h, addr)
+                    ptr[i] = kintsuki_read_u8(h, romOffsetToBus(abs))
                 }
             case .sram:
                 // LoROM SRAM: $70:0000-$7D:FFFF. Mirror per-bank.
@@ -1616,9 +1784,7 @@ final class Emulator {
         case .wram:
             kintsuki_write_u8(h, 0x7E0000 + offset, byte)
         case .rom:
-            let bank = offset / 0x8000
-            let addr = (bank << 16) | 0x8000 | (offset & 0x7FFF)
-            kintsuki_write_u8(h, addr, byte)
+            kintsuki_write_u8(h, romOffsetToBus(offset), byte)
         case .sram:
             let addr = (UInt32(0x70) << 16) | (offset & 0xFFFF)
             kintsuki_write_u8(h, addr, byte)
@@ -1633,7 +1799,14 @@ final class Emulator {
     }
 
     // ----- Cached PPU dumps (rebuilt at most ~6 Hz) -----------------------
-    private var vramCache = Data(count: 0x10000)
+    /// Live PPU VRAM size: 64 KB stock, 128 KB with the VA15 mod. Set on the
+    /// core before the ROM is loaded; viewers size their pages off this.
+    var vramBytes: Int {
+        guard let h = handle else { return 0x10000 }
+        return Int(kintsuki_vram_size(h))
+    }
+
+    private var vramCache = Data(count: 0x20000)   // max; trimmed to vramBytes on refresh
     private var cgramCache = Data(count: 0x200)
     private var paletteCache = [(UInt8, UInt8, UInt8)](repeating: (0,0,0), count: 256)
     private var tileImageCache: [Int: NSImage] = [:]      // keyed by base+sub-palette
@@ -1646,8 +1819,10 @@ final class Emulator {
         if lastFrameID < lastInspectorRefresh + 10 { return false }
         lastInspectorRefresh = lastFrameID
         guard let h = handle else { return false }
+        let vbytes = Int(kintsuki_vram_size(h))
+        if vramCache.count != vbytes { vramCache = Data(count: vbytes) }
         vramCache.withUnsafeMutableBytes {
-            _ = kintsuki_vram_dump(h, $0.bindMemory(to: UInt8.self).baseAddress, 0x10000)
+            _ = kintsuki_vram_dump(h, $0.bindMemory(to: UInt8.self).baseAddress, UInt32(vbytes))
         }
         cgramCache.withUnsafeMutableBytes {
             _ = kintsuki_cgram_dump(h, $0.bindMemory(to: UInt8.self).baseAddress, 0x200)

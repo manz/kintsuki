@@ -427,8 +427,7 @@ struct MemoryViewerView: View {
         switch region {
         case .wram:  return String(format: "%06X", 0x7E0000 + offset)
         case .rom:
-            let bank = offset / 0x8000
-            let addr = (bank << 16) | 0x8000 | (offset & 0x7FFF)
+            let addr = emulator.romOffsetToBus(UInt32(offset))
             return String(format: "%06X", addr)
         case .sram:  return String(format: "70:%04X", offset & 0xFFFF)
         case .vram:  return String(format: "VRAM:%04X", offset & 0xFFFF)

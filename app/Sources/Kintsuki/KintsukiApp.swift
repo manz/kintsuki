@@ -114,6 +114,8 @@ struct KintsukiApp: App {
                     emulator.togglePause()
                 }
                 .keyboardShortcut("p", modifiers: .command)
+                Toggle("Mute Audio", isOn: $emulator.muted)
+                    .keyboardShortcut("m", modifiers: [.command, .option])
                 Button("Step Frame") { emulator.stepOneFrame() }
                     .keyboardShortcut(".", modifiers: .command)
                 Button("Rewind 1 Frame") { emulator.rewindOneFrame() }

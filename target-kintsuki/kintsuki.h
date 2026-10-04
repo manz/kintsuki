@@ -37,6 +37,11 @@ kintsuki_t* kintsuki_create(void);
 void        kintsuki_destroy(kintsuki_t*);
 int         kintsuki_load_rom(kintsuki_t*, const char* path);
 
+// Mapper of the currently loaded cart. 1 => HiROM, 0 => LoROM (or no ROM
+// loaded). ExHiROM currently reports as HiROM (detectRom falls through);
+// coprocessor carts use whichever base mapper the manifest specifies.
+int         kintsuki_rom_is_hirom(kintsuki_t*);
+
 // Soft reset. Power-cycles the emulator without re-reading the ROM
 // from disk. Equivalent to physically tapping the SNES reset button.
 // Preserves cart SRAM contents. No-op if no ROM loaded.
@@ -48,6 +53,17 @@ void        kintsuki_reset(kintsuki_t*);
 // SRAM regardless of files on disk (e.g. test fixtures with stray
 // `.srm` siblings). Set persists for the handle's lifetime.
 void        kintsuki_set_srm_sidecar(kintsuki_t*, int enable);
+
+// PPU VRAM size in bytes. Default 65536 (stock hardware); pass 131072 to
+// model the VA15 mod, which wires a second 64K VRAM bank the PPU can
+// address, so background tile indices and sprite tiledata reach past
+// $FFFF instead of wrapping. Call BEFORE kintsuki_load_rom: the size is
+// latched into vram.mask at the first power-on. Returns 1 on success, 0
+// if `bytes` is neither 65536 nor 131072 (the setting is left unchanged).
+int         kintsuki_set_vram_size(kintsuki_t*, uint32_t bytes);
+
+// Current PPU VRAM size in bytes (65536 or 131072). 0 on a NULL handle.
+uint32_t    kintsuki_vram_size(kintsuki_t*);
 
 // Load `len` bytes from `data` into the cart's SRAM region (the
 // in-memory `save.ram` buffer ares allocated at boot). Use this to
@@ -211,6 +227,165 @@ int         kintsuki_screenshot(kintsuki_t*, const char* path);
 // Python `framebuffer()` uses this to collapse ares' always-doubled
 // 564-wide output back to single columns in normal mode.
 int         kintsuki_ppu_hires(kintsuki_t*);
+
+// ---- Audio output -------------------------------------------------------
+// ares resamples the SPC/DSP output to a fixed stereo stream that the core
+// pushes during `kintsuki_run_frames`. Samples accumulate in an internal
+// lock-free ring; a host audio thread drains it with `kintsuki_audio_read`.
+//
+// Disabled by default (headless / Python paths produce no audio overhead).
+// Enable it, start pulling from your audio device's render callback, and
+// you have sound. The producer is the thread calling `kintsuki_run_frames`;
+// the consumer is your audio thread; these may differ, and the ring is the
+// single-producer/single-consumer handoff between them.
+//
+// Fixed output format: interleaved stereo float32 at the rate reported by
+// `kintsuki_audio_sample_rate` (48000 Hz).
+void     kintsuki_audio_set_enabled(kintsuki_t*, int enable);
+int      kintsuki_audio_is_enabled(kintsuki_t*);
+double   kintsuki_audio_sample_rate(kintsuki_t*);
+// Copy up to `frames` interleaved stereo frames into `out` (which must hold
+// at least `frames*2` floats). Returns the number of frames written; a
+// short return means the ring underran and the caller should zero-fill the
+// remainder. Safe to call from a real-time audio thread (no locks/allocs).
+uint32_t kintsuki_audio_read(kintsuki_t*, float* out, uint32_t frames);
+// Stereo frames currently queued.
+uint32_t kintsuki_audio_available(kintsuki_t*);
+
+// ---- ROM-free SPC700 audio path -----------------------------------------
+// Drive ONLY the SPC700 (smp) + S-DSP (dsp) over a 64KB ARAM image, with no
+// SNES cartridge loaded. Intended for hosts (e.g. a music tracker) that want
+// to audition a SNES sound driver + samples + song without a full game ROM.
+//
+// Backing store: the 64KB ARAM is `dsp.apuram`, the single array both the
+// SPC700 and the S-DSP read and write. `kintsuki_spc_write_aram` copies into
+// it directly; the SPC700 sees those bytes through its normal memory map.
+//
+// How ROM-free boot works: `kintsuki_spc_boot` powers the emulator with the
+// System pak only (boards.bml + ipl.rom). The IPL ROM is the SPC700's own
+// 64-byte boot ROM and is legitimately required - SMP power reseeds the SPC
+// reset vector from it. NO cartridge slot is connected, so the 65816 main CPU
+// has no program mapped and idle-runs on open-bus. That is harmless: the
+// SPC700 and S-DSP run on their own Thread clocks and produce audio
+// independently of what the main CPU does. (The ares scheduler still uses the
+// CPU as master clock; it just executes nothing useful. This is the documented
+// limitation of the ROM-free path - we idle-run the CPU.)
+//
+// Typical sequence:
+//   kintsuki_t* k = kintsuki_create();
+//   kintsuki_audio_set_enabled(k, 1);
+//   kintsuki_spc_boot(k);
+//   kintsuki_spc_write_aram(k, 0x0400, driver,  driver_len);   // driver code
+//   kintsuki_spc_write_aram(k, 0x2000, samples, samples_len);  // BRR bank
+//   kintsuki_spc_write_aram(k, 0xC000, song,    song_len);     // song stream
+//   kintsuki_spc_set_pc(k, 0x0400);          // jump the driver into action
+//   kintsuki_spc_write_port(k, 0, 0x01);     // optional: "play song 1" cmd
+//   // render loop:
+//   kintsuki_spc_run_samples(k, 800);        // advance ~800 stereo frames
+//   float buf[800*2];
+//   uint32_t got = kintsuki_audio_read(k, buf, 800);  // drain the ring
+//
+// Output format is identical to the ROM audio path: interleaved stereo
+// float32 at `kintsuki_audio_sample_rate` (48000 Hz).
+
+// Power up smp + dsp with no cartridge (System pak / IPL only). Returns 1 on
+// success, 0 on failure (System pak missing, etc.). Additive: does not touch
+// the ROM path - you can still kintsuki_load_rom on a fresh handle instead.
+int      kintsuki_spc_boot(kintsuki_t*);
+
+// Copy `len` bytes of `data` into ARAM at `addr`. Wraps at the 64KB boundary
+// (addr is masked per-byte to 16 bits). Use this to install the driver code,
+// the BRR sample bank, the song event stream, and any DSP register shadow.
+void     kintsuki_spc_write_aram(kintsuki_t*, uint32_t addr,
+                                 const uint8_t* data, uint32_t len);
+// Read `len` bytes of ARAM at `addr` into `out` (wraps at 64KB). Returns
+// bytes copied. Handy for verifying an install or reading driver scratch.
+uint32_t kintsuki_spc_read_aram(kintsuki_t*, uint32_t addr,
+                                uint8_t* out, uint32_t len);
+
+// Set the SPC700 program counter. Simplest way to start a driver running:
+// after installing it in ARAM, point the SPC at its entry (e.g. 0x0400) and
+// it begins executing on the next `kintsuki_spc_run_samples`. This bypasses
+// the real IPL upload handshake - we just set PC directly.
+void     kintsuki_spc_set_pc(kintsuki_t*, uint16_t pc);
+
+// Poke / peek the four CPU<->SPC communication ports. `port` is 0..3:
+//   write -> CPU->SPC direction ($2140-$2143 host side, read at $F4-$F7 on
+//            the SPC). This is how the main CPU hands the driver a command,
+//            e.g. "play song N" or "set volume".
+//   read  -> SPC->CPU direction (what the driver wrote back at $F4-$F7),
+//            useful for reading a handshake / ack / status byte.
+// Out-of-range ports are ignored (write) / return 0 (read).
+void     kintsuki_spc_write_port(kintsuki_t*, int port, uint8_t value);
+uint8_t  kintsuki_spc_read_port(kintsuki_t*, int port);
+
+// Advance smp + dsp until at least `frames` additional stereo frames have
+// been pushed into the audio ring (or an internal safety cap is hit), then
+// return the number of frames actually produced. Requires audio to be
+// enabled - returns 0 otherwise (the ring is the only sink). The host drains
+// the produced audio with the existing `kintsuki_audio_read`.
+//
+// Render in chunks no larger than the ring capacity (~8192 frames). If you
+// ask for more than the ring can hold without draining, the surplus is
+// dropped on overrun and the call returns once it stops making progress.
+uint32_t kintsuki_spc_run_samples(kintsuki_t*, uint32_t frames);
+
+// SPC700 (audio CPU) register snapshot. `psw` is the raw status byte
+// (bit0 C, 1 Z, 2 I, 3 H, 4 B, 5 P, 6 V, 7 N). A/Y are the low/high
+// halves of the YA word. Valid after kintsuki_spc_boot (or any boot).
+typedef struct {
+  uint16_t pc;
+  uint8_t  a, x, y, sp;
+  uint8_t  psw;
+} kintsuki_spc_state_t;
+
+void kintsuki_spc_get_state(kintsuki_t*, kintsuki_spc_state_t* out);
+void kintsuki_spc_set_state(kintsuki_t*, const kintsuki_spc_state_t* in);
+
+// S-DSP register file: 128 bytes ($00-$7F). Per-voice block at voice*0x10
+// (VOLL VOLR PITCHL PITCHH SRCN ADSR1 ADSR2 GAIN ENVX OUTX); globals at
+// the $.C/$.D/$.F columns (MVOL EVOL KON KOF FLG ENDX EFB PMON NON EON DIR
+// ESA EDL + 8-tap FIR). Copies min(len, 128) into `out`; returns bytes
+// copied. ARAM (the 64KB sample/echo store) is the separate
+// kintsuki_spc_read_aram window.
+uint32_t kintsuki_dsp_registers(kintsuki_t*, uint8_t* out, uint32_t len);
+
+// ---- SPC700 execution debug ---------------------------------------------
+// Breakpoints / single-step / run-until / disassembly for the audio CPU,
+// the SMP-side analogue of the main-CPU debug surface. `kind` reuses the
+// KINTSUKI_CB_* enum (exec / read / write); addresses are 16-bit ARAM.
+
+// Register a SPC700 callback. Fires fn(addr, value, userdata) on exec (value
+// 0), read (byte read), or write (byte written) within [lo, hi]. Returns a
+// 1-based id (pass to remove), 0 on failure.
+int  kintsuki_spc_add_callback(kintsuki_t*, int kind, uint32_t lo, uint32_t hi,
+                               kintsuki_cb_t fn, void* userdata);
+// Same, but when `halt` is non-zero the run stops at the next safe SMP
+// instruction boundary after the callback fires (a real breakpoint).
+int  kintsuki_spc_add_callback_ex(kintsuki_t*, int kind, uint32_t lo, uint32_t hi,
+                                  int halt, kintsuki_cb_t fn, void* userdata);
+void kintsuki_spc_remove_callback(kintsuki_t*, int kind, int id);
+
+// Execute exactly one SPC700 instruction (the one at the current SMP PC).
+void kintsuki_spc_step(kintsuki_t*);
+
+// Run the SMP until its PC reaches `pc`, capped at `max_insns` SPC700
+// instructions (0 = a large internal default). Returns 1 if the target was
+// hit, 0 if the cap tripped first.
+int  kintsuki_spc_run_until(kintsuki_t*, uint16_t pc, uint32_t max_insns);
+
+// Disassemble `count` consecutive SPC700 instructions starting at `pc`.
+// Renders via ares' own SPC700 disassembler; the direct-page base follows
+// the live P flag. Returns the number of entries written.
+typedef struct {
+  uint16_t pc;
+  uint8_t  length;   // 1..3 bytes
+  uint8_t  _pad;
+  char     text[64];
+} kintsuki_spc_disasm_line_t;
+
+uint32_t kintsuki_spc_disassemble_at(kintsuki_t*, uint16_t pc, uint32_t count,
+                                     kintsuki_spc_disasm_line_t* out);
 
 // Input. mask bits: Up=0 Down=1 Left=2 Right=3 B=4 A=5 Y=6 X=7 L=8 R=9 Select=10 Start=11
 void        kintsuki_set_input(kintsuki_t*, int port, uint16_t mask);
@@ -457,6 +632,22 @@ uint32_t kintsuki_dma_log_snapshot(kintsuki_t*,
                                    kintsuki_dma_event_t* out,
                                    uint32_t cap);
 void     kintsuki_dma_log_clear(kintsuki_t*);
+
+// PPU register write log: every $2100-$213F write with the live scanline/dot.
+typedef struct kintsuki_ppu_write_t {
+  uint16_t addr;    // $2100-$213F
+  uint8_t  data;
+  uint16_t v;       // cpu.vcounter() (live scanline) at the write
+  uint16_t h;       // cpu.hcounter() (live dot) at the write
+  uint64_t frame;   // framesRendered at the write
+} kintsuki_ppu_write_t;
+
+void     kintsuki_ppu_writes_start(kintsuki_t*);
+void     kintsuki_ppu_writes_stop(kintsuki_t*);
+uint32_t kintsuki_ppu_writes_count(kintsuki_t*);
+uint32_t kintsuki_ppu_writes_snapshot(kintsuki_t*,
+                                      kintsuki_ppu_write_t* out,
+                                      uint32_t cap);
 
 // Per-scanline HDMA channel mask for the most recently completed
 // frame (double-buffered). `out[i]` = bitmask of channels that fired

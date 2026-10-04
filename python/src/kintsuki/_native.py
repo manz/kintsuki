@@ -13,6 +13,8 @@ from ctypes import (
     POINTER,
     Structure,
     c_char_p,
+    c_double,
+    c_float,
     c_int,
     c_int8,
     c_size_t,
@@ -204,6 +206,22 @@ _bind("kintsuki_dma_log_count",    c_uint32, [HANDLE])
 _bind("kintsuki_dma_log_snapshot", c_uint32, [HANDLE, POINTER(DmaEvent), c_uint32])
 _bind("kintsuki_dma_log_clear",    None,     [HANDLE])
 
+
+class PpuWriteRaw(Structure):
+    _fields_ = [
+        ("addr",  c_uint16),
+        ("data",  c_uint8),
+        ("v",     c_uint16),
+        ("h",     c_uint16),
+        ("frame", c_uint64),
+    ]
+
+
+_bind("kintsuki_ppu_writes_start",    None,     [HANDLE])
+_bind("kintsuki_ppu_writes_stop",     None,     [HANDLE])
+_bind("kintsuki_ppu_writes_count",    c_uint32, [HANDLE])
+_bind("kintsuki_ppu_writes_snapshot", c_uint32, [HANDLE, POINTER(PpuWriteRaw), c_uint32])
+
 # .adbg label table.
 _bind("kintsuki_load_adbg",     c_int,    [HANDLE, c_char_p])
 _bind("kintsuki_clear_adbg",    None,     [HANDLE])
@@ -300,6 +318,8 @@ _bind("kintsuki_tracer_drain", c_uint32, [HANDLE, c_char_p, c_uint32])
 _bind("kintsuki_reset", None, [HANDLE])
 _bind("kintsuki_inject_sram", c_uint32, [HANDLE, POINTER(c_uint8), c_uint32])
 _bind("kintsuki_set_srm_sidecar", None, [HANDLE, c_int])
+_bind("kintsuki_set_vram_size", c_int, [HANDLE, c_uint32])
+_bind("kintsuki_vram_size", c_uint32, [HANDLE])
 
 # Savestate
 _bind("kintsuki_save_state", c_uint32, [HANDLE, c_void_p, c_uint32])
@@ -319,6 +339,61 @@ LOAD_FLAG_INJECT_ONLY = 1 << 2
 
 _bind("kintsuki_load_state_ex", c_int,
       [HANDLE, c_void_p, c_uint32, POINTER(LoadStateOpts)])
+
+# SPC700 / S-DSP
+class SpcStateRaw(Structure):
+    """SPC700 (audio CPU) register snapshot."""
+
+    _fields_ = [
+        ("pc", c_uint16),
+        ("a", c_uint8),
+        ("x", c_uint8),
+        ("y", c_uint8),
+        ("sp", c_uint8),
+        ("psw", c_uint8),
+    ]
+
+
+_bind("kintsuki_spc_boot", c_int, [HANDLE])
+_bind("kintsuki_spc_write_aram", None, [HANDLE, c_uint32, POINTER(c_uint8), c_uint32])
+_bind("kintsuki_spc_read_aram", c_uint32, [HANDLE, c_uint32, POINTER(c_uint8), c_uint32])
+_bind("kintsuki_spc_set_pc", None, [HANDLE, c_uint16])
+_bind("kintsuki_spc_write_port", None, [HANDLE, c_int, c_uint8])
+_bind("kintsuki_spc_read_port", c_uint8, [HANDLE, c_int])
+_bind("kintsuki_spc_run_samples", c_uint32, [HANDLE, c_uint32])
+_bind("kintsuki_spc_get_state", None, [HANDLE, POINTER(SpcStateRaw)])
+_bind("kintsuki_spc_set_state", None, [HANDLE, POINTER(SpcStateRaw)])
+_bind("kintsuki_dsp_registers", c_uint32, [HANDLE, POINTER(c_uint8), c_uint32])
+
+
+class SpcDisasmLine(Structure):
+    """One disassembled SPC700 instruction."""
+
+    _fields_ = [
+        ("pc", c_uint16),
+        ("length", c_uint8),
+        ("_pad", c_uint8),
+        ("text", ctypes.c_char * 64),
+    ]
+
+
+# SPC700 execution debug (breakpoints reuse the CB_* enum / CALLBACK type).
+_bind("kintsuki_spc_add_callback", c_int,
+      [HANDLE, c_int, c_uint32, c_uint32, CALLBACK, c_void_p])
+_bind("kintsuki_spc_add_callback_ex", c_int,
+      [HANDLE, c_int, c_uint32, c_uint32, c_int, CALLBACK, c_void_p])
+_bind("kintsuki_spc_remove_callback", None, [HANDLE, c_int, c_int])
+_bind("kintsuki_spc_step", None, [HANDLE])
+_bind("kintsuki_spc_run_until", c_int, [HANDLE, c_uint16, c_uint32])
+_bind("kintsuki_spc_disassemble_at", c_uint32,
+      [HANDLE, c_uint16, c_uint32, POINTER(SpcDisasmLine)])
+
+# Audio
+_bind("kintsuki_audio_set_enabled", None, [HANDLE, c_int])
+_bind("kintsuki_audio_is_enabled", c_int, [HANDLE])
+_bind("kintsuki_audio_sample_rate", c_double, [HANDLE])
+_bind("kintsuki_audio_read", c_uint32, [HANDLE, POINTER(c_float), c_uint32])
+_bind("kintsuki_audio_available", c_uint32, [HANDLE])
 
 # Framebuffer / screenshot
 _bind("kintsuki_framebuffer", POINTER(c_uint32), [HANDLE, POINTER(c_uint32), POINTER(c_uint32)])

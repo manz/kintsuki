@@ -19,8 +19,8 @@ struct VRAMViewerView: View {
     /// graphics that live in cart or main RAM (e.g. decompressed font
     /// glyphs the engine pulls into WRAM, or raw cart tile banks).
     @State private var source: Emulator.MemRegion = .vram
-    /// 64 KB page within `source`. Always 0 for VRAM (single 64 KB
-    /// region); WRAM has 2, ROM has many, SRAM has up to 1.
+    /// 64 KB page within `source`. VRAM has 1, or 2 with the VA15 mod
+    /// (lower bank + upper bank); WRAM has 2, ROM has many, SRAM up to 1.
     @State private var page: Int = 0
     private static let pageBytes: Int = 0x10000
     /// Cached DMA transfers — re-pulled on the same 2 Hz tick that
@@ -138,8 +138,15 @@ struct VRAMViewerView: View {
     /// to at least 1 so the stepper picker never hides when nothing is
     /// loaded.
     private var pageCount: Int {
-        let total = Int(source.size)
+        let total = regionSize(source)
         return max(1, (total + Self.pageBytes - 1) / Self.pageBytes)
+    }
+
+    /// Addressable bytes in `region`. VRAM is the one region whose size is
+    /// set at runtime (64 KB stock, 128 KB with the VA15 mod), so it comes
+    /// from the core rather than the enum's static upper bound.
+    private func regionSize(_ region: Emulator.MemRegion) -> Int {
+        region == .vram ? emulator.vramBytes : Int(region.size)
     }
 
     private func maxPaletteIndex(_ bpp: TileBpp) -> Int {
@@ -434,7 +441,7 @@ struct VRAMViewerView: View {
     /// 64 KB) doesn't pull in open-bus tail bytes that would render as
     /// garbage tiles.
     private func bytesForCurrentPage() -> Data {
-        let regionSize = Int(source.size)
+        let regionSize = regionSize(source)
         let start = page * Self.pageBytes
         guard start < regionSize else { return Data() }
         let want = min(Self.pageBytes, regionSize - start)

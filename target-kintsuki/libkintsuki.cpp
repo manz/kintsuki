@@ -226,6 +226,9 @@ void kintsuki_destroy(kintsuki_t* h) {
   ares::SuperFamicom::execHook = nullptr;
   ares::SuperFamicom::memReadHook = nullptr;
   ares::SuperFamicom::memWriteHook = nullptr;
+  ares::SuperFamicom::smpExecHook = nullptr;
+  ares::SuperFamicom::smpReadHook = nullptr;
+  ares::SuperFamicom::smpWriteHook = nullptr;
   ares::callHook = nullptr;
   ares::returnHook = nullptr;
   g_callstack.clear();
@@ -254,9 +257,27 @@ void kintsuki_reset(kintsuki_t* h) {
   g_callstack.clear();
 }
 
+int kintsuki_rom_is_hirom(kintsuki_t* h) {
+  if(!h || !h->program) return 0;
+  if(h->program->romSize() == 0) return 0;
+  return h->program->romIsHiRom() ? 1 : 0;
+}
+
 void kintsuki_set_srm_sidecar(kintsuki_t* h, int enable) {
   if(!h) return;
   h->program->loadSrmSidecar = (enable != 0);
+}
+
+int kintsuki_set_vram_size(kintsuki_t* h, uint32_t bytes) {
+  if(!h) return 0;
+  if(bytes != 0x10000 && bytes != 0x20000) return 0;
+  h->program->vramSizeBytes = bytes;
+  return 1;
+}
+
+uint32_t kintsuki_vram_size(kintsuki_t* h) {
+  if(!h) return 0;
+  return h->program->vramSizeBytes;
 }
 
 uint32_t kintsuki_inject_sram(kintsuki_t* h, const uint8_t* data, uint32_t len) {
@@ -354,7 +375,8 @@ void    kintsuki_oam_write(kintsuki_t* h, uint32_t addr, uint8_t v)  { if(h) h->
 
 uint32_t kintsuki_vram_dump(kintsuki_t* h, uint8_t* out, uint32_t len) {
   if(!h || !out) return 0;
-  uint32_t n = len < 0x10000 ? len : 0x10000;
+  uint32_t cap = h->program->vramSizeBytes;      // 128K only with the VA15 mod
+  uint32_t n = len < cap ? len : cap;
   for(uint32_t i = 0; i < n; i++) out[i] = h->program->vramRead(i);
   return n;
 }
@@ -574,6 +596,96 @@ int kintsuki_screenshot(kintsuki_t* h, const char* path) {
   return (h && h->program->writeScreenshot(path)) ? 1 : 0;
 }
 
+void kintsuki_audio_set_enabled(kintsuki_t* h, int enable) {
+  if(!h) return;
+  h->program->setAudioEnabled(enable != 0);
+}
+
+int kintsuki_audio_is_enabled(kintsuki_t* h) {
+  if(!h) return 0;
+  return h->program->audioEnabledState() ? 1 : 0;
+}
+
+double kintsuki_audio_sample_rate(kintsuki_t* h) {
+  (void)h;
+  return Program::audioSampleRate;
+}
+
+uint32_t kintsuki_audio_read(kintsuki_t* h, float* out, uint32_t frames) {
+  if(!h) return 0;
+  return h->program->audioRead(out, frames);
+}
+
+uint32_t kintsuki_audio_available(kintsuki_t* h) {
+  if(!h) return 0;
+  return h->program->audioAvailable();
+}
+
+// ---- ROM-free SPC700 audio path -----------------------------------------
+// See kintsuki.h for the boot/install/run/drain contract.
+
+int kintsuki_spc_boot(kintsuki_t* h) {
+  if(!h) return 0;
+  if(!h->program->bootSpc()) return 0;
+  // Fresh power-up: any retained call frames describe a chain that no
+  // longer exists. Keep parity with kintsuki_load_rom.
+  g_callstack.clear();
+  return 1;
+}
+
+void kintsuki_spc_write_aram(kintsuki_t* h, uint32_t addr,
+                             const uint8_t* data, uint32_t len) {
+  if(!h) return;
+  h->program->aramWrite(addr, data, len);
+}
+
+uint32_t kintsuki_spc_read_aram(kintsuki_t* h, uint32_t addr,
+                                uint8_t* out, uint32_t len) {
+  if(!h || !out) return 0;
+  h->program->aramRead(addr, out, len);
+  return len;
+}
+
+void kintsuki_spc_set_pc(kintsuki_t* h, uint16_t pc) {
+  if(!h) return;
+  h->program->smpSetPc(pc);
+}
+
+void kintsuki_spc_write_port(kintsuki_t* h, int port, uint8_t value) {
+  if(!h) return;
+  h->program->smpWritePort(port, value);
+}
+
+uint8_t kintsuki_spc_read_port(kintsuki_t* h, int port) {
+  if(!h) return 0;
+  return h->program->smpReadPort(port);
+}
+
+uint32_t kintsuki_spc_run_samples(kintsuki_t* h, uint32_t frames) {
+  if(!h) return 0;
+  return h->program->runSpcSamples(frames);
+}
+
+void kintsuki_spc_get_state(kintsuki_t* h, kintsuki_spc_state_t* out) {
+  if(!h || !out) return;
+  SpcState s = h->program->spcGetState();
+  out->pc = s.pc; out->a = s.a; out->x = s.x; out->y = s.y;
+  out->sp = s.sp; out->psw = s.psw;
+}
+
+void kintsuki_spc_set_state(kintsuki_t* h, const kintsuki_spc_state_t* in) {
+  if(!h || !in) return;
+  SpcState s;
+  s.pc = in->pc; s.a = in->a; s.x = in->x; s.y = in->y;
+  s.sp = in->sp; s.psw = in->psw;
+  h->program->spcSetState(s);
+}
+
+uint32_t kintsuki_dsp_registers(kintsuki_t* h, uint8_t* out, uint32_t len) {
+  if(!h) return 0;
+  return h->program->dspRegisters(out, len);
+}
+
 // 1 when the PPU is in BGMODE 5/6 or pseudo-hires (each emitted column
 // is a real pixel), 0 in normal mode (every other column is a dupe).
 // Lets Python `framebuffer()` collapse the doubled output the same way
@@ -617,6 +729,44 @@ uint8_t g_cExecPages[65536]  = {};
 uint8_t g_cReadPages[65536]  = {};
 uint8_t g_cWritePages[65536] = {};
 
+// ---- SPC700 (audio CPU) debug callbacks ---------------------------------
+// 16-bit ARAM address space, so the page bitmap is 256 entries (addr>>8).
+// Mirrors the CPU CCallback machinery above; separate hooks (smpExecHook /
+// smpReadHook / smpWriteHook) feed these.
+struct SpcCallback {
+  uint16_t lo, hi;
+  kintsuki_cb_t fn;
+  void* userdata;
+  bool active;
+  bool halt;
+};
+std::vector<SpcCallback> g_sExec, g_sRead, g_sWrite;
+uint8_t g_sExecPages[256]  = {};
+uint8_t g_sReadPages[256]  = {};
+uint8_t g_sWritePages[256] = {};
+
+// SPC700 instruction byte-lengths, generated from ares' own SPC700
+// disassembler operand reads (1 + highest operand-byte offset). Used to
+// advance the disassembler line by line.
+static const uint8_t kSpcInstLen[256] = {
+  1, 1, 2, 3, 2, 3, 1, 2, 2, 3, 3, 2, 3, 1, 3, 1,
+  2, 1, 2, 3, 2, 3, 3, 2, 3, 1, 2, 2, 1, 1, 3, 3,
+  1, 1, 2, 3, 2, 3, 1, 2, 2, 3, 3, 2, 3, 1, 3, 2,
+  2, 1, 2, 3, 2, 3, 3, 2, 3, 1, 2, 2, 1, 1, 2, 3,
+  1, 1, 2, 3, 2, 3, 1, 2, 2, 3, 3, 2, 3, 1, 3, 2,
+  2, 1, 2, 3, 2, 3, 3, 2, 3, 1, 3, 2, 1, 1, 3, 3,
+  1, 1, 2, 3, 2, 3, 1, 2, 2, 3, 3, 2, 3, 1, 3, 1,
+  2, 1, 2, 3, 2, 3, 3, 2, 3, 1, 3, 2, 1, 1, 2, 1,
+  1, 1, 2, 3, 2, 3, 1, 2, 2, 3, 3, 2, 3, 2, 1, 3,
+  2, 1, 2, 3, 2, 3, 3, 2, 3, 1, 3, 2, 1, 1, 1, 1,
+  1, 1, 2, 3, 2, 3, 1, 2, 2, 3, 3, 2, 3, 2, 1, 1,
+  2, 1, 2, 3, 2, 3, 3, 2, 3, 1, 2, 2, 1, 1, 1, 1,
+  1, 1, 2, 3, 2, 3, 1, 2, 2, 3, 3, 2, 3, 2, 1, 1,
+  2, 1, 2, 3, 2, 3, 3, 2, 2, 2, 2, 2, 1, 1, 3, 1,
+  1, 1, 2, 3, 2, 3, 1, 2, 2, 3, 3, 2, 3, 1, 1, 1,
+  2, 1, 2, 3, 2, 3, 3, 2, 2, 2, 3, 2, 1, 1, 2, 1,
+};
+
 }  // anonymous namespace
 
 static void resetAllCallbacks() {
@@ -626,6 +776,12 @@ static void resetAllCallbacks() {
   std::memset(g_cExecPages,  0, sizeof(g_cExecPages));
   std::memset(g_cReadPages,  0, sizeof(g_cReadPages));
   std::memset(g_cWritePages, 0, sizeof(g_cWritePages));
+  g_sExec.clear();
+  g_sRead.clear();
+  g_sWrite.clear();
+  std::memset(g_sExecPages,  0, sizeof(g_sExecPages));
+  std::memset(g_sReadPages,  0, sizeof(g_sReadPages));
+  std::memset(g_sWritePages, 0, sizeof(g_sWritePages));
 }
 
 namespace {
@@ -701,7 +857,40 @@ void cOnRead(uint32_t addr, uint8_t value) {
   cFire(g_cRead, addr, value);
 }
 
+// ---- PPU register write event log --------------------------------------
+// Records every write to $2100-$213F with the LIVE scanline/dot
+// (cpu.vcounter()/hcounter()) - the CPU->PPU sync means these are accurate at
+// the write, unlike a Python callback reading the stale latched io.vcounter.
+// Purpose: per-scanline PPU-write timeline (Mesen event-viewer style) to catch
+// mid-active-display register writes that a frame-end snapshot can't see.
+struct PpuWriteEvent {
+  uint16_t addr;    // $2100-$213F
+  uint8_t  data;
+  uint16_t v;       // cpu.vcounter() at the write (live scanline)
+  uint16_t h;       // cpu.hcounter() at the write (live dot)
+  uint64_t frame;   // framesRendered at the write
+};
+constexpr size_t kPpuWriteCap = 8192;
+PpuWriteEvent g_ppuWrites[kPpuWriteCap] = {};
+size_t g_ppuWriteHead = 0;   // ring head (next slot)
+size_t g_ppuWriteSize = 0;
+bool   g_ppuCollect = false;
+
 void cOnWrite(uint32_t addr, uint8_t value) {
+  if(g_ppuCollect) {
+    uint16_t a = (uint16_t)(addr & 0xffff);
+    if(a >= 0x2100 && a <= 0x213f) {
+      g_ppuWrites[g_ppuWriteHead] = PpuWriteEvent{
+        .addr = a,
+        .data = value,
+        .v = (uint16_t)ares::SuperFamicom::cpu.vcounter(),
+        .h = (uint16_t)ares::SuperFamicom::cpu.hcounter(),
+        .frame = (g_handle ? g_handle->program->framesRendered : 0),
+      };
+      g_ppuWriteHead = (g_ppuWriteHead + 1) % kPpuWriteCap;
+      if(g_ppuWriteSize < kPpuWriteCap) g_ppuWriteSize++;
+    }
+  }
   if(g_cWritePages[(addr & 0xffffff) >> 8] == 0) return;
   cFire(g_cWrite, addr, value);
 }
@@ -717,6 +906,86 @@ auto pickPages(int kind) -> uint8_t* {
   if(kind == CB_EXEC)  return g_cExecPages;
   if(kind == CB_READ)  return g_cReadPages;
   if(kind == CB_WRITE) return g_cWritePages;
+  return nullptr;
+}
+
+// ---- SPC700 callback dispatch (16-bit ARAM addresses) -------------------
+auto markSPages(uint8_t* pages, uint16_t lo, uint16_t hi, int delta) -> void {
+  for(uint32_t p = (lo >> 8); p <= (uint32_t)(hi >> 8); p++) {
+    int v = (int)pages[p] + delta;
+    if(v < 0) v = 0;
+    if(v > 255) v = 255;
+    pages[p] = (uint8_t)v;
+  }
+}
+
+auto sFire(std::vector<SpcCallback>& list, uint16_t addr, uint8_t value) -> void {
+  for(auto& cb : list) {
+    if(!cb.active) continue;
+    if(addr < cb.lo || addr > cb.hi) continue;
+    cb.fn(addr, value, cb.userdata);
+    if(cb.halt) {
+      // Stop the SMP at its next instruction boundary (smpExecHook yields
+      // via scheduler.exit) and break Program::runSpcSamples' outer loop.
+      ares::SuperFamicom::kintsukiSmpBailRequested = true;
+      ares::SuperFamicom::kintsukiHaltRequested = true;
+    }
+  }
+}
+
+// Step support: an exec hook that bails the moment the SMP PC differs from
+// where the step began. The scheduler yields AFTER the exec hook but BEFORE
+// the instruction runs, so the SMP can be parked either at a fresh boundary
+// (hook fires for the start PC first) or with the start instruction already
+// primed (hook fires for the next PC). Keying off "PC != start" handles both
+// so exactly one instruction executes either way. Saved around the user hook
+// so breakpoints survive a step.
+ares::SuperFamicom::SmpExecHook g_prevSmpExecHook = nullptr;
+uint16_t    g_spcStepStartPc = 0;
+
+void spcStepHook(uint16_t pc) {
+  if(pc != g_spcStepStartPc) {
+    ares::SuperFamicom::kintsukiSmpBailRequested = true;
+    ares::SuperFamicom::kintsukiHaltRequested = true;
+  }
+}
+
+// run-until support: bail when the SMP PC reaches a target address.
+ares::SuperFamicom::SmpExecHook g_prevSmpExecHookRU = nullptr;
+uint16_t    g_spcRunUntilPc = 0;
+bool        g_spcRunUntilHit = false;
+
+void spcRunUntilHook(uint16_t pc) {
+  if(pc == g_spcRunUntilPc) {
+    g_spcRunUntilHit = true;
+    ares::SuperFamicom::kintsukiSmpBailRequested = true;
+    ares::SuperFamicom::kintsukiHaltRequested = true;
+  }
+}
+
+void cOnSpcExec(uint16_t pc) {
+  if(g_sExecPages[pc >> 8] == 0) return;
+  sFire(g_sExec, pc, 0);
+}
+void cOnSpcRead(uint16_t addr, uint8_t value) {
+  if(g_sReadPages[addr >> 8] == 0) return;
+  sFire(g_sRead, addr, value);
+}
+void cOnSpcWrite(uint16_t addr, uint8_t value) {
+  if(g_sWritePages[addr >> 8] == 0) return;
+  sFire(g_sWrite, addr, value);
+}
+
+auto pickSpcList(int kind) -> std::vector<SpcCallback>* {
+  if(kind == CB_EXEC)  return &g_sExec;
+  if(kind == CB_READ)  return &g_sRead;
+  if(kind == CB_WRITE) return &g_sWrite;
+  return nullptr;
+}
+auto pickSpcPages(int kind) -> uint8_t* {
+  if(kind == CB_EXEC)  return g_sExecPages;
+  if(kind == CB_READ)  return g_sReadPages;
+  if(kind == CB_WRITE) return g_sWritePages;
   return nullptr;
 }
 
@@ -766,6 +1035,102 @@ void kintsuki_remove_callback(kintsuki_t* h, int kind, int id) {
     if(kind == CB_READ  && !g_project) ares::SuperFamicom::memReadHook = nullptr;
     if(kind == CB_WRITE)               ares::SuperFamicom::memWriteHook = nullptr;
   }
+}
+
+// ---- SPC700 execution debug: breakpoints / step / run-until / disasm ----
+
+int kintsuki_spc_add_callback_ex(kintsuki_t* h, int kind, uint32_t lo, uint32_t hi,
+                                 int halt, kintsuki_cb_t fn, void* userdata) {
+  (void)h;
+  auto* list = pickSpcList(kind);
+  auto* pages = pickSpcPages(kind);
+  if(!list || !pages || !fn) return 0;
+  list->push_back({(uint16_t)lo, (uint16_t)hi, fn, userdata, true, halt != 0});
+  markSPages(pages, (uint16_t)lo, (uint16_t)hi, +1);
+  if(kind == CB_EXEC)  ares::SuperFamicom::smpExecHook  = &cOnSpcExec;
+  if(kind == CB_READ)  ares::SuperFamicom::smpReadHook  = &cOnSpcRead;
+  if(kind == CB_WRITE) ares::SuperFamicom::smpWriteHook = &cOnSpcWrite;
+  return (int)list->size();
+}
+
+int kintsuki_spc_add_callback(kintsuki_t* h, int kind, uint32_t lo, uint32_t hi,
+                              kintsuki_cb_t fn, void* userdata) {
+  return kintsuki_spc_add_callback_ex(h, kind, lo, hi, 0, fn, userdata);
+}
+
+void kintsuki_spc_remove_callback(kintsuki_t* h, int kind, int id) {
+  (void)h;
+  auto* list = pickSpcList(kind);
+  auto* pages = pickSpcPages(kind);
+  if(!list || !pages) return;
+  if(id < 1 || (size_t)id > list->size()) return;
+  auto& cb = (*list)[id - 1];
+  if(cb.active) {
+    markSPages(pages, cb.lo, cb.hi, -1);
+    cb.active = false;
+  }
+  bool any = false;
+  for(auto& c : *list) if(c.active) { any = true; break; }
+  if(!any) {
+    if(kind == CB_EXEC)  ares::SuperFamicom::smpExecHook  = nullptr;
+    if(kind == CB_READ)  ares::SuperFamicom::smpReadHook  = nullptr;
+    if(kind == CB_WRITE) ares::SuperFamicom::smpWriteHook = nullptr;
+  }
+}
+
+// Drive the scheduler until an armed SMP hook sets kintsukiHaltRequested,
+// or a spin cap trips.
+static void kSpcDriveUntilHalt(uint64_t cap) {
+  ares::SuperFamicom::kintsukiHaltRequested = false;
+  ares::SuperFamicom::kintsukiSmpBailRequested = false;
+  uint64_t spin = 0;
+  while(!ares::SuperFamicom::kintsukiHaltRequested && spin++ < cap) {
+    ares::SuperFamicom::system.run();
+  }
+}
+
+void kintsuki_spc_step(kintsuki_t* h) {
+  if(!h) return;
+  g_prevSmpExecHook = ares::SuperFamicom::smpExecHook;
+  g_spcStepStartPc = ares::SuperFamicom::smp.r.pc.w;
+  ares::SuperFamicom::smpExecHook = &spcStepHook;
+  kSpcDriveUntilHalt(2'000'000ull);
+  ares::SuperFamicom::smpExecHook = g_prevSmpExecHook;
+}
+
+int kintsuki_spc_run_until(kintsuki_t* h, uint16_t pc, uint32_t max_insns) {
+  if(!h) return 0;
+  g_prevSmpExecHookRU = ares::SuperFamicom::smpExecHook;
+  g_spcRunUntilPc = pc;
+  g_spcRunUntilHit = false;
+  ares::SuperFamicom::smpExecHook = &spcRunUntilHook;
+  uint64_t cap = max_insns ? ((uint64_t)max_insns * 4ull + 64ull) : 2'000'000ull;
+  kSpcDriveUntilHalt(cap);
+  ares::SuperFamicom::smpExecHook = g_prevSmpExecHookRU;
+  return g_spcRunUntilHit ? 1 : 0;
+}
+
+uint32_t kintsuki_spc_disassemble_at(kintsuki_t* h, uint16_t pc, uint32_t count,
+                                     kintsuki_spc_disasm_line_t* out) {
+  if(!h || !out || count == 0) return 0;
+  auto& smp = ares::SuperFamicom::smp;
+  uint16_t cur = pc;
+  uint32_t produced = 0;
+  for(uint32_t i = 0; i < count; i++) {
+    uint8_t opcode = ares::SuperFamicom::dsp.apuram[cur];
+    uint8_t len = kSpcInstLen[opcode];
+    if(len == 0) len = 1;
+    // P flag selects the direct-page base ($00xx / $01xx) for the render.
+    nall::string text = smp.disassembleInstruction(cur, smp.r.p.p);
+    out[produced].pc = cur;
+    out[produced].length = len;
+    std::memset(out[produced].text, 0, sizeof(out[produced].text));
+    std::snprintf(out[produced].text, sizeof(out[produced].text), "%s",
+                  (const char*)text);
+    produced++;
+    cur = (uint16_t)(cur + len);
+  }
+  return produced;
 }
 
 // ---- Formatted execution tracer ------------------------------------------
@@ -1372,6 +1737,48 @@ uint32_t kintsuki_dma_log_snapshot(kintsuki_t* h,
 void kintsuki_dma_log_clear(kintsuki_t* h) {
   if(!h) return;
   g_dmaLogSize = 0;
+}
+
+// ---- PPU register write log --------------------------------------------
+
+void kintsuki_ppu_writes_start(kintsuki_t* h) {
+  if(!h) return;
+  g_ppuWriteHead = 0;
+  g_ppuWriteSize = 0;
+  g_ppuCollect = true;
+  ares::SuperFamicom::memWriteHook = &cOnWrite;   // ensure the write path is armed
+}
+
+void kintsuki_ppu_writes_stop(kintsuki_t* h) {
+  if(!h) return;
+  g_ppuCollect = false;
+  // leave the write hook only if a user write callback is still active
+  bool any = false;
+  for(auto& c : g_cWrite) if(c.active) { any = true; break; }
+  ares::SuperFamicom::memWriteHook = any ? &cOnWrite : nullptr;
+}
+
+uint32_t kintsuki_ppu_writes_count(kintsuki_t* h) {
+  if(!h) return 0;
+  return (uint32_t)g_ppuWriteSize;
+}
+
+uint32_t kintsuki_ppu_writes_snapshot(kintsuki_t* h,
+                                      kintsuki_ppu_write_t* out,
+                                      uint32_t cap) {
+  if(!h || !out || cap == 0) return 0;
+  uint32_t n = (uint32_t)((g_ppuWriteSize < cap) ? g_ppuWriteSize : cap);
+  // oldest-first
+  size_t start = (g_ppuWriteHead + kPpuWriteCap - g_ppuWriteSize) % kPpuWriteCap;
+  for(uint32_t i = 0; i < n; i++) {
+    auto& e = g_ppuWrites[(start + i) % kPpuWriteCap];
+    out[i].addr = e.addr;
+    out[i].data = e.data;
+    out[i].v = e.v;
+    out[i].h = e.h;
+    out[i].frame = e.frame;
+  }
+  return n;
 }
 
 // ---- Label enumeration --------------------------------------------------

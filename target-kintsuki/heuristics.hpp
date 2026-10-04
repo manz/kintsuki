@@ -21,6 +21,7 @@ struct RomInfo {
   std::string board;     // SHVC-1xxX-XX matching boards.bml
   uint32_t programSize;  // size used by the cart (rounded to next pow2)
   bool hiRom;            // true: HiROM ($00:8000-FFFF and $40:0000-FFFF)
+  bool exHiRom;          // map mode $x5: extended HiROM (>4MB, $40-$7D upper half)
   bool fastRom;          // 3.58 MHz vs 2.68 MHz
   bool hasSaveRam;
   uint32_t saveRamSize;  // bytes

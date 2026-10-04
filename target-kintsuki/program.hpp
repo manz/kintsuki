@@ -6,6 +6,7 @@
 #include <ares/ares.hpp>
 #include <sfc/sfc.hpp>
 
+#include <atomic>
 #include <cstdint>
 #include <string>
 #include <vector>
@@ -20,6 +21,13 @@ struct CpuState {
   bool     e;
   bool     stp;  // STP halted
   bool     wai;  // WAI waiting for IRQ
+};
+
+// Plain SPC700 (audio CPU) register snapshot.
+struct SpcState {
+  uint16_t pc;
+  uint8_t  a, x, y, sp;
+  uint8_t  psw;   // raw status byte (c z i h b p v n, bit 0..7)
 };
 
 struct Program : ares::Platform {
@@ -59,6 +67,35 @@ struct Program : ares::Platform {
   auto bootRom() -> bool;
   auto runFrames(u32 n) -> void;
   auto softReset() -> void;
+
+  // ---- ROM-free SPC700 audio path ---------------------------------------
+  // Bring the emulator up with the System pak (boards.bml + ipl.rom) but no
+  // cartridge, so the SPC700 (smp) + S-DSP (dsp) are powered and tickable.
+  // See kintsuki.h for the full boot/install/run/drain contract.
+  auto bootSpc() -> bool;
+  // Copy `len` bytes of `data` into the shared 64KB ARAM (dsp.apuram) at
+  // `addr`, wrapping at the 64KB boundary. ARAM is the single backing store
+  // both smp and dsp read/write.
+  auto aramWrite(u32 addr, const u8* data, u32 len) -> void;
+  auto aramRead(u32 addr, u8* out, u32 len) -> void;
+  // Set the SPC700 program counter (jump the driver into action).
+  auto smpSetPc(u16 pc) -> void;
+  // Poke a CPU->SPC communication port. `port` 0..3 maps to $2140-$2143 on
+  // the CPU side / $F4-$F7 on the SPC side.
+  auto smpWritePort(int port, u8 value) -> void;
+  auto smpReadPort(int port) const -> u8;
+  // SPC700 register snapshot + restore, and the 128-byte S-DSP register
+  // file. Read-side inspection for tests / debuggers driving the audio core.
+  auto spcGetState() const -> SpcState;
+  auto spcSetState(const SpcState& s) -> void;
+  auto dspRegisters(u8* out, u32 len) const -> u32;
+  // Advance smp+dsp (driven by the scheduler) until at least `frames`
+  // additional stereo audio frames have been pushed into the ring, or a
+  // safety spin cap is hit. Returns frames actually produced. Requires
+  // audio to be enabled (otherwise the ring never fills; returns 0).
+  auto runSpcSamples(u32 frames) -> u32;
+  // True once bootSpc (or bootRom) has powered the system.
+  auto isLoaded() const -> bool { return loaded; }
   auto injectSram(const u8* data, u32 len) -> u32;
 
   // Memory: CPU bus (24-bit address)
@@ -101,6 +138,25 @@ struct Program : ares::Platform {
   // renderer happy.
   auto frameOutputWidth() const -> u32;
 
+  // ---- Audio output -----------------------------------------------------
+  // ares pushes resampled stereo samples (at audioSampleRate) through the
+  // `audio()` platform callback as the SPC/DSP runs. We funnel them into a
+  // lock-free SPSC ring drained by the host's real-time audio thread
+  // (CoreAudio render callback in the macOS app). Disabled by default so
+  // headless / Python use accrues no overhead; the app flips it on.
+  static constexpr double   audioSampleRate = 48000.0;
+  // Power-of-two stereo-frame capacity (~170ms @ 48kHz), big enough to
+  // absorb the jitter between the 60Hz emulation tick and the audio clock.
+  static constexpr uint32_t audioRingFrames = 8192;
+
+  auto setAudioEnabled(bool enable) -> void;
+  auto audioEnabledState() const -> bool { return audioEnabled; }
+  // Consumer side (host audio thread): copy up to `frames` interleaved
+  // stereo frames into `out` (length >= frames*2). Returns frames written.
+  auto audioRead(float* out, uint32_t frames) -> uint32_t;
+  // Stereo frames currently queued.
+  auto audioAvailable() const -> uint32_t;
+
   // Input. Bits indexed by Gamepad enum
   // (Up=0, Down=1, Left=2, Right=3, B=4, A=5, Y=6, X=7, L=8, R=9, Select=10, Start=11).
   auto setButton(u32 port, u32 button, bool pressed) -> void;
@@ -120,6 +176,12 @@ struct Program : ares::Platform {
   // doesn't get clobbered by an accidental save file.
   bool loadSrmSidecar = true;
 
+  // PPU VRAM size in bytes, applied at bootRom() before the first power().
+  // 64K is stock hardware; 128K models the VA15 mod (an extra VRAM chip
+  // wired so the PPU can address a second 64K bank). Only 65536 and 131072
+  // are accepted (see kintsuki_set_vram_size).
+  uint32_t vramSizeBytes = 64 * 1024;
+
 private:
   // ROM image + cart pak built at load_rom().
   std::vector<uint8_t> romData;
@@ -131,6 +193,16 @@ private:
 
   // System pak (boards.bml + ipl.rom) built at construction.
   std::shared_ptr<vfs::directory> systemPak;
+
+  // Audio ring (interleaved stereo f32). Single producer (emulation thread,
+  // via the `audio()` callback) / single consumer (host audio thread).
+  // Free-running u32 indices; capacity is a power of two so wrap is a mask.
+  std::vector<float>    audioRing;
+  std::atomic<uint32_t> audioWriteIdx{0};
+  std::atomic<uint32_t> audioReadIdx{0};
+  bool                  audioEnabled = false;
+
+  auto audioPushFrame(float l, float r) -> void;
 
   // Track which pak() call we're on. ares calls pak() once for the system
   // node and once for the cartridge peripheral; we identify by node name.

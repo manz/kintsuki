@@ -20,11 +20,13 @@ auto SMP::read(n16 address) -> n8 {
     n8 data = readRAM(address);
     if((address & 0xfff0) == 0x00f0) data = readIO(address);
     wait(1, address);
+    if(smpReadHook) smpReadHook(address, data);
     return data;
   } else {
     wait(0, address);
     n8 data = readRAM(address);
     if((address & 0xfff0) == 0x00f0) data = readIO(address);
+    if(smpReadHook) smpReadHook(address, data);
     return data;
   }
 }
@@ -33,6 +35,7 @@ auto SMP::write(n16 address, n8 data) -> void {
   wait(0, address);
   writeRAM(address, data);  //even IO writes affect underlying RAM
   if((address & 0xfff0) == 0x00f0) writeIO(address, data);
+  if(smpWriteHook) smpWriteHook(address, data);
 }
 
 auto SMP::readDisassembler(n16 address) -> n8 {
