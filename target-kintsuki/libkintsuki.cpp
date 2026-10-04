@@ -268,6 +268,18 @@ void kintsuki_set_srm_sidecar(kintsuki_t* h, int enable) {
   h->program->loadSrmSidecar = (enable != 0);
 }
 
+int kintsuki_set_vram_size(kintsuki_t* h, uint32_t bytes) {
+  if(!h) return 0;
+  if(bytes != 0x10000 && bytes != 0x20000) return 0;
+  h->program->vramSizeBytes = bytes;
+  return 1;
+}
+
+uint32_t kintsuki_vram_size(kintsuki_t* h) {
+  if(!h) return 0;
+  return h->program->vramSizeBytes;
+}
+
 uint32_t kintsuki_inject_sram(kintsuki_t* h, const uint8_t* data, uint32_t len) {
   if(!h) return 0;
   return h->program->injectSram(data, len);
@@ -363,7 +375,8 @@ void    kintsuki_oam_write(kintsuki_t* h, uint32_t addr, uint8_t v)  { if(h) h->
 
 uint32_t kintsuki_vram_dump(kintsuki_t* h, uint8_t* out, uint32_t len) {
   if(!h || !out) return 0;
-  uint32_t n = len < 0x10000 ? len : 0x10000;
+  uint32_t cap = h->program->vramSizeBytes;      // 128K only with the VA15 mod
+  uint32_t n = len < cap ? len : cap;
   for(uint32_t i = 0; i < n; i++) out[i] = h->program->vramRead(i);
   return n;
 }
@@ -844,7 +857,40 @@ void cOnRead(uint32_t addr, uint8_t value) {
   cFire(g_cRead, addr, value);
 }
 
+// ---- PPU register write event log --------------------------------------
+// Records every write to $2100-$213F with the LIVE scanline/dot
+// (cpu.vcounter()/hcounter()) - the CPU->PPU sync means these are accurate at
+// the write, unlike a Python callback reading the stale latched io.vcounter.
+// Purpose: per-scanline PPU-write timeline (Mesen event-viewer style) to catch
+// mid-active-display register writes that a frame-end snapshot can't see.
+struct PpuWriteEvent {
+  uint16_t addr;    // $2100-$213F
+  uint8_t  data;
+  uint16_t v;       // cpu.vcounter() at the write (live scanline)
+  uint16_t h;       // cpu.hcounter() at the write (live dot)
+  uint64_t frame;   // framesRendered at the write
+};
+constexpr size_t kPpuWriteCap = 8192;
+PpuWriteEvent g_ppuWrites[kPpuWriteCap] = {};
+size_t g_ppuWriteHead = 0;   // ring head (next slot)
+size_t g_ppuWriteSize = 0;
+bool   g_ppuCollect = false;
+
 void cOnWrite(uint32_t addr, uint8_t value) {
+  if(g_ppuCollect) {
+    uint16_t a = (uint16_t)(addr & 0xffff);
+    if(a >= 0x2100 && a <= 0x213f) {
+      g_ppuWrites[g_ppuWriteHead] = PpuWriteEvent{
+        .addr = a,
+        .data = value,
+        .v = (uint16_t)ares::SuperFamicom::cpu.vcounter(),
+        .h = (uint16_t)ares::SuperFamicom::cpu.hcounter(),
+        .frame = (g_handle ? g_handle->program->framesRendered : 0),
+      };
+      g_ppuWriteHead = (g_ppuWriteHead + 1) % kPpuWriteCap;
+      if(g_ppuWriteSize < kPpuWriteCap) g_ppuWriteSize++;
+    }
+  }
   if(g_cWritePages[(addr & 0xffffff) >> 8] == 0) return;
   cFire(g_cWrite, addr, value);
 }
@@ -1691,6 +1737,48 @@ uint32_t kintsuki_dma_log_snapshot(kintsuki_t* h,
 void kintsuki_dma_log_clear(kintsuki_t* h) {
   if(!h) return;
   g_dmaLogSize = 0;
+}
+
+// ---- PPU register write log --------------------------------------------
+
+void kintsuki_ppu_writes_start(kintsuki_t* h) {
+  if(!h) return;
+  g_ppuWriteHead = 0;
+  g_ppuWriteSize = 0;
+  g_ppuCollect = true;
+  ares::SuperFamicom::memWriteHook = &cOnWrite;   // ensure the write path is armed
+}
+
+void kintsuki_ppu_writes_stop(kintsuki_t* h) {
+  if(!h) return;
+  g_ppuCollect = false;
+  // leave the write hook only if a user write callback is still active
+  bool any = false;
+  for(auto& c : g_cWrite) if(c.active) { any = true; break; }
+  ares::SuperFamicom::memWriteHook = any ? &cOnWrite : nullptr;
+}
+
+uint32_t kintsuki_ppu_writes_count(kintsuki_t* h) {
+  if(!h) return 0;
+  return (uint32_t)g_ppuWriteSize;
+}
+
+uint32_t kintsuki_ppu_writes_snapshot(kintsuki_t* h,
+                                      kintsuki_ppu_write_t* out,
+                                      uint32_t cap) {
+  if(!h || !out || cap == 0) return 0;
+  uint32_t n = (uint32_t)((g_ppuWriteSize < cap) ? g_ppuWriteSize : cap);
+  // oldest-first
+  size_t start = (g_ppuWriteHead + kPpuWriteCap - g_ppuWriteSize) % kPpuWriteCap;
+  for(uint32_t i = 0; i < n; i++) {
+    auto& e = g_ppuWrites[(start + i) % kPpuWriteCap];
+    out[i].addr = e.addr;
+    out[i].data = e.data;
+    out[i].v = e.v;
+    out[i].h = e.h;
+    out[i].frame = e.frame;
+  }
+  return n;
 }
 
 // ---- Label enumeration --------------------------------------------------

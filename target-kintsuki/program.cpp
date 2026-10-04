@@ -334,6 +334,10 @@ auto Program::bootRom() -> bool {
     }
   }
 
+  // PPU::power() latches vram.mask from this setting, so it has to be set
+  // between load() (which creates the node) and the first power().
+  SuperFamicom::ppuPerformanceImpl.vramSize->setValue(vramSizeBytes);
+
   SuperFamicom::system.power(false);
   loaded = true;
   return true;
@@ -497,14 +501,15 @@ auto Program::memWrite(u32 addr, u8 val) -> void {
   SuperFamicom::bus.write(addr & 0xffffff, val);
 }
 
-// VRAM lives in the performance PPU's vram member (n16[64K]).
+// VRAM lives in the performance PPU's vram member (n16[64K] array = 128KB phys).
+// Mask-track vram.mask so tooling reaches the upper bank when 128K VRAM is enabled.
 auto Program::vramRead(u32 addr) -> u8 {
-  uint16_t word = SuperFamicom::ppuPerformanceImpl.vram.data[(addr >> 1) & 0x7fff];
+  uint16_t word = SuperFamicom::ppuPerformanceImpl.vram.data[(addr >> 1) & SuperFamicom::ppuPerformanceImpl.vram.mask];
   return (addr & 1) ? (word >> 8) : (word & 0xff);
 }
 
 auto Program::vramWrite(u32 addr, u8 val) -> void {
-  u32 idx = (addr >> 1) & 0x7fff;
+  u32 idx = (addr >> 1) & SuperFamicom::ppuPerformanceImpl.vram.mask;
   auto& word = SuperFamicom::ppuPerformanceImpl.vram.data[idx];
   uint16_t w = word;
   if(addr & 1) w = (w & 0x00ff) | (uint16_t(val) << 8);

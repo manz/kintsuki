@@ -206,6 +206,22 @@ _bind("kintsuki_dma_log_count",    c_uint32, [HANDLE])
 _bind("kintsuki_dma_log_snapshot", c_uint32, [HANDLE, POINTER(DmaEvent), c_uint32])
 _bind("kintsuki_dma_log_clear",    None,     [HANDLE])
 
+
+class PpuWriteRaw(Structure):
+    _fields_ = [
+        ("addr",  c_uint16),
+        ("data",  c_uint8),
+        ("v",     c_uint16),
+        ("h",     c_uint16),
+        ("frame", c_uint64),
+    ]
+
+
+_bind("kintsuki_ppu_writes_start",    None,     [HANDLE])
+_bind("kintsuki_ppu_writes_stop",     None,     [HANDLE])
+_bind("kintsuki_ppu_writes_count",    c_uint32, [HANDLE])
+_bind("kintsuki_ppu_writes_snapshot", c_uint32, [HANDLE, POINTER(PpuWriteRaw), c_uint32])
+
 # .adbg label table.
 _bind("kintsuki_load_adbg",     c_int,    [HANDLE, c_char_p])
 _bind("kintsuki_clear_adbg",    None,     [HANDLE])
@@ -302,6 +318,8 @@ _bind("kintsuki_tracer_drain", c_uint32, [HANDLE, c_char_p, c_uint32])
 _bind("kintsuki_reset", None, [HANDLE])
 _bind("kintsuki_inject_sram", c_uint32, [HANDLE, POINTER(c_uint8), c_uint32])
 _bind("kintsuki_set_srm_sidecar", None, [HANDLE, c_int])
+_bind("kintsuki_set_vram_size", c_int, [HANDLE, c_uint32])
+_bind("kintsuki_vram_size", c_uint32, [HANDLE])
 
 # Savestate
 _bind("kintsuki_save_state", c_uint32, [HANDLE, c_void_p, c_uint32])

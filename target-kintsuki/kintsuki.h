@@ -54,6 +54,17 @@ void        kintsuki_reset(kintsuki_t*);
 // `.srm` siblings). Set persists for the handle's lifetime.
 void        kintsuki_set_srm_sidecar(kintsuki_t*, int enable);
 
+// PPU VRAM size in bytes. Default 65536 (stock hardware); pass 131072 to
+// model the VA15 mod, which wires a second 64K VRAM bank the PPU can
+// address, so background tile indices and sprite tiledata reach past
+// $FFFF instead of wrapping. Call BEFORE kintsuki_load_rom: the size is
+// latched into vram.mask at the first power-on. Returns 1 on success, 0
+// if `bytes` is neither 65536 nor 131072 (the setting is left unchanged).
+int         kintsuki_set_vram_size(kintsuki_t*, uint32_t bytes);
+
+// Current PPU VRAM size in bytes (65536 or 131072). 0 on a NULL handle.
+uint32_t    kintsuki_vram_size(kintsuki_t*);
+
 // Load `len` bytes from `data` into the cart's SRAM region (the
 // in-memory `save.ram` buffer ares allocated at boot). Use this to
 // inject a `.srm` blob without binding the file on disk: the emulator
@@ -621,6 +632,22 @@ uint32_t kintsuki_dma_log_snapshot(kintsuki_t*,
                                    kintsuki_dma_event_t* out,
                                    uint32_t cap);
 void     kintsuki_dma_log_clear(kintsuki_t*);
+
+// PPU register write log: every $2100-$213F write with the live scanline/dot.
+typedef struct kintsuki_ppu_write_t {
+  uint16_t addr;    // $2100-$213F
+  uint8_t  data;
+  uint16_t v;       // cpu.vcounter() (live scanline) at the write
+  uint16_t h;       // cpu.hcounter() (live dot) at the write
+  uint64_t frame;   // framesRendered at the write
+} kintsuki_ppu_write_t;
+
+void     kintsuki_ppu_writes_start(kintsuki_t*);
+void     kintsuki_ppu_writes_stop(kintsuki_t*);
+uint32_t kintsuki_ppu_writes_count(kintsuki_t*);
+uint32_t kintsuki_ppu_writes_snapshot(kintsuki_t*,
+                                      kintsuki_ppu_write_t* out,
+                                      uint32_t cap);
 
 // Per-scanline HDMA channel mask for the most recently completed
 // frame (double-buffered). `out[i]` = bitmask of channels that fired

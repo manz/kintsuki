@@ -239,7 +239,8 @@ class _Registered:
     trampoline: ctypes._FuncPointer
 
 
-VRAM_BYTES = 0x10000   # 64 KB, byte-addressed
+VRAM_BYTES = 0x10000   # 64 KB, byte-addressed (stock hardware)
+VRAM_BYTES_VA15 = 0x20000  # 128 KB, the VA15 second-bank mod
 CGRAM_BYTES = 0x200    # 256 colors × 2 bytes
 OAM_BYTES = 0x220      # 512 B sprite table + 32 B high table
 ARAM_BYTES = 0x10000   # 64 KB SPC700 / S-DSP audio RAM
@@ -344,7 +345,8 @@ class Emu:
     # leak into the deterministic SRAM the harness expects.
     default_load_srm_sidecar: bool = True
 
-    def __init__(self, *, load_srm_sidecar: bool | None = None) -> None:
+    def __init__(self, *, load_srm_sidecar: bool | None = None,
+                 vram_size: int = VRAM_BYTES) -> None:
         h = _native.lib.kintsuki_create()
         if not h:
             raise RuntimeError("kintsuki_create failed")
@@ -352,6 +354,23 @@ class Emu:
         self._registered: list[_Registered] = []
         on = Emu.default_load_srm_sidecar if load_srm_sidecar is None else load_srm_sidecar
         _native.lib.kintsuki_set_srm_sidecar(self._handle, 1 if on else 0)
+        self.set_vram_size(vram_size)
+
+    def set_vram_size(self, size: int) -> None:
+        """Set PPU VRAM size: ``VRAM_BYTES`` (64 KB, stock hardware, the
+        default) or ``VRAM_BYTES_VA15`` (128 KB, the mod that wires a second
+        VRAM bank the PPU can address). Must be called before
+        :meth:`load_rom`, since the size is latched at power-on. Raises
+        ``ValueError`` for any other size."""
+        if not _native.lib.kintsuki_set_vram_size(self._handle, size):
+            raise ValueError(
+                f"vram_size must be {VRAM_BYTES} or {VRAM_BYTES_VA15}, got {size}"
+            )
+
+    @property
+    def vram_size(self) -> int:
+        """PPU VRAM size in bytes (64 KB stock, 128 KB with the VA15 mod)."""
+        return int(_native.lib.kintsuki_vram_size(self._handle))
 
     # ------------------------------------------------------------------ ROM
     def load_rom(self, path: str, *, adbg: str | os.PathLike[str] | None = None) -> None:
@@ -545,6 +564,40 @@ class Emu:
 
     def dma_log_clear(self) -> None:
         _native.lib.kintsuki_dma_log_clear(self._handle)
+
+    # ------------------------------------------------------------- PPU write log
+    def ppu_writes_start(self) -> None:
+        """Begin recording every $2100-$213F write with its LIVE scanline/dot
+        (cpu.vcounter()/hcounter()) - accurate at the write, unlike a Python
+        write-callback that reads the stale latched io.vcounter. Clears the ring."""
+        _native.lib.kintsuki_ppu_writes_start(self._handle)
+
+    def ppu_writes_stop(self) -> None:
+        """Stop recording PPU writes (restores the write hook if a user write
+        callback is still active)."""
+        _native.lib.kintsuki_ppu_writes_stop(self._handle)
+
+    def ppu_writes(self, max_entries: int = 8192) -> list[dict]:
+        """Snapshot the PPU-write ring, oldest-first. Each entry: ``addr``
+        ($2100-$213F), ``data``, ``v`` (scanline), ``h`` (dot), ``frame``.
+        Gives a per-scanline PPU-write timeline (Mesen event-viewer style)."""
+        n = int(_native.lib.kintsuki_ppu_writes_count(self._handle))
+        if n == 0:
+            return []
+        cap = min(n, max_entries)
+        buf = (_native.PpuWriteRaw * cap)()
+        wrote = _native.lib.kintsuki_ppu_writes_snapshot(self._handle, buf, cap)
+        out: list[dict] = []
+        for i in range(wrote):
+            e = buf[i]
+            out.append({
+                "addr":  int(e.addr),
+                "data":  int(e.data),
+                "v":     int(e.v),
+                "h":     int(e.h),
+                "frame": int(e.frame),
+            })
+        return out
 
     # ----------------------------------------------------------------- Project
     def project_open(self, dir: str | os.PathLike[str]) -> None:
@@ -854,10 +907,11 @@ class Emu:
         _native.lib.kintsuki_vram_write(self._handle, addr, value & 0xFF)
 
     def vram_read_range(self, addr: int = 0, length: int | None = None) -> memoryview:
-        """Default: full 64 KB VRAM dump from `addr`. Returns a memoryview
-        over the underlying ctypes buffer (zero-copy)."""
+        """Default: full VRAM dump from `addr`: 64 KB, or 128 KB when the
+        VA15 mod is enabled. Returns a memoryview over the underlying ctypes
+        buffer (zero-copy)."""
         if length is None:
-            length = VRAM_BYTES - addr
+            length = self.vram_size - addr
         buf = (ctypes.c_uint8 * length)()
         n = _native.lib.kintsuki_vram_read_range(self._handle, addr, length, buf)
         return memoryview(buf)[:n]

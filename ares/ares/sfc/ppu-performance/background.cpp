@@ -16,7 +16,10 @@ auto PPU::Background::render() -> void {
 
   u32 tileHeight = 3 + io.tileSize;
   u32 tileWidth = !hires ? tileHeight : 4;
-  u32 tileMask = 0x0fff >> io.mode;
+  // 128K VRAM (VA15 mod): widen the tile-index mask one bit so a charbase in the
+  // upper bank (e.g. HDMA BG12NBA = 0x8 -> tiledataAddress 0x8000) survives instead of
+  // wrapping back into the lower 64K. Stock 64K keeps the original 0x0fff mask.
+  u32 tileMask = (self.vram.mask == 0xffff ? 0x1fff : 0x0fff) >> io.mode;
   u32 tiledataIndex = io.tiledataAddress >> 3 + io.mode;
 
   u32 paletteBase = self.io.bgMode == 0 ? id << 5 : 0;

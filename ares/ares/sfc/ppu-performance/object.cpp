@@ -84,7 +84,7 @@ auto PPU::Object::render() -> void {
 
       u32 mirrorX = !object.hflip ? tileX : tileWidth - 1 - tileX;
       u32 address = tiledataAddress + ((characterY + (characterX + mirrorX & 15)) << 4);
-      address = (address & 0xfff0) + (y & 7);
+      address = (address & (self.vram.mask == 0xffff ? 0x1fff0 : 0xfff0)) + (y & 7);  // 128K VA15: reach upper bank
       tile.data.bit( 0,15) = self.vram[address + 0];
       tile.data.bit(16,31) = self.vram[address + 8];
 

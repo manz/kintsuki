@@ -176,6 +176,12 @@ struct Program : ares::Platform {
   // doesn't get clobbered by an accidental save file.
   bool loadSrmSidecar = true;
 
+  // PPU VRAM size in bytes, applied at bootRom() before the first power().
+  // 64K is stock hardware; 128K models the VA15 mod (an extra VRAM chip
+  // wired so the PPU can address a second 64K bank). Only 65536 and 131072
+  // are accepted (see kintsuki_set_vram_size).
+  uint32_t vramSizeBytes = 64 * 1024;
+
 private:
   // ROM image + cart pak built at load_rom().
   std::vector<uint8_t> romData;
