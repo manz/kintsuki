@@ -122,6 +122,17 @@ _bind("kintsuki_step", None, [HANDLE])
 _bind("kintsuki_frame_count", c_uint64, [HANDLE])
 _bind("kintsuki_master_clock", c_uint64, [HANDLE])
 _bind("kintsuki_cpu_cycles", c_uint64, [HANDLE])
+
+
+class LiveCountersRaw(Structure):
+    _fields_ = [
+        ("master", c_uint64),
+        ("v",      c_uint16),
+        ("h",      c_uint16),
+    ]
+
+
+_bind("kintsuki_live_counters", None, [HANDLE, POINTER(LiveCountersRaw)])
 _bind("kintsuki_run_until", c_int, [HANDLE, c_uint32, c_uint32])
 _bind("kintsuki_run_until_ex", c_int,
       [HANDLE, c_uint32, c_uint32, POINTER(c_uint64)])

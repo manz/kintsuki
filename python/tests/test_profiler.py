@@ -129,3 +129,22 @@ def test_profiler_master_cycles_property(assemble_rom):
         # reduced; raw clock progresses forward. (Across many run_frames
         # calls the absolute value is non-monotonic — documented caveat.)
         assert after > before
+
+
+def test_profiler_pairs_jsr_indexed_indirect(assemble_rom):
+    """JSR (abs,X) pushes a frame: each job's RTS pops its own, so the
+    dispatcher's inclusive cycles cover both jobs plus its own 32 nops."""
+    rom = assemble_rom("test_jsr_indirect.s")
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        emu.profile_start()
+        emu.run_frames(4)
+        by_pc = _by_pc(emu.profile_stop())
+
+    dispatch, job_a, job_b = by_pc[0x008100], by_pc[0x008200], by_pc[0x008300]
+    assert dispatch.calls > 10
+    assert job_a.calls in (dispatch.calls, dispatch.calls + 1)
+    assert job_b.calls in (dispatch.calls, dispatch.calls + 1)
+    assert dispatch.excl_cycles > job_b.excl_cycles  # 32 nops vs 16
+    per_call = dispatch.incl_cycles / dispatch.calls
+    assert per_call > (job_a.incl_cycles + job_b.incl_cycles) / dispatch.calls

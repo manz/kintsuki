@@ -37,6 +37,9 @@ namespace ares::SuperFamicom {
 namespace {
 constexpr size_t kCallstackCap = 256;
 std::deque<kintsuki_call_frame_t> g_callstack;
+// S right after each frame's JSR/JSL push, parallel to g_callstack: which
+// hardware stack the frame lives on (see switchShadowStack).
+std::deque<uint16_t> g_callstackS;
 kintsuki::AdbgLabels g_labels;
 // Project file (slice 1): persistent reversing state. Declared up here so
 // kintsuki_destroy (file-order above the body where g_project is used)
@@ -155,13 +158,91 @@ void profileOnReturn() {
   }
 }
 
+// ---- Shadow-stack switching (tasks, fibers, coroutines) ----------------
+// One shadow stack per hardware stack. A TCS/TXS that moves S off the live
+// stack parks its frames (shadow callstack + profiler frames) and resumes the
+// parked stack whose top frame sits at most kStackResumeSlack bytes above the
+// new S (a suspended task's saved S is its yield frame minus the registers it
+// pushed), or starts an empty one (a task entered through a fabricated frame).
+// A TCS that stays within the slack of the live stack (a local frame:
+// tsc / sbc / tcs) is not a switch.
+//
+// A parked stack's profiler clocks stop: on resume every frame's push_clock
+// moves forward by the parked time, so incl/excl count the cycles a function
+// ran, not the time another task held the CPU.
+struct ParkedStack {
+  std::deque<kintsuki_call_frame_t> calls;
+  std::deque<uint16_t>              calls_s;
+  std::vector<ProfFrame>            prof;
+  uint64_t                          parked_at = 0;
+};
+constexpr uint16_t kStackResumeSlack = 0x80;
+constexpr size_t   kParkedStackCap   = 64;
+std::vector<ParkedStack> g_parkedStacks;
+
+bool stackResumesAt(uint16_t top_s, uint16_t new_s) {
+  return top_s >= new_s && (uint16_t)(top_s - new_s) <= kStackResumeSlack;
+}
+
+void switchShadowStack(uint16_t new_s) {
+  if(!g_callstackS.empty() && stackResumesAt(g_callstackS.back(), new_s)) return;
+  int best = -1;
+  uint16_t bestGap = 0xFFFF;
+  for(size_t i = 0; i < g_parkedStacks.size(); i++) {
+    uint16_t top = g_parkedStacks[i].calls_s.back();
+    if(stackResumesAt(top, new_s) && (uint16_t)(top - new_s) < bestGap) {
+      best = (int)i;
+      bestGap = (uint16_t)(top - new_s);
+    }
+  }
+  if(g_callstack.empty() && best < 0) return;  // nothing to park or resume
+  uint64_t now = profileMasterCycles();
+  ParkedStack resumed;
+  if(best >= 0) {
+    resumed = std::move(g_parkedStacks[best]);
+    g_parkedStacks.erase(g_parkedStacks.begin() + best);
+  }
+  if(!g_callstack.empty()) {
+    if(g_parkedStacks.size() >= kParkedStackCap) g_parkedStacks.erase(g_parkedStacks.begin());
+    ParkedStack parked;
+    parked.calls     = std::move(g_callstack);
+    parked.calls_s   = std::move(g_callstackS);
+    parked.prof      = std::move(g_profileStack);
+    parked.parked_at = now;
+    g_parkedStacks.push_back(std::move(parked));
+  }
+  g_callstack    = std::move(resumed.calls);
+  g_callstackS   = std::move(resumed.calls_s);
+  g_profileStack = std::move(resumed.prof);
+  for(auto& f : g_profileStack) f.push_clock += now - resumed.parked_at;
+}
+
+// Every live and parked frame: the call chain they describe is gone (reset,
+// state load, CPU rearm).
+void clearShadowStacks() {
+  g_callstack.clear();
+  g_callstackS.clear();
+  g_parkedStacks.clear();
+}
+
+// Profiler frames only: a new or stopped profile window must not pop frames
+// stamped by an earlier one, live or parked.
+void clearProfileFrames() {
+  g_profileStack.clear();
+  for(auto& p : g_parkedStacks) p.prof.clear();
+}
+
 void cOnCall(uint32_t callsite_pc, uint32_t target_pc, uint8_t kind) {
-  if(g_callstack.size() >= kCallstackCap) g_callstack.pop_front();
+  if(g_callstack.size() >= kCallstackCap) {
+    g_callstack.pop_front();
+    g_callstackS.pop_front();
+  }
   kintsuki_call_frame_t f{};
   f.callsite_pc = callsite_pc & 0xFFFFFF;
   f.target_pc   = target_pc   & 0xFFFFFF;
   f.kind        = kind;
   g_callstack.push_back(f);
+  g_callstackS.push_back(ares::SuperFamicom::cpu.r.s.w);
   profileOnCall(target_pc);
   // Auto-seed entry flags at every JSR/JSL target so cold-cache disasm at
   // any reached function knows the caller's M/X/E. First writer wins —
@@ -180,6 +261,7 @@ void cOnReturn(uint8_t kind) {
   // top frame is the routine that's exiting.
   uint32_t entry = g_callstack.back().target_pc & 0xFFFFFF;
   g_callstack.pop_back();
+  g_callstackS.pop_back();
   profileOnReturn();
   if(g_project) {
     // exit_pc = the RTS/RTL opcode address. cOnExec stashes the last
@@ -213,7 +295,7 @@ kintsuki_t* kintsuki_create(void) {
   // single null-check per JSR/RTS, identical to execHook's pattern.
   ares::callHook   = &cOnCall;
   ares::returnHook = &cOnReturn;
-  g_callstack.clear();
+  clearShadowStacks();
   return h;
 }
 
@@ -231,7 +313,7 @@ void kintsuki_destroy(kintsuki_t* h) {
   ares::SuperFamicom::smpWriteHook = nullptr;
   ares::callHook = nullptr;
   ares::returnHook = nullptr;
-  g_callstack.clear();
+  clearShadowStacks();
   g_labels.clear();
   g_tracer_last_label = nullptr;
   g_project.reset();
@@ -245,7 +327,7 @@ int kintsuki_load_rom(kintsuki_t* h, const char* path) {
   if(!h->program->loadRom(path)) return 0;
   if(!h->program->bootRom()) return 0;
   // Fresh cart = fresh call chain; previous run's frames are stale.
-  g_callstack.clear();
+  clearShadowStacks();
   return 1;
 }
 
@@ -254,7 +336,7 @@ void kintsuki_reset(kintsuki_t* h) {
   h->program->softReset();
   // Reset wipes the live timeline; any retained frames describe a
   // call chain that no longer exists in the just-rebooted CPU.
-  g_callstack.clear();
+  clearShadowStacks();
 }
 
 int kintsuki_rom_is_hirom(kintsuki_t* h) {
@@ -304,6 +386,13 @@ uint64_t kintsuki_frame_count(kintsuki_t* h) { return h ? h->program->framesRend
 uint64_t kintsuki_master_clock(kintsuki_t* h) {
   if(!h) return 0;
   return ares::SuperFamicom::cpu.clock();
+}
+
+void kintsuki_live_counters(kintsuki_t* h, kintsuki_live_counters_t* out) {
+  if(!h || !out) return;
+  out->master = profileMasterCycles();
+  out->v = (uint16_t)ares::SuperFamicom::cpu.vcounter();
+  out->h = (uint16_t)ares::SuperFamicom::cpu.hcounter();
 }
 
 uint64_t kintsuki_cpu_cycles(kintsuki_t* h) {
@@ -569,7 +658,7 @@ int kintsuki_load_state(kintsuki_t* h, const void* buf, uint32_t len) {
   // Live call chain belongs to the pre-load run; the new state is a
   // different point in time, so any future RTS would otherwise pop the
   // stale frame and report bogus callsites.
-  g_callstack.clear();
+  clearShadowStacks();
   return 1;
 }
 
@@ -581,7 +670,7 @@ int kintsuki_load_state_ex(kintsuki_t* h, const void* buf, uint32_t len,
   if(!h->program->loadStateBlobEx((const uint8_t*)buf, len, flags, expected)) {
     return 0;
   }
-  g_callstack.clear();
+  clearShadowStacks();
   return 1;
 }
 
@@ -629,7 +718,7 @@ int kintsuki_spc_boot(kintsuki_t* h) {
   if(!h->program->bootSpc()) return 0;
   // Fresh power-up: any retained call frames describe a chain that no
   // longer exists. Keep parity with kintsuki_load_rom.
-  g_callstack.clear();
+  clearShadowStacks();
   return 1;
 }
 
@@ -825,6 +914,17 @@ void tracerOnExec(uint32_t pc);
 
 void cOnExec(uint32_t pc) {
   g_lastExecPc = pc & 0xFFFFFF;
+  {
+    // TCS / TXS about to run: S may be moving to another stack (a task or
+    // fiber switch). The hook fires before the instruction, so the new S is
+    // the source register now.
+    auto& r = ares::SuperFamicom::cpu.r;
+    uint8_t opcode = ares::SuperFamicom::cpu.readDisassembler(pc & 0xFFFFFF);
+    if(opcode == 0x1B || opcode == 0x9A) {
+      uint16_t src = opcode == 0x1B ? r.a.w : r.x.w;
+      switchShadowStack(r.e ? (uint16_t)(0x0100 | (src & 0xFF)) : src);
+    }
+  }
   if(g_project) {
     // Resolve instruction length from the live opcode + M/X flags so
     // operand bytes get marked as CodeOperand (the user can spot
@@ -1031,7 +1131,7 @@ void kintsuki_remove_callback(kintsuki_t* h, int kind, int id) {
   if(!any) {
     // Keep hooks armed when a project is open — the project relies on
     // exec + read marks even with zero user-registered CBs.
-    if(kind == CB_EXEC  && !g_project) ares::SuperFamicom::execHook = nullptr;
+    if(kind == CB_EXEC  && !g_project && !g_profileActive) ares::SuperFamicom::execHook = nullptr;
     if(kind == CB_READ  && !g_project) ares::SuperFamicom::memReadHook = nullptr;
     if(kind == CB_WRITE)               ares::SuperFamicom::memWriteHook = nullptr;
   }
@@ -1422,7 +1522,7 @@ void kintsuki_rearm_cpu(kintsuki_t* h) {
   // Same reasoning as load_state: the rebuilt coroutine starts from
   // scratch; any frames left over describe a call chain that no longer
   // exists in the now-discarded host stack.
-  g_callstack.clear();
+  clearShadowStacks();
 }
 
 int kintsuki_run_until(kintsuki_t* h, uint32_t target_pc, uint32_t max_frames) {
@@ -1472,13 +1572,13 @@ uint32_t kintsuki_callstack_snapshot(kintsuki_t* h,
 
 void kintsuki_callstack_clear(kintsuki_t* h) {
   if(!h) return;
-  g_callstack.clear();
+  clearShadowStacks();
 }
 
 void kintsuki_profile_start(kintsuki_t* h, uint32_t lo, uint32_t hi) {
   if(!h) return;
   g_profileStats.clear();
-  g_profileStack.clear();
+  clearProfileFrames();
   g_profileLo = lo & 0xFFFFFF;
   g_profileHi = hi & 0xFFFFFF;
   // Re-baseline the master-cycle widener. We don't reset the ares core
@@ -1487,6 +1587,9 @@ void kintsuki_profile_start(kintsuki_t* h, uint32_t lo, uint32_t hi) {
   g_lastMasterCounter = ares::SuperFamicom::cpu.masterCycleCounter();
   g_masterCounterBase = 0;
   g_profileActive = true;
+  // Stack switches (TCS/TXS) are seen by the exec hook: keep it armed for
+  // the profile window.
+  if(!ares::SuperFamicom::execHook) ares::SuperFamicom::execHook = &cOnExec;
 }
 
 void kintsuki_profile_stop(kintsuki_t* h) {
@@ -1495,13 +1598,17 @@ void kintsuki_profile_stop(kintsuki_t* h) {
   // Drop any unclosed frames — partial functions in-flight at stop have
   // no honest incl number. Leaving them in g_profileStack would corrupt
   // a subsequent profile_start's first push/pop accounting.
-  g_profileStack.clear();
+  clearProfileFrames();
+  bool anyExec = false;
+  for(auto& c : g_cExec) if(c.active) { anyExec = true; break; }
+  if(!anyExec && !g_project && ares::SuperFamicom::execHook == &cOnExec)
+    ares::SuperFamicom::execHook = nullptr;
 }
 
 void kintsuki_profile_reset(kintsuki_t* h) {
   if(!h) return;
   g_profileStats.clear();
-  g_profileStack.clear();
+  clearProfileFrames();
 }
 
 uint32_t kintsuki_profile_stats_count(kintsuki_t* h) {
