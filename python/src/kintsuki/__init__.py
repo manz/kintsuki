@@ -30,6 +30,7 @@ __all__ = [
     "CallbackKind",
     "SymbolTable",
     "FnStat",
+    "LiveCounters",
 ]
 
 
@@ -49,6 +50,18 @@ class FnStat:
     excl_cycles: int
     max_cycles: int
     min_cycles: int
+
+
+@dataclass(frozen=True)
+class LiveCounters:
+    """Counters read at the instruction being executed (see
+    :meth:`Emu.live_counters`). ``master`` is a monotonic master-cycle count
+    (deltas only, the origin is arbitrary); ``v`` / ``h`` are the scanline and
+    dot the CPU sees."""
+
+    master: int
+    v: int
+    h: int
 
 
 @dataclass(frozen=True)
@@ -867,6 +880,16 @@ class Emu:
         # ares-scaled master clock; monotonic u64. Use raw deltas for relative
         # measurement — the absolute unit is "master ticks since reset".
         return int(_native.lib.kintsuki_master_clock(self._handle))
+
+    def live_counters(self) -> LiveCounters:
+        """Master cycles + scanline/dot at the instruction being executed.
+        Unlike :attr:`master_cycles` (a scheduler-slice clock) and the PPU's
+        latched counters, these are exact inside exec/read/write callbacks:
+        e.g. a write callback on a frame-ready flag can time the main loop
+        against the NMI."""
+        raw = _native.LiveCountersRaw()
+        _native.lib.kintsuki_live_counters(self._handle, raw)
+        return LiveCounters(master=int(raw.master), v=int(raw.v), h=int(raw.h))
 
     @property
     def cpu_cycles(self) -> int:

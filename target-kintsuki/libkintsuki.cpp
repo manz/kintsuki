@@ -388,6 +388,13 @@ uint64_t kintsuki_master_clock(kintsuki_t* h) {
   return ares::SuperFamicom::cpu.clock();
 }
 
+void kintsuki_live_counters(kintsuki_t* h, kintsuki_live_counters_t* out) {
+  if(!h || !out) return;
+  out->master = profileMasterCycles();
+  out->v = (uint16_t)ares::SuperFamicom::cpu.vcounter();
+  out->h = (uint16_t)ares::SuperFamicom::cpu.hcounter();
+}
+
 uint64_t kintsuki_cpu_cycles(kintsuki_t* h) {
   if(!h) return 0;
   // SNES CPU runs at master/6. Thread clock is in ares-scaled units; the

@@ -86,6 +86,18 @@ uint64_t    kintsuki_frame_count(kintsuki_t*);
 uint64_t    kintsuki_master_clock(kintsuki_t*);
 uint64_t    kintsuki_cpu_cycles(kintsuki_t*);
 
+// Live counters, read at the instruction being executed: valid inside exec /
+// read / write callbacks, where master_clock (a scheduler-slice clock) and
+// the PPU's latched counters lag. `master` is the monotonic master-cycle
+// counter the profiler uses (deltas only: its origin is arbitrary); `v` / `h`
+// are the CPU's view of the PPU scanline and dot.
+typedef struct {
+  uint64_t master;
+  uint16_t v;
+  uint16_t h;
+} kintsuki_live_counters_t;
+void        kintsuki_live_counters(kintsuki_t*, kintsuki_live_counters_t* out);
+
 // Mid-frame run-until. Yields the scheduler the moment the CPU is about
 // to execute target_pc — does NOT wait for vblank. Returns 1 on hit,
 // 0 if max_frames of emulated time elapsed without reaching the target.
