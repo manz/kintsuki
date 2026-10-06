@@ -103,6 +103,9 @@ auto WDC65816::instructionCallIndexedIndirect() -> void {
   idle();
   W.l = read(PC.b << 16 | n16(V.w + X.w + 0));
 L W.h = read(PC.b << 16 | n16(V.w + X.w + 1));
+  // JSR (abs,X): both operand bytes fetched, so the opcode sat 3 bytes back.
+  // Its RTS fires returnHook like any JSR's, so the call must push a frame.
+  if(callHook) callHook((PC.b << 16) | u16(PC.w - 3), (PC.b << 16) | W.w, 0);
   PC.w = W.w;
 E S.h = 0x01;
   idleJump();
