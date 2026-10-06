@@ -405,7 +405,10 @@ int         kintsuki_add_callback_ex(kintsuki_t*, int kind, uint32_t lo, uint32_
 void        kintsuki_remove_callback(kintsuki_t*, int kind, int id);
 
 // ---- Shadow callstack ----------------------------------------------------
-// Maintained transparently by the WDC65816 JSR/JSL/RTS/RTL hooks. Frames
+// Maintained transparently by the WDC65816 JSR/JSL/RTS/RTL hooks, one shadow
+// stack per hardware stack while the exec hook is armed (an exec callback, a
+// project, or a profile window): a TCS/TXS onto another stack (task / fiber
+// switch) parks the live frames and resumes that stack's. Frames
 // stay live across `kintsuki_run_*` calls and are explicitly cleared by
 // `kintsuki_callstack_clear` (and implicitly by `kintsuki_load_state` /
 // `kintsuki_rearm_cpu`, since both invalidate the live call chain).
@@ -426,7 +429,8 @@ void     kintsuki_callstack_clear(kintsuki_t*);
 // Aggregates inclusive/exclusive master-cycles per target_pc by hooking
 // into the JSR/JSL/RTS/RTL call chain. While active, every push stamps
 // `cpu.clock()`; every pop computes the delta and folds it into the
-// per-function stat bucket. excl = incl − sum(children's incl).
+// per-function stat bucket. excl = incl − sum(children's incl). Time a
+// function's stack spends parked (another task running) is not counted.
 //
 // Profiler uses master-cycle deltas which are invariant under the ares
 // scheduler's periodic reduce (subtracts same amount from all threads),
