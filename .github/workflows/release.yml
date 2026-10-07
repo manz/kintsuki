@@ -50,7 +50,8 @@ jobs:
 
       - name: Configure + build libkintsuki
         run: |
-          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+          # ares defaults to -march=native; wheels must run on any CPU of the target arch.
+          cmake -S . -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DARES_BUILD_LOCAL=OFF
           ninja -C build kintsuki
 
       - name: Install hatch
