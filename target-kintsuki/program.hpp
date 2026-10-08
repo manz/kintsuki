@@ -175,6 +175,17 @@ struct Program : ares::Platform {
   // sidecar if one exists. Tests flip this off so deterministic SRAM
   // doesn't get clobbered by an accidental save file.
   bool loadSrmSidecar = true;
+  // What to do when incoming SRAM (inject_sram, the .srm sidecar, a savestate's
+  // cart.sram region) doesn't match the cart's declared size: KINTSUKI_SRAM_*
+  // (kintsuki.h). The default refuses with a message in lastError.
+  u32 sramPolicy = 0;
+  // Why the last SRAM-sized operation refused or adjusted its input ("" if
+  // none). kintsuki_last_error() exposes it.
+  std::string lastError;
+  // Fit `len` incoming bytes to a `cap`-byte cart SRAM under sramPolicy into
+  // `out` (cap bytes). false + lastError when the policy refuses. `what`
+  // names the source in the message.
+  auto fitSram(const u8* data, u32 len, u32 cap, std::vector<u8>& out, const char* what) -> bool;
 
   // PPU VRAM size in bytes, applied at bootRom() before the first power().
   // 64K is stock hardware; 128K models the VA15 mod (an extra VRAM chip

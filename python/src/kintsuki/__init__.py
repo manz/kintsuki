@@ -32,6 +32,9 @@ __all__ = [
     "CallbackKind",
     "SymbolTable",
     "FnStat",
+    "SramSizeError",
+    "SramSizeWarning",
+    "SRAM_POLICIES",
     "LiveCounters",
 ]
 
@@ -351,6 +354,18 @@ class DspGlobal:
     fir: tuple[int, ...]  # 8 signed FIR coefficients
 
 
+SRAM_POLICIES = ("error", "truncate", "extend", "fit", "clear")  # KINTSUKI_SRAM_* order
+
+
+class SramSizeError(RuntimeError):
+    """Incoming SRAM didn't match the cart's declared size and the SRAM policy
+    refused it; the message says how to load it anyway."""
+
+
+class SramSizeWarning(UserWarning):
+    """A .srm sidecar's size didn't match the cart; the policy ignored it."""
+
+
 class Emu:
     """High-level wrapper. Single-instance for now (bsnes core uses globals)."""
 
@@ -363,7 +378,8 @@ class Emu:
     _live: "weakref.WeakSet[Emu]" = weakref.WeakSet()
 
     def __init__(self, *, load_srm_sidecar: bool | None = None,
-                 vram_size: int = VRAM_BYTES) -> None:
+                 vram_size: int = VRAM_BYTES,
+                 sram_policy: str = "error") -> None:
         # kintsuki runs one emulator per process (a single native handle). An
         # Emu still open would share it, then destroy it from its finaliser at
         # some later point - possibly under this one, at a reused address.
@@ -384,6 +400,30 @@ class Emu:
         on = Emu.default_load_srm_sidecar if load_srm_sidecar is None else load_srm_sidecar
         _native.lib.kintsuki_set_srm_sidecar(self._handle, 1 if on else 0)
         self.set_vram_size(vram_size)
+        self.sram_policy = sram_policy
+
+    @property
+    def sram_policy(self) -> str:
+        """What to do with incoming SRAM whose size doesn't match the cart's
+        declared SRAM (inject_sram, the .srm sidecar, a savestate's SRAM):
+        ``"error"`` (default) refuses with :class:`SramSizeError`,
+        ``"truncate"`` drops a longer input's tail, ``"extend"`` zero-fills a
+        shorter one, ``"fit"`` does whichever applies, ``"clear"`` ignores the
+        input and zeroes the cart's SRAM."""
+        return SRAM_POLICIES[int(_native.lib.kintsuki_sram_policy(self._handle))]
+
+    @sram_policy.setter
+    def sram_policy(self, policy: str) -> None:
+        if policy not in SRAM_POLICIES:
+            raise ValueError(f"sram_policy must be one of {SRAM_POLICIES}, got {policy!r}")
+        _native.lib.kintsuki_set_sram_policy(self._handle, SRAM_POLICIES.index(policy))
+
+    @property
+    def last_error(self) -> str:
+        """Why the last SRAM-sized operation refused or adjusted its input
+        ("" if it had nothing to report)."""
+        raw = _native.lib.kintsuki_last_error(self._handle)
+        return raw.decode("utf-8") if raw else ""
 
     def set_vram_size(self, size: int) -> None:
         """Set PPU VRAM size: ``VRAM_BYTES`` (64 KB, stock hardware, the
@@ -410,6 +450,8 @@ class Emu:
         ok = _native.lib.kintsuki_load_rom(self._handle, path.encode("utf-8"))
         if not ok:
             raise RuntimeError(f"failed to load ROM: {path}")
+        if self.last_error:  # a .srm sidecar the SRAM policy refused
+            warnings.warn(self.last_error, SramSizeWarning, stacklevel=2)
         if adbg is not None:
             self.load_adbg(adbg)
 
@@ -1050,13 +1092,17 @@ class Emu:
         _native.lib.kintsuki_reset(self._handle)
 
     def inject_sram(self, data: bytes) -> int:
-        """Copy `data` into the cart's in-memory SRAM. The original `.srm`
-        file (if any) is never touched. Returns bytes copied (clamped to
-        cart SRAM size)."""
+        """Copy `data` into the cart's in-memory SRAM (the original `.srm`
+        file, if any, is never touched). Returns the cart's SRAM size. A
+        `data` whose size doesn't match goes through :attr:`sram_policy`;
+        refused (the default), raises :class:`SramSizeError`."""
         if not data:
             return 0
         buf = (ctypes.c_uint8 * len(data))(*data)
-        return _native.lib.kintsuki_inject_sram(self._handle, buf, len(data))
+        n = int(_native.lib.kintsuki_inject_sram(self._handle, buf, len(data)))
+        if n == 0:
+            raise SramSizeError(self.last_error or "inject_sram failed")
+        return n
 
     def set_state(self, s: CpuState) -> None:
         _native.lib.kintsuki_set_state(self._handle, ctypes.byref(s))
@@ -1071,8 +1117,14 @@ class Emu:
         return bytes(buf)
 
     def load_state(self, blob: bytes) -> None:
+        """Restore a :meth:`save_state` blob. A state whose SRAM size doesn't
+        match the cart's (a state from another ROM or an older build) goes
+        through :attr:`sram_policy`: refused with :class:`SramSizeError` by
+        default, instead of loading shifted garbage."""
         ok = _native.lib.kintsuki_load_state(self._handle, blob, len(blob))
         if not ok:
+            if self.last_error:
+                raise SramSizeError(self.last_error)
             raise RuntimeError("load_state failed")
 
     # Re-exports for convenience.

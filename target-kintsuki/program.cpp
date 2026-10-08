@@ -276,14 +276,23 @@ auto Program::loadRom(const char* path) -> bool {
     // next to a fixture ROM doesn't seed deterministic SRAM with random
     // save data. Default true so end-user clients (Swift app, CLI) get
     // mia-equivalent behaviour.
+    lastError.clear();
     if(loadSrmSidecar) {
       auto trySrm = [&](const std::string& srmPath) {
         auto srm = readFile(srmPath.c_str());
         if(srm.empty()) return false;
-        size_t n = srm.size() < ram.size() ? srm.size() : ram.size();
-        for(size_t i = 0; i < n; i++) ram[i] = srm[i];
+        // A sidecar whose size doesn't match the cart's declared SRAM goes
+        // through the SRAM policy; refused, the cart boots with zeroed SRAM
+        // and lastError says why (the load itself still succeeds).
+        std::vector<u8> fitted;
+        std::string what = "sidecar " + srmPath;
+        if(!fitSram(srm.data(), (u32)srm.size(), (u32)ram.size(), fitted, what.c_str())) {
+          std::fprintf(stderr, "kintsuki: %s\n", lastError.c_str());
+          return true;
+        }
+        ram = std::move(fitted);
         std::fprintf(stderr, "kintsuki: seeded SRAM from %s (%zu bytes)\n",
-                     srmPath.c_str(), n);
+                     srmPath.c_str(), srm.size());
         return true;
       };
       if(!trySrm(p + ".srm")) {
@@ -458,14 +467,39 @@ auto Program::runSpcSamples(u32 frames) -> u32 {
   return produced;
 }
 
+auto Program::fitSram(const u8* data, u32 len, u32 cap, std::vector<u8>& out,
+                      const char* what) -> bool {
+  enum : u32 { ERROR_ = 0, TRUNCATE = 1, EXTEND = 2, FIT = 3, CLEAR = 4 };
+  out.assign(cap, 0);
+  auto copy = [&](u32 n) { if(n) std::memcpy(out.data(), data, n); };
+  if(len == cap) { copy(len); return true; }
+  bool longer = len > cap;
+  switch(sramPolicy) {
+  case CLEAR:    return true;
+  case FIT:      copy(longer ? cap : len); return true;
+  case TRUNCATE: if(longer)  { copy(cap); return true; } break;
+  case EXTEND:   if(!longer) { copy(len); return true; } break;
+  default:       break;
+  }
+  char buf[320];
+  std::snprintf(buf, sizeof(buf),
+    "%s: SRAM is %u bytes but the cart declares %u; set an SRAM policy "
+    "(%s, fit or clear) to load it anyway",
+    what, len, cap, longer ? "truncate" : "extend");
+  lastError = buf;
+  return false;
+}
+
 auto Program::injectSram(const u8* data, u32 len) -> u32 {
+  lastError.clear();
   if(!loaded || !data) return 0;
   auto& ram = SuperFamicom::cartridge.ram;
   u32 cap = (u32)ram.size();
-  if(cap == 0) return 0;
-  u32 n = len < cap ? len : cap;
-  for(u32 i = 0; i < n; i++) ram.data()[i] = data[i];
-  return n;
+  if(cap == 0) { lastError = "inject_sram: the cart has no SRAM"; return 0; }
+  std::vector<u8> fitted;
+  if(!fitSram(data, len, cap, fitted, "inject_sram")) return 0;
+  std::memcpy(ram.data(), fitted.data(), cap);
+  return cap;
 }
 
 auto Program::runFrames(u32 n) -> void {
@@ -764,10 +798,31 @@ auto Program::saveStateBlob() -> std::vector<uint8_t> {
 }
 
 auto Program::loadStateBlob(const uint8_t* data, u32 size) -> bool {
-  // Footer is opt-in for the legacy entry point: if present, just strip it
-  // before handing the inner blob to ares. No size reconciliation happens
-  // here — callers wanting cross-ROM behavior go through loadStateBlobEx.
+  // ares' stream has no size markers: a state whose cart.sram region differs
+  // from the bound cart's would shift every later field (garbage CPU/PPU state,
+  // crashes). When the KSSF footer says so, refuse by default (lastError says
+  // why) or fit the region under sramPolicy. A blob without a footer can't be
+  // checked; it loads as before.
+  lastError.clear();
   auto footer = parseKssfFooter(data, size);
+  u32 cartSram = (u32)SuperFamicom::cartridge.ram.size();
+  if(footer.valid && footer.cartSram.present && footer.cartSram.length != cartSram) {
+    u32 srcOff = footer.cartSram.offset;
+    u32 srcLen = footer.cartSram.length;
+    if(srcOff + srcLen > footer.aresBlobLen) {
+      lastError = "load_state: the KSSF footer points past the state";
+      return false;
+    }
+    std::vector<u8> sram;
+    if(!fitSram(data + srcOff, srcLen, cartSram, sram, "load_state")) return false;
+    std::vector<uint8_t> patched;
+    patched.reserve(footer.aresBlobLen - srcLen + cartSram);
+    patched.insert(patched.end(), data, data + srcOff);
+    patched.insert(patched.end(), sram.begin(), sram.end());
+    patched.insert(patched.end(), data + srcOff + srcLen, data + footer.aresBlobLen);
+    serializer s(patched.data(), (u32)patched.size());
+    return SuperFamicom::system.unserialize(s);
+  }
   u32 aresLen = footer.present ? footer.aresBlobLen : size;
   serializer s(data, aresLen);
   return SuperFamicom::system.unserialize(s);

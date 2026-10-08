@@ -73,6 +73,25 @@ uint32_t    kintsuki_vram_size(kintsuki_t*);
 // SRAM size; 0 if no SRAM or no ROM).
 uint32_t    kintsuki_inject_sram(kintsuki_t*, const uint8_t* data, uint32_t len);
 
+// SRAM size mismatches. Incoming SRAM - kintsuki_inject_sram, the .srm sidecar
+// at load, a savestate's cart.sram region (KSSF footer) - whose size differs
+// from the cart's declared SRAM goes through the policy:
+//   ERROR    refuse (default): inject returns 0, load_state returns 0, a
+//            sidecar is ignored (zeroed SRAM); kintsuki_last_error says why
+//   TRUNCATE accept a longer input, dropping its tail (shorter: refuse)
+//   EXTEND   accept a shorter input, zero-filling the rest (longer: refuse)
+//   FIT      truncate or extend, whichever applies
+//   CLEAR    ignore the incoming SRAM: the cart's SRAM is zeroed
+// kintsuki_last_error returns "" when the last such call had nothing to report.
+#define KINTSUKI_SRAM_ERROR    0
+#define KINTSUKI_SRAM_TRUNCATE 1
+#define KINTSUKI_SRAM_EXTEND   2
+#define KINTSUKI_SRAM_FIT      3
+#define KINTSUKI_SRAM_CLEAR    4
+int         kintsuki_set_sram_policy(kintsuki_t*, uint32_t policy);
+uint32_t    kintsuki_sram_policy(kintsuki_t*);
+const char* kintsuki_last_error(kintsuki_t*);
+
 // Execution
 void        kintsuki_run_frames(kintsuki_t*, uint32_t n);
 void        kintsuki_step(kintsuki_t*);

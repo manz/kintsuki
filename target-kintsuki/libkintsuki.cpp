@@ -362,6 +362,20 @@ uint32_t kintsuki_vram_size(kintsuki_t* h) {
   return h->program->vramSizeBytes;
 }
 
+int kintsuki_set_sram_policy(kintsuki_t* h, uint32_t policy) {
+  if(!h || policy > KINTSUKI_SRAM_CLEAR) return 0;
+  h->program->sramPolicy = policy;
+  return 1;
+}
+
+uint32_t kintsuki_sram_policy(kintsuki_t* h) {
+  return h ? h->program->sramPolicy : 0;
+}
+
+const char* kintsuki_last_error(kintsuki_t* h) {
+  return h ? h->program->lastError.c_str() : "";
+}
+
 uint32_t kintsuki_inject_sram(kintsuki_t* h, const uint8_t* data, uint32_t len) {
   if(!h) return 0;
   return h->program->injectSram(data, len);
