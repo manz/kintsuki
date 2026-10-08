@@ -14,6 +14,8 @@ import ctypes
 import os
 import re
 from dataclasses import dataclass
+import warnings
+import weakref
 from typing import Callable
 
 from . import _native
@@ -357,13 +359,27 @@ class Emu:
     # this class attribute in conftest so a stray fixture .srm doesn't
     # leak into the deterministic SRAM the harness expects.
     default_load_srm_sidecar: bool = True
+    # The open Emu (at most one: a new Emu closes the previous one).
+    _live: "weakref.WeakSet[Emu]" = weakref.WeakSet()
 
     def __init__(self, *, load_srm_sidecar: bool | None = None,
                  vram_size: int = VRAM_BYTES) -> None:
+        # kintsuki runs one emulator per process (a single native handle). An
+        # Emu still open would share it, then destroy it from its finaliser at
+        # some later point - possibly under this one, at a reused address.
+        # Close it now instead.
+        for prev in list(Emu._live):
+            warnings.warn(
+                "an Emu was still open; kintsuki runs one emulator at a time, "
+                "closing it (use `with Emu() as emu:`)",
+                ResourceWarning, stacklevel=2,
+            )
+            prev.close()
         h = _native.lib.kintsuki_create()
         if not h:
             raise RuntimeError("kintsuki_create failed")
         self._handle = h
+        Emu._live.add(self)
         self._registered: list[_Registered] = []
         on = Emu.default_load_srm_sidecar if load_srm_sidecar is None else load_srm_sidecar
         _native.lib.kintsuki_set_srm_sidecar(self._handle, 1 if on else 0)
@@ -1564,9 +1580,17 @@ class Emu:
     # --------------------------------------------------------------- Cleanup
     def close(self) -> None:
         if self._handle:
+            # Unregister this Emu's callbacks before the trampolines are freed
+            # below, so the C side can never call one that's gone.
+            for r in self._registered:
+                if r.kind & 0x100:
+                    _native.lib.kintsuki_spc_remove_callback(self._handle, r.kind & 0xFF, r.cb_id)
+                else:
+                    _native.lib.kintsuki_remove_callback(self._handle, r.kind, r.cb_id)
             _native.lib.kintsuki_destroy(self._handle)
             self._handle = None
             self._registered.clear()
+            Emu._live.discard(self)
 
     def __enter__(self) -> "Emu":
         return self
