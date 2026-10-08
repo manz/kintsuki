@@ -466,6 +466,10 @@ final class Emulator {
         }
         handle = kintsuki_create()
         if let h = handle {
+            // A save sized for another board (a vanilla 8 KB .srm on a
+            // hack whose header declares 128 KB) is fitted rather than
+            // refused: zero-filled when shorter, truncated when longer.
+            _ = kintsuki_set_sram_policy(h, UInt32(KINTSUKI_SRAM_FIT))
             let out = AudioOutput(handle: h)
             out.setMuted(muted)
             audioOutput = out
@@ -1960,7 +1964,8 @@ final class Emulator {
             return kintsuki_inject_sram(h, base, UInt32(data.count))
         }
         guard copied > 0 else {
-            NSLog("kintsuki: loadSRM cart has no SRAM (or 0 copied)")
+            let reason = String(cString: kintsuki_last_error(h))
+            NSLog("kintsuki: loadSRM copied nothing: \(reason.isEmpty ? "cart has no SRAM" : reason)")
             return false
         }
         kintsuki_reset(h)
