@@ -128,10 +128,10 @@ struct KintsukiApp: App {
                     .keyboardShortcut(".", modifiers: .command)
                 Button("Rewind 1 Frame") { emulator.rewindOneFrame() }
                     .keyboardShortcut(.leftArrow, modifiers: .command)
-                    .disabled(emulator.rewindFrames < 2)
+                    .disabled(!emulator.canRewind)
                 Button("Rewind 1 Second") { emulator.rewindBy(frames: 60) }
                     .keyboardShortcut(.leftArrow, modifiers: [.command, .shift])
-                    .disabled(emulator.rewindFrames < 2)
+                    .disabled(!emulator.canRewind)
                 Divider()
                 Button("Tilemap Viewer") { toggleToolWindow("tilemap") }
                     .keyboardShortcut("t", modifiers: [.command, .shift])

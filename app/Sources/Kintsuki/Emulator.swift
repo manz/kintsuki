@@ -486,7 +486,17 @@ final class Emulator {
     private var rewindBuffer = RewindBuffer(capacity: 3600,
                                             keyframeInterval: 60)
     /// Frames currently retained in the rewind buffer (for the status pill).
-    private(set) var rewindFrames: Int = 0
+    private(set) var rewindFrames: Int = 0 {
+        didSet {
+            let can = rewindFrames >= 2
+            if can != canRewind { canRewind = can }
+        }
+    }
+    /// `rewindFrames >= 2`, written only when it flips. The menu bar reads
+    /// this instead of `rewindFrames`: every observed change rebuilds the
+    /// `.commands` menus, which dismisses any open submenu (Open Recent)
+    /// while the buffer fills at ~6 Hz.
+    private(set) var canRewind: Bool = false
     /// Set true while a rewind is in progress so the run loop pauses
     /// captures (otherwise we'd push the rewound state right back onto
     /// the buffer and never make progress).
