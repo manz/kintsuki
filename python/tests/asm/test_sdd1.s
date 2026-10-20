@@ -1,0 +1,115 @@
+; SFC S-DD1 cart (cart type $43) exercising the kintsuki S-DD1 trace:
+;   reset arms S-DD1 channel 0 ($4800/$4801), points GDMA channel 0 at the
+;   blob at $C0:8000 (file 0x8000) and streams 0x100 decompressed bytes
+;   into VRAM word $1000 via VMDATA, then streams 0x40 bytes of the same
+;   blob into WRAM $7E:2000 via WMDATA (the Star Ocean path), then STPs.
+;
+; S-DD1 decoding is total (any byte stream decodes to *something*), so
+; the blob is arbitrary; the test cross-checks the captured stream
+; against kintsuki_sdd1_decompress and against VRAM.
+
+.map identifier=1 bank_range=0x00, 0x6f addr_range=0x8000, 0xffff mask=0x8000 mirror_bank_range=0x80, 0xcf
+.map identifier=2 bank_range=0x7e, 0x7f addr_range=0x0000, 0xffff mask=0x10000 writable=1
+
+*=0x008000
+reset:
+    sei
+    clc
+    xce                  ; native mode
+    rep #0x30
+    ldx.w #0x1FFF
+    txs
+    sep #0x20
+
+    ; Forced blank so VRAM accepts writes outside vblank.
+    lda.b #0x80
+    sta.l 0x002100
+    ; VMAIN = $80 (+1 word after VMDATAH), VMADDR = $1000.
+    sta.l 0x002115
+    rep #0x20
+    lda.w #0x1000
+    sta.l 0x002116
+    sep #0x20
+
+    ; DMAP0 = $09: fixed A-bus address (S-DD1 streams from one address),
+    ; two regs low/high. BBAD0 = $18 (VMDATAL).
+    lda.b #0x09
+    sta.l 0x004300
+    lda.b #0x18
+    sta.l 0x004301
+    ; A1T0/A1B0 = $C0:8000: S-DD1 MMC bank 0 maps it to ROM 0x8000.
+    rep #0x20
+    lda.w #0x8000
+    sta.l 0x004302
+    sep #0x20
+    lda.b #0xC0
+    sta.l 0x004304
+    ; DAS0 = 0x100 bytes.
+    rep #0x20
+    lda.w #0x0100
+    sta.l 0x004305
+    sep #0x20
+
+    ; S-DD1: channel 0 DMA-enable + decompression-enable, then fire.
+    lda.b #0x01
+    sta.l 0x004800
+    sta.l 0x004801
+    sta.l 0x00420B
+
+    ; Second stream: same head, 0x40 bytes into WRAM via WMDATA ($2180).
+    ; WMADD = $7E:2000.
+    rep #0x20
+    lda.w #0x2000
+    sta.l 0x002181
+    sep #0x20
+    lda.b #0x00
+    sta.l 0x002183
+    ; DMAP0 = $08 (fixed A-bus, one register), BBAD0 = $80.
+    lda.b #0x08
+    sta.l 0x004300
+    lda.b #0x80
+    sta.l 0x004301
+    rep #0x20
+    lda.w #0x8000
+    sta.l 0x004302
+    lda.w #0x0040
+    sta.l 0x004305
+    sep #0x20
+    lda.b #0x01
+    sta.l 0x004801
+    sta.l 0x00420B
+    stp
+
+; Cartridge header
+*=0x00FFC0
+.ascii "KINTSUKI SDD1        "
+.db 0x32            ; map mode: LoROM + fast (S-DD1 carts use $32)
+.db 0x43            ; cart type: S-DD1 ($4x) + ROM
+.db 0x09
+.db 0x00            ; no SRAM -> SHVC-1N0N board
+.db 0x01
+.db 0x33
+.db 0x00
+
+*=0x00FFDC
+.dw 0xFFFF
+.dw 0x0000
+
+*=0x00FFE4
+.dw 0x0000, 0x0000, 0x0000, 0x0000, 0x0000, 0x0000
+
+*=0x00FFF4
+.dw 0x0000, 0x0000, 0x0000, 0x0000
+.dw reset
+.dw 0x0000
+
+; Arbitrary "compressed" blob at file 0x8000 (= $C0:8000).
+*=0x018000
+blob:
+.db 0x5A, 0x3C, 0x91, 0xE7, 0x08, 0x6D, 0xB2, 0x4F, 0xC3, 0x17, 0xA8, 0x7E, 0x29, 0xD4, 0x60, 0x95
+.db 0x1B, 0xF2, 0x8C, 0x47, 0xBE, 0x03, 0x72, 0xE9, 0x5D, 0xA6, 0x34, 0xCF, 0x81, 0x1E, 0x6B, 0xF8
+.db 0x42, 0x97, 0x2D, 0xD0, 0x7B, 0x0E, 0xB5, 0x63, 0xEC, 0x19, 0x86, 0x5F, 0x31, 0xCA, 0x74, 0x0B
+.db 0xA3, 0x58, 0xF6, 0x2E, 0x99, 0x45, 0xDB, 0x10, 0x67, 0xBC, 0x83, 0x3A, 0xE1, 0x56, 0x0C, 0xFD
+
+*=0x01FFFF
+.db 0x00

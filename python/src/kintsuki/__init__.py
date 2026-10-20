@@ -636,6 +636,82 @@ class Emu:
     def dma_log_clear(self) -> None:
         _native.lib.kintsuki_dma_log_clear(self._handle)
 
+    # ------------------------------------------------------------- S-DD1
+    def sdd1_present(self) -> bool:
+        """True when the loaded cart carries an S-DD1 (Star Ocean, SFA2)."""
+        return bool(_native.lib.kintsuki_sdd1_present(self._handle))
+
+    def sdd1_registers(self) -> dict | None:
+        """``$4800-$4807`` snapshot: ``dma_enable`` ($4800), ``decomp_enable``
+        ($4801, cleared per channel once its stream ends) and ``banks``
+        ($4804-$4807, the 1 MB ROM page mapped at C0/D0/E0/F0). None
+        without an S-DD1."""
+        buf = (ctypes.c_uint8 * 8)()
+        if not _native.lib.kintsuki_sdd1_registers(self._handle, buf):
+            return None
+        return {
+            "dma_enable":    int(buf[0]),
+            "decomp_enable": int(buf[1]),
+            "banks":         [int(buf[i]) for i in range(4, 8)],
+        }
+
+    def sdd1_streams(self, max_entries: int | None = None, data: bool = False) -> list[dict]:
+        """Snapshot the S-DD1 decompression log (most-recent first), one
+        entry per decompressed DMA stream: ``bus_addr`` (compressed head,
+        $C0-$FF), ``rom_offset`` (head through the MMC banks), ``size``
+        (DMA count requested), ``compressed_size`` (input bytes consumed),
+        ``captured``, ``channel``, ``dst_reg`` ($21XX low byte),
+        ``vram_addr`` (VMADDR word, for $18/$19 targets), ``wram_addr``
+        (WMADD, for $80 targets), ``caller_pc``, ``frame``,
+        ``complete``. ``data=True`` adds the decompressed ``data`` bytes.
+        ``max_entries=None`` returns the whole log."""
+        if max_entries is None:
+            max_entries = _native.lib.kintsuki_sdd1_log_count(self._handle)
+        if max_entries <= 0:
+            return []
+        buf = (_native.Sdd1Event * max_entries)()
+        n = _native.lib.kintsuki_sdd1_log_snapshot(self._handle, buf, max_entries)
+        out: list[dict] = []
+        for i in range(n):
+            e = buf[i]
+            entry = {
+                "bus_addr":        int(e.bus_addr),
+                "rom_offset":      int(e.rom_offset),
+                "size":            int(e.size),
+                "compressed_size": int(e.compressed_size),
+                "captured":        int(e.captured),
+                "channel":         int(e.channel),
+                "dst_reg":         int(e.dst_reg),
+                "vram_addr":       int(e.vram_addr),
+                "wram_addr":       int(e.wram_addr),
+                "caller_pc":       int(e.caller_pc),
+                "frame":           int(e.frame),
+                "complete":        bool(e.complete),
+            }
+            if data:
+                raw = (ctypes.c_uint8 * max(1, e.captured))()
+                got = _native.lib.kintsuki_sdd1_log_data(self._handle, i, raw, e.captured)
+                entry["data"] = bytes(raw[:got])
+            out.append(entry)
+        return out
+
+    def sdd1_log_clear(self) -> None:
+        _native.lib.kintsuki_sdd1_log_clear(self._handle)
+
+    def sdd1_decompress(self, bus_addr: int, size: int) -> tuple[bytes, int]:
+        """Decompress ``size`` bytes of the S-DD1 stream at ``bus_addr``
+        ($C0-$FF, current MMC banks) without disturbing a live transfer.
+        Returns ``(data, compressed_size)``. Raises without an S-DD1."""
+        if not self.sdd1_present():
+            raise RuntimeError("loaded cart has no S-DD1")
+        if size <= 0:
+            raise ValueError(f"size must be positive, got {size}")
+        out = (ctypes.c_uint8 * size)()
+        consumed = ctypes.c_uint32(0)
+        n = _native.lib.kintsuki_sdd1_decompress(
+            self._handle, bus_addr, size, out, ctypes.byref(consumed))
+        return bytes(out[:n]), int(consumed.value)
+
     # ------------------------------------------------------------- PPU write log
     def ppu_writes_start(self) -> None:
         """Begin recording every $2100-$213F write with its LIVE scanline/dot

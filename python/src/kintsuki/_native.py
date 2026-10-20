@@ -218,6 +218,35 @@ _bind("kintsuki_dma_log_snapshot", c_uint32, [HANDLE, POINTER(DmaEvent), c_uint3
 _bind("kintsuki_dma_log_clear",    None,     [HANDLE])
 
 
+# S-DD1 decompression log, populated by libkintsuki via the ares sdd1Hook.
+class Sdd1Event(Structure):
+    _fields_ = [
+        ("bus_addr",        c_uint32),
+        ("rom_offset",      c_uint32),
+        ("compressed_size", c_uint32),
+        ("captured",        c_uint32),
+        ("frame",           c_uint64),
+        ("caller_pc",       c_uint32),
+        ("wram_addr",       c_uint32),
+        ("size",            c_uint16),
+        ("vram_addr",       c_uint16),
+        ("channel",         c_uint8),
+        ("dst_reg",         c_uint8),
+        ("complete",        c_uint8),
+        ("_pad",            c_uint8),
+    ]
+
+
+_bind("kintsuki_sdd1_present",      c_int,    [HANDLE])
+_bind("kintsuki_sdd1_registers",    c_int,    [HANDLE, POINTER(c_uint8)])
+_bind("kintsuki_sdd1_log_count",    c_uint32, [HANDLE])
+_bind("kintsuki_sdd1_log_snapshot", c_uint32, [HANDLE, POINTER(Sdd1Event), c_uint32])
+_bind("kintsuki_sdd1_log_data",     c_uint32, [HANDLE, c_uint32, POINTER(c_uint8), c_uint32])
+_bind("kintsuki_sdd1_log_clear",    None,     [HANDLE])
+_bind("kintsuki_sdd1_decompress",   c_uint32,
+      [HANDLE, c_uint32, c_uint32, POINTER(c_uint8), POINTER(c_uint32)])
+
+
 class PpuWriteRaw(Structure):
     _fields_ = [
         ("addr",  c_uint16),

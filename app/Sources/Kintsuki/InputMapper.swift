@@ -11,7 +11,8 @@ enum SnesButton: Int32 {
 enum InputMapper {
     /// macOS virtual keycodes (NSEvent.keyCode) → SNES button.
     /// Layout matches Mesen's default: ZXAS for face buttons, arrows for
-    /// d-pad, Return = Start, Right Shift = Select, Q/W = L/R.
+    /// d-pad, Return = Start, Q/W = L/R. Select is Space, not Mesen's
+    /// Right Shift: modifier keys only arrive via flagsChanged, never keyDown.
     static func button(forKeyCode code: UInt16) -> SnesButton? {
         switch code {
         case 126: return .up         // Arrow Up
@@ -25,7 +26,7 @@ enum InputMapper {
         case 12:  return .l          // Q
         case 13:  return .r          // W
         case 36:  return .start      // Return
-        case 60, 56: return .select  // Right Shift / Left Shift
+        case 49:  return .select     // Space
         default: return nil
         }
     }

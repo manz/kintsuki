@@ -13,3 +13,16 @@ swiftc -parse-as-library -o "$OUT/rewind_buffer_test" \
     Tests/RewindRingTest.swift
 
 "$OUT/rewind_buffer_test"
+
+swiftc -parse-as-library -o "$OUT/input_mapper_test" \
+    Sources/Kintsuki/InputMapper.swift \
+    Tests/InputMapperTest.swift
+
+"$OUT/input_mapper_test"
+
+swiftc -parse-as-library -o "$OUT/tile_sheet_test" \
+    Sources/Kintsuki/TileDecoder.swift \
+    Sources/Kintsuki/TileSheet.swift \
+    Tests/TileSheetTest.swift
+
+"$OUT/tile_sheet_test"

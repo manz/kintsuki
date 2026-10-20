@@ -407,10 +407,7 @@ struct VRAMViewerView: View {
     /// "$00C0:801F" or "FooRoutine+12" if .adbg is loaded and the PC
     /// lands inside a known routine. Compact enough to fit the DMA row.
     private func callerLabel(for pc: UInt32) -> String {
-        if let (name, off) = emulator.lookupLabelContaining(addr: pc) {
-            return off == 0 ? name : "\(name)+\(String(off, radix: 16))"
-        }
-        return String(format: "$%02X:%04X", pc >> 16, pc & 0xFFFF)
+        emulator.pcLabel(pc)
     }
 
     // ----- Snapshot derivation -----
@@ -424,7 +421,7 @@ struct VRAMViewerView: View {
         }
         let bytes = bytesForCurrentPage()
         let cgram = emulator.cgramSnapshot()
-        let palette = paletteFromCGRAM(cgram)
+        let palette = TilePalette.rgb(fromCGRAM: cgram)
         let tileBytes = bpp.tileBytes
         let tileCount = bytes.count / tileBytes
         snapshot = VRAMSnapshot(bpp: bpp,
@@ -451,25 +448,6 @@ struct VRAMViewerView: View {
             return emulator.vramSnapshot()
         }
         return emulator.readRegion(source, offset: UInt32(start), length: want)
-    }
-
-    private func paletteFromCGRAM(_ cgram: Data) -> [(UInt8, UInt8, UInt8)] {
-        var out = [(UInt8, UInt8, UInt8)](repeating: (0, 0, 0), count: 256)
-        cgram.withUnsafeBytes { raw in
-            guard let p = raw.bindMemory(to: UInt8.self).baseAddress else { return }
-            for i in 0..<256 {
-                let lo = p[i * 2]
-                let hi = p[i * 2 + 1]
-                let bgr = UInt16(lo) | (UInt16(hi) << 8)
-                let r5 = UInt8((bgr >> 0) & 0x1F)
-                let g5 = UInt8((bgr >> 5) & 0x1F)
-                let b5 = UInt8((bgr >> 10) & 0x1F)
-                out[i] = ((r5 << 3) | (r5 >> 2),
-                          (g5 << 3) | (g5 >> 2),
-                          (b5 << 3) | (b5 >> 2))
-            }
-        }
-        return out
     }
 
     private func renderSingleTile(snap: VRAMSnapshot, tileIndex: Int) -> NSImage {
@@ -584,15 +562,4 @@ private struct VRAMTileGrid: View {
         return cgImageFromRGBA(rgba: rgba, width: pxW, height: pxH)
             .map { NSImage(cgImage: $0, size: NSSize(width: pxW, height: pxH)) }
     }
-}
-
-private func cgImageFromRGBA(rgba: [UInt8], width: Int, height: Int) -> CGImage? {
-    guard let provider = CGDataProvider(data: Data(rgba) as CFData) else { return nil }
-    let cs = CGColorSpaceCreateDeviceRGB()
-    return CGImage(width: width, height: height,
-                   bitsPerComponent: 8, bitsPerPixel: 32,
-                   bytesPerRow: width * 4, space: cs,
-                   bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
-                   provider: provider, decode: nil, shouldInterpolate: false,
-                   intent: .defaultIntent)
 }

@@ -35,6 +35,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <vector>
@@ -72,6 +73,11 @@ public:
                                        uint32_t rom_size,
                                        const std::string& manifest_bml,
                                        bool is_hirom);
+
+  // Coprocessor carts whose bus map the LoROM/HiROM fast path can't express
+  // (S-DD1's MMC banks) install a resolver here. It returns -1 for non-ROM
+  // addresses; offsets past rom_size are rejected by the project.
+  void set_bus_mapper(std::function<int64_t(uint32_t)> mapper);
 
   // True if the ROM that was loaded when this project was opened matches
   // the pristine sha recorded in `project.toml`. False = patched ROM

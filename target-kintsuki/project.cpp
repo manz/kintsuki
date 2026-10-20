@@ -141,6 +141,7 @@ struct Project::Impl {
   std::string  manifest_bml;
   uint32_t     rom_size = 0;
   bool         is_hirom = false;
+  std::function<int64_t(uint32_t)> bus_mapper;  // overrides the fast path
   bool         loaded_matches_pristine = true;
   bool         dirty = false;
   bool         labels_dirty = false;
@@ -165,6 +166,10 @@ struct Project::Impl {
   // tracked separately — the manifest is persisted so future builds can
   // implement these against the same project file unchanged).
   int64_t busToRom(uint32_t bus_addr) const {
+    if(bus_mapper) {
+      int64_t off = bus_mapper(bus_addr & 0xFFFFFF);
+      return (off >= 0 && off < rom_size) ? off : -1;
+    }
     uint32_t bank = (bus_addr >> 16) & 0xFF;
     uint32_t addr = bus_addr & 0xFFFF;
     if(is_hirom) {
@@ -555,6 +560,10 @@ void Project::note_exec(uint32_t pc_24, uint8_t insn_len) {
   if(insn_len > 1) {
     mark_auto((uint32_t)off + 1, (uint32_t)insn_len - 1, ByteClass::CodeOperand);
   }
+}
+
+void Project::set_bus_mapper(std::function<int64_t(uint32_t)> mapper) {
+  impl_->bus_mapper = std::move(mapper);
 }
 
 int64_t Project::bus_to_rom_offset(uint32_t bus_addr_24) const {

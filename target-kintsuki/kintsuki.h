@@ -668,6 +668,45 @@ uint32_t kintsuki_dma_log_snapshot(kintsuki_t*,
                                    uint32_t cap);
 void     kintsuki_dma_log_clear(kintsuki_t*);
 
+// ---- S-DD1 decompression log --------------------------------------------
+// One entry per S-DD1 decompressed DMA stream (Star Ocean, SFA2),
+// most-recent first in snapshots, bounded to 4096 streams / 16 MB of
+// captured output (oldest evicted). The decompressed output is kept per
+// stream (kintsuki_sdd1_log_data).
+typedef struct kintsuki_sdd1_event_t {
+  uint32_t bus_addr;         // 24-bit compressed stream head ($C0-$FF)
+  uint32_t rom_offset;       // stream head resolved through the MMC banks
+  uint32_t compressed_size;  // input bytes consumed so far
+  uint32_t captured;         // decompressed bytes captured so far
+  uint64_t frame;            // framesRendered at stream start
+  uint32_t caller_pc;        // top of shadow callstack at stream start
+  uint32_t wram_addr;        // WMADD ($7E/$7F) at start; meaningful when dst_reg == 0x80
+  uint16_t size;             // DMA byte count requested
+  uint16_t vram_addr;        // VMADDR (word) at start; meaningful when dst_reg == 0x18/0x19
+  uint8_t  channel;
+  uint8_t  dst_reg;          // B-bus target low byte ($21XX)
+  uint8_t  complete;         // 1 once the DMA count reached zero
+  uint8_t  _pad;
+} kintsuki_sdd1_event_t;
+
+// 1 when the loaded cart carries an S-DD1.
+int      kintsuki_sdd1_present(kintsuki_t*);
+// $4800-$4807 (index = low nibble; $4802/3 read 0). 0 without S-DD1.
+int      kintsuki_sdd1_registers(kintsuki_t*, uint8_t out[8]);
+uint32_t kintsuki_sdd1_log_count(kintsuki_t*);
+uint32_t kintsuki_sdd1_log_snapshot(kintsuki_t*, kintsuki_sdd1_event_t* out,
+                                    uint32_t cap);
+// Decompressed bytes of snapshot entry `index` (same ordering).
+uint32_t kintsuki_sdd1_log_data(kintsuki_t*, uint32_t index,
+                                uint8_t* out, uint32_t cap);
+void     kintsuki_sdd1_log_clear(kintsuki_t*);
+// Decompress `size` bytes of the stream at `bus_addr` ($C0-$FF, current
+// MMC banks) without touching the live decompressor. Returns bytes
+// written (0 without S-DD1); `out_compressed_size` may be NULL.
+uint32_t kintsuki_sdd1_decompress(kintsuki_t*, uint32_t bus_addr,
+                                  uint32_t size, uint8_t* out,
+                                  uint32_t* out_compressed_size);
+
 // PPU register write log: every $2100-$213F write with the live scanline/dot.
 typedef struct kintsuki_ppu_write_t {
   uint16_t addr;    // $2100-$213F
