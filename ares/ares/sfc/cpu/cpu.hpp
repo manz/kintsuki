@@ -22,6 +22,8 @@ struct CPU : WDC65816, Thread, PPUcounter {
 
   auto interruptPending() const -> bool override { return status.interruptPending; }
   auto pio() const -> n8 { return io.pio; }
+  // kintsuki: WMADD ($2181-$2183) for the S-DD1 trace's WRAM targets.
+  auto wramAddress() const -> u32 { return (u32)io.wramAddress; }
 
   // kintsuki: clear all pending interrupts so an external set_state PC
   // override survives the next scheduler entry. Without this the reset/

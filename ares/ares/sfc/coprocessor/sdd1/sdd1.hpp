@@ -15,6 +15,11 @@ struct SDD1 {
 
   auto serialize(serializer&) -> void;
 
+  // kintsuki: read-only views for the SDD1 trace (register file + the
+  // ROM offset an $C0-$FF bus address resolves to through the MMC).
+  auto reg(n4 index) const -> n8;
+  auto mmcOffset(n24 address) const -> n32;
+
   ReadableMemory rom;
 
 private:

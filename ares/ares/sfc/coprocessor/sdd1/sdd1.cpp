@@ -2,6 +2,40 @@ SDD1 sdd1;
 #include "decompressor.cpp"
 #include "serialization.cpp"
 
+// kintsuki: decompression trace hook. event 0 = stream start (data=0),
+// 1 = decompressed byte, 2 = stream end (data = last byte). `size` is
+// the DMA byte count left BEFORE this byte; `romOffset` is the MMC-
+// resolved ROM offset of the stream head; `inputPos` the compressed
+// input cursor (bus address) after this byte.
+typedef void (*KintsukiSdd1Hook)(uint8_t event, uint8_t channel,
+                                 uint32_t busAddr, uint32_t romOffset,
+                                 uint16_t size, uint32_t inputPos,
+                                 uint8_t data);
+__attribute__((visibility("default")))
+KintsukiSdd1Hook kintsukiSdd1Hook = nullptr;
+
+auto SDD1::reg(n4 index) const -> n8 {
+  switch(index) {
+  case 0x0: return r4800;
+  case 0x1: return r4801;
+  case 0x4: return r4804;
+  case 0x5: return r4805;
+  case 0x6: return r4806;
+  case 0x7: return r4807;
+  }
+  return 0;
+}
+
+auto SDD1::mmcOffset(n24 address) const -> n32 {
+  switch(address.bit(20,21)) {
+  case 0: return (n4)r4804 << 20 | (n20)address;  //c0-cf:0000-ffff
+  case 1: return (n4)r4805 << 20 | (n20)address;  //d0-df:0000-ffff
+  case 2: return (n4)r4806 << 20 | (n20)address;  //e0-ef:0000-ffff
+  case 3: return (n4)r4807 << 20 | (n20)address;  //f0-ff:0000-ffff
+  }
+  unreachable;
+}
+
 auto SDD1::unload() -> void {
   rom.reset();
 }
@@ -72,13 +106,7 @@ auto SDD1::dmaWrite(n24 address, n8 data) -> void {
 }
 
 auto SDD1::mmcRead(n24 address) -> n8 {
-  switch(address.bit(20,21)) {
-  case 0: return rom.read((n4)r4804 << 20 | (n20)address);  //c0-cf:0000-ffff
-  case 1: return rom.read((n4)r4805 << 20 | (n20)address);  //d0-df:0000-ffff
-  case 2: return rom.read((n4)r4806 << 20 | (n20)address);  //e0-ef:0000-ffff
-  case 3: return rom.read((n4)r4807 << 20 | (n20)address);  //f0-ff:0000-ffff
-  }
-  unreachable;
+  return rom.read(mmcOffset(address));
 }
 
 //map address=00-3f,80-bf:8000-ffff
@@ -103,13 +131,19 @@ auto SDD1::mcuRead(n24 address, n8 data) -> n8 {
             //prepare streaming decompression
             decompressor.init(address);
             dmaReady = true;
+            if(kintsukiSdd1Hook) kintsukiSdd1Hook(0, n, address, mmcOffset(address),
+                                                  dma[n].size, address, 0);
           }
 
           //fetch a decompressed byte; once finished, disable channel and invalidate buffer
           data = decompressor.read();
+          if(kintsukiSdd1Hook) kintsukiSdd1Hook(1, n, address, mmcOffset(address), dma[n].size,
+                                                decompressor.im.position(), data);
           if(--dma[n].size == 0) {
             dmaReady = false;
             r4801.bit(n) = 0;
+            if(kintsukiSdd1Hook) kintsukiSdd1Hook(2, n, address, mmcOffset(address), 0,
+                                                  decompressor.im.position(), data);
           }
 
           return data;

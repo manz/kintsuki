@@ -95,6 +95,10 @@ bool detectRom(std::span<const uint8_t> rom, RomInfo& info) {
   // of them as ExHiROM and mapped them at base=0x400000.
   info.exHiRom = (map & 0x0f) == 0x05;
 
+  // Cart type high nibble names the coprocessor; $4x = S-DD1. Its banks
+  // C0-FF go through the MCU, so a plain LoROM board leaves them unmapped.
+  info.sdd1 = (rom[off + 0x16] & 0xf0) == 0x40;
+
   // SRAM size byte at $D8: bytes = 1024 << val (Nintendo SHVC convention).
   // val=3 → 8 KB (typical), val=5 → 32 KB. Cap to 256 KB.
   uint8_t sramShift = rom[off + 0x18];
@@ -117,7 +121,8 @@ bool detectRom(std::span<const uint8_t> rom, RomInfo& info) {
   // Pick the simplest matching SHVC board. boards.bml entries with multiple
   // revisions list them as "1A0N-(01,02,...)" — ares' loadBoard accepts the
   // bare name without revision, falling back to the first listed.
-  if(info.exHiRom)                  info.board = "SHVC-1J3M-EXHI";
+  if(info.sdd1)                     info.board = info.hasSaveRam ? "SHVC-LN3B-01" : "SHVC-1N0N-01";
+  else if(info.exHiRom)             info.board = "SHVC-1J3M-EXHI";
   else if(info.hiRom && info.hasSaveRam) info.board = "SHVC-1J3M-01";
   else if(info.hiRom)               info.board = "SHVC-1J0N-01";
   else if(info.hasSaveRam)          info.board = "SHVC-1A3M-10";

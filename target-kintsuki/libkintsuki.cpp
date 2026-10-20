@@ -29,6 +29,9 @@ namespace ares::SuperFamicom {
   extern KintsukiDmaHook kintsukiDmaHook;
   typedef void (*KintsukiHdmaHook)(uint8_t, uint16_t, uint8_t);
   extern KintsukiHdmaHook kintsukiHdmaHook;
+  typedef void (*KintsukiSdd1Hook)(uint8_t, uint8_t, uint32_t, uint32_t,
+                                   uint16_t, uint32_t, uint8_t);
+  extern KintsukiSdd1Hook kintsukiSdd1Hook;
 }
 
 // ---- Shadow callstack + .adbg label table -------------------------------
@@ -1713,6 +1716,25 @@ int kintsuki_lookup_source(kintsuki_t* h, uint32_t addr,
   return 1;
 }
 
+// ---- S-DD1 bus helpers --------------------------------------------------
+namespace {
+// $C0-$FF through the live MMC banks; $00-$3F/$80-$BF:8000-FFFF LoROM.
+int64_t sdd1BusToRom(uint32_t bus) {
+  uint32_t bank = bus >> 16, addr = bus & 0xFFFF;
+  if(bank >= 0xC0) return ares::SuperFamicom::sdd1.mmcOffset(bus);
+  if(addr >= 0x8000 && (bank & 0x40) == 0) return ((bank & 0x3F) << 15) | (addr & 0x7FFF);
+  return -1;
+}
+
+// True when a DMA on `channel` from `src` will be served by the S-DD1
+// decompressor rather than by plain ROM reads.
+bool sdd1Streaming(uint8_t channel, uint32_t src) {
+  if(!ares::SuperFamicom::cartridge.has.SDD1 || (src >> 16) < 0xC0) return false;
+  auto& sdd1 = ares::SuperFamicom::sdd1;
+  return ((sdd1.reg(0) & sdd1.reg(1)) >> channel) & 1;
+}
+}
+
 // ---- DMA transfer log ---------------------------------------------------
 // Captures each Channel::dmaRun call, deduplicating by (src, dst, size)
 // so a game that re-pushes the same buffer every frame collapses to a
@@ -1747,7 +1769,9 @@ void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
   // Project-file auto-classification: tag the ROM source range by the
   // destination PPU register class (graphics/palette/...) — no-op when
   // no project is open.
-  if(g_project) {
+  // S-DD1 streams read compressed bytes from `src`, not `size` of them:
+  // the SDD1 log marks the consumed span when the stream ends.
+  if(g_project && !sdd1Streaming(channel, src)) {
     uint64_t frame = g_handle ? g_handle->program->framesRendered : 0;
     g_project->note_dma(src, size, dst);
     g_project->note_dma_provenance(src, size, dst, callerPc, frame);
@@ -1858,6 +1882,137 @@ uint32_t kintsuki_dma_log_snapshot(kintsuki_t* h,
 void kintsuki_dma_log_clear(kintsuki_t* h) {
   if(!h) return;
   g_dmaLogSize = 0;
+}
+
+// ---- S-DD1 decompression log -------------------------------------------
+// One entry per decompressed DMA stream, chronological, oldest evicted.
+// Not deduplicated: the decompressed bytes are kept per stream so a
+// re-streamed asset shows up again with its own frame/caller.
+namespace {
+struct Sdd1Stream {
+  kintsuki_sdd1_event_t info;
+  std::vector<uint8_t> data;
+};
+// Games re-stream small animation assets every frame, so the entry cap
+// is generous; the decompressed-byte budget bounds memory instead.
+constexpr size_t kSdd1LogCap = 4096;
+constexpr size_t kSdd1DataBudget = 16u << 20;
+std::deque<Sdd1Stream> g_sdd1Log;
+size_t g_sdd1DataBytes = 0;
+bool g_sdd1Open = false;
+
+void sdd1EvictOldest() {
+  g_sdd1DataBytes -= g_sdd1Log.front().data.size();
+  g_sdd1Log.pop_front();
+}
+
+void sdd1HookFn(uint8_t event, uint8_t channel, uint32_t busAddr,
+                uint32_t romOffset, uint16_t size, uint32_t inputPos,
+                uint8_t data) {
+  if(event == 0) {
+    if(g_sdd1Log.size() >= kSdd1LogCap) sdd1EvictOldest();
+    auto& ch = ares::SuperFamicom::cpu.dmaChannel(channel);
+    Sdd1Stream st{};
+    st.info.bus_addr   = busAddr & 0xFFFFFF;
+    st.info.rom_offset = romOffset;
+    st.info.size       = size;
+    st.info.channel    = channel;
+    st.info.dst_reg    = (uint8_t)ch.targetAddress;
+    st.info.vram_addr  = (uint16_t)ares::SuperFamicom::ppuPerformanceImpl.vram.address;
+    st.info.wram_addr  = 0x7E0000 | ares::SuperFamicom::cpu.wramAddress();
+    st.info.caller_pc  = g_callstack.empty()
+      ? ((uint32_t)ares::SuperFamicom::cpu.r.pc.d & 0xFFFFFF)
+      : (g_callstack.back().target_pc & 0xFFFFFF);
+    st.info.frame      = g_handle ? g_handle->program->framesRendered : 0;
+    g_sdd1Log.push_back(std::move(st));
+    g_sdd1Open = true;
+    return;
+  }
+  if(!g_sdd1Open || g_sdd1Log.empty()) return;
+  auto& st = g_sdd1Log.back();
+  st.info.compressed_size = inputPos - st.info.bus_addr;
+  if(event == 1) {
+    st.data.push_back(data);
+    // Budget eviction never drops the open stream (always the newest).
+    if(++g_sdd1DataBytes > kSdd1DataBudget && g_sdd1Log.size() > 1) sdd1EvictOldest();
+  } else {
+    st.info.complete = 1;
+    g_sdd1Open = false;
+    if(g_project) {
+      uint16_t span = (uint16_t)std::min<uint32_t>(st.info.compressed_size, 0xFFFF);
+      g_project->note_dma(st.info.bus_addr, span, st.info.dst_reg);
+      g_project->note_dma_provenance(st.info.bus_addr, span, st.info.dst_reg,
+                                     st.info.caller_pc, st.info.frame);
+    }
+  }
+}
+
+struct Sdd1HookInstaller {
+  Sdd1HookInstaller() { ares::SuperFamicom::kintsukiSdd1Hook = &sdd1HookFn; }
+} g_sdd1HookInstaller;
+
+// Most-recent-first index -> deque slot.
+const Sdd1Stream* sdd1At(uint32_t index) {
+  if(index >= g_sdd1Log.size()) return nullptr;
+  return &g_sdd1Log[g_sdd1Log.size() - 1 - index];
+}
+}
+
+int kintsuki_sdd1_present(kintsuki_t* h) {
+  return (h && ares::SuperFamicom::cartridge.has.SDD1) ? 1 : 0;
+}
+
+int kintsuki_sdd1_registers(kintsuki_t* h, uint8_t out[8]) {
+  if(!out || !kintsuki_sdd1_present(h)) return 0;
+  for(uint32_t i = 0; i < 8; i++) out[i] = (uint8_t)ares::SuperFamicom::sdd1.reg(i);
+  return 1;
+}
+
+uint32_t kintsuki_sdd1_log_count(kintsuki_t* h) {
+  return h ? (uint32_t)g_sdd1Log.size() : 0;
+}
+
+uint32_t kintsuki_sdd1_log_snapshot(kintsuki_t* h, kintsuki_sdd1_event_t* out,
+                                    uint32_t cap) {
+  if(!h || !out) return 0;
+  uint32_t n = 0;
+  for(; n < cap; n++) {
+    auto* st = sdd1At(n);
+    if(!st) break;
+    out[n] = st->info;
+    out[n].captured = (uint32_t)st->data.size();
+  }
+  return n;
+}
+
+uint32_t kintsuki_sdd1_log_data(kintsuki_t* h, uint32_t index,
+                                uint8_t* out, uint32_t cap) {
+  if(!h || !out) return 0;
+  auto* st = sdd1At(index);
+  if(!st) return 0;
+  uint32_t n = (uint32_t)std::min<size_t>(cap, st->data.size());
+  std::memcpy(out, st->data.data(), n);
+  return n;
+}
+
+void kintsuki_sdd1_log_clear(kintsuki_t* h) {
+  if(!h) return;
+  g_sdd1Log.clear();
+  g_sdd1DataBytes = 0;
+  g_sdd1Open = false;
+}
+
+uint32_t kintsuki_sdd1_decompress(kintsuki_t* h, uint32_t bus_addr,
+                                  uint32_t size, uint8_t* out,
+                                  uint32_t* out_compressed_size) {
+  if(!out || size == 0 || !kintsuki_sdd1_present(h)) return 0;
+  // A fresh decompressor binds its sub-modules to itself, so this never
+  // disturbs a live stream; ROM reads go through the current MMC banks.
+  auto d = std::make_unique<ares::SuperFamicom::SDD1::Decompressor>();
+  d->init(bus_addr & 0xFFFFFF);
+  for(uint32_t i = 0; i < size; i++) out[i] = (uint8_t)d->read();
+  if(out_compressed_size) *out_compressed_size = d->im.position() - (bus_addr & 0xFFFFFF);
+  return size;
 }
 
 // ---- PPU register write log --------------------------------------------
@@ -2115,6 +2270,7 @@ int kintsuki_project_open(kintsuki_t* h, const char* dir) {
     h->program->romManifest(),
     h->program->romIsHiRom());
   if(!g_project) return 0;
+  if(ares::SuperFamicom::cartridge.has.SDD1) g_project->set_bus_mapper(&sdd1BusToRom);
   // Ensure execHook is wired so note_exec fires even without user CBs.
   if(!ares::SuperFamicom::execHook) ares::SuperFamicom::execHook = &cOnExec;
   // memReadHook only fires when registered; install cOnRead (which

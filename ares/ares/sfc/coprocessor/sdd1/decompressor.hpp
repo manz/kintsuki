@@ -4,6 +4,8 @@ struct Decompressor {
     auto init(n32 offset) -> void;
     auto getCodeWord(n8 codeLength) -> n8;
     auto serialize(serializer&) -> void;
+    // kintsuki: input cursor, for compressed-length reporting.
+    auto position() const -> u32 { return (u32)offset + (bitCount ? 1 : 0); }
 
   private:
     Decompressor& self;
