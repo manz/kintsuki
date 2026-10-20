@@ -54,6 +54,31 @@ void        kintsuki_reset(kintsuki_t*);
 // `.srm` siblings). Set persists for the handle's lifetime.
 void        kintsuki_set_srm_sidecar(kintsuki_t*, int enable);
 
+// Toggle automatic application of a BPS patch sitting next to the ROM at
+// `kintsuki_load_rom` time (`<rom>.bps`, then `<stem>.bps`). Default 0:
+// opt-in. When enabled and a BPS is found it takes precedence over IPS.
+// A BPS whose source/target CRC32 doesn't match is rejected and the ROM
+// loads unpatched; kintsuki_patch_info reports why.
+void        kintsuki_set_bps_sidecar(kintsuki_t*, int enable);
+
+// The patch `kintsuki_load_rom` found next to the ROM. Strings borrow from
+// the handle and stay valid until the next `kintsuki_load_rom`.
+//   kind     "" (no patch), "ips" or "bps"
+//   path     the patch file
+//   metadata BPS metadata blob (usually XML/BML); "" for IPS
+//   status   "" when applied, else why it was rejected ("error: ..." /
+//            "warning: ..."); the ROM was then loaded unpatched
+typedef struct {
+  const char* kind;
+  const char* path;
+  const char* metadata;
+  const char* status;
+} kintsuki_patch_info_t;
+
+// Fill `out`. Returns 1 when a patch file was found, 0 otherwise (out is
+// still filled with empty strings).
+int         kintsuki_patch_info(kintsuki_t*, kintsuki_patch_info_t* out);
+
 // PPU VRAM size in bytes. Default 65536 (stock hardware); pass 131072 to
 // model the VA15 mod, which wires a second 64K VRAM bank the PPU can
 // address, so background tile indices and sprite tiledata reach past
