@@ -27,6 +27,7 @@ python-stage: build  ## Copy libkintsuki + ares System pak into the wheel
 	$(Q) mkdir -p python/src/kintsuki/_lib
 	$(Q) LIB_DIR=$(BUILD)/ares/target-kintsuki; \
 	if [ -f $$LIB_DIR/libkintsuki.dylib ]; then \
+	  rm -f python/src/kintsuki/_lib/libkintsuki.dylib; \
 	  cp $$LIB_DIR/libkintsuki.dylib python/src/kintsuki/_lib/; \
 	elif [ -f $$LIB_DIR/libkintsuki.so ]; then \
 	  cp $$LIB_DIR/libkintsuki.so python/src/kintsuki/_lib/; \
