@@ -78,6 +78,10 @@ struct KintsukiApp: App {
         Window("Profiler", id: "profiler") {
             ProfilerView(emulator: emulator)
         }
+
+        Window("Patch Info", id: "patch") {
+            PatchInfoView(emulator: emulator)
+        }
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Open ROM…") {
@@ -148,6 +152,9 @@ struct KintsukiApp: App {
                     .keyboardShortcut("b", modifiers: [.command, .shift])
                 Button("Profiler") { toggleToolWindow("profiler") }
                     .keyboardShortcut("f", modifiers: [.command, .shift])
+                Button("Patch Info") { toggleToolWindow("patch") }
+                    .keyboardShortcut("i", modifiers: [.command, .shift])
+                    .disabled(emulator.loadedROM == nil)
                 Divider()
                 Button("Save Screenshot") { saveScreenshotToPicturesFolder() }
                     .keyboardShortcut("p", modifiers: [.command, .shift])
