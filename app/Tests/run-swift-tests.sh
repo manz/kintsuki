@@ -19,3 +19,10 @@ swiftc -parse-as-library -o "$OUT/input_mapper_test" \
     Tests/InputMapperTest.swift
 
 "$OUT/input_mapper_test"
+
+swiftc -parse-as-library -o "$OUT/tile_sheet_test" \
+    Sources/Kintsuki/TileDecoder.swift \
+    Sources/Kintsuki/TileSheet.swift \
+    Tests/TileSheetTest.swift
+
+"$OUT/tile_sheet_test"

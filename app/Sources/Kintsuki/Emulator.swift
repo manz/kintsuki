@@ -318,6 +318,78 @@ final class Emulator {
         return out
     }
 
+    /// One S-DD1 decompressed DMA stream from the libkintsuki log.
+    /// The log has no stable id, so `key` (frame + channel + source +
+    /// caller) is what the viewer uses to re-find a stream after newer
+    /// ones shift the snapshot indices.
+    struct SDD1Stream: Identifiable, Hashable {
+        struct Key: Hashable {
+            let frame: UInt64
+            let channel: UInt8
+            let busAddr: UInt32
+            let callerPc: UInt32
+        }
+        let busAddr: UInt32       // 24-bit compressed stream head
+        let romOffset: UInt32
+        let size: UInt16          // DMA byte count requested
+        let compressedSize: UInt32
+        let captured: UInt32      // decompressed bytes held by the log
+        let channel: UInt8
+        let dstReg: UInt8         // $21XX low byte
+        let vramAddr: UInt16      // word address, when dstReg is $18/$19
+        let wramAddr: UInt32      // WMADD, when dstReg is $80
+        let callerPc: UInt32
+        let frame: UInt64
+        let complete: Bool
+        var key: Key { Key(frame: frame, channel: channel, busAddr: busAddr, callerPc: callerPc) }
+        var id: Key { key }
+        var isVRAMWrite: Bool { dstReg == 0x18 || dstReg == 0x19 }
+        var isWRAMWrite: Bool { dstReg == 0x80 }
+    }
+
+    /// True when the loaded cart carries an S-DD1.
+    var sdd1Present: Bool {
+        guard let h = handle else { return false }
+        return kintsuki_sdd1_present(h) != 0
+    }
+
+    /// Logged S-DD1 streams, most recent first.
+    func sdd1Streams() -> [SDD1Stream] {
+        guard let h = handle else { return [] }
+        let cap = Int(kintsuki_sdd1_log_count(h))
+        if cap == 0 { return [] }
+        var raw = [kintsuki_sdd1_event_t](repeating: kintsuki_sdd1_event_t(), count: cap)
+        let n = raw.withUnsafeMutableBufferPointer { buf -> UInt32 in
+            kintsuki_sdd1_log_snapshot(h, buf.baseAddress, UInt32(buf.count))
+        }
+        return raw.prefix(Int(n)).map { e in
+            SDD1Stream(busAddr: e.bus_addr, romOffset: e.rom_offset, size: e.size,
+                       compressedSize: e.compressed_size, captured: e.captured,
+                       channel: e.channel, dstReg: e.dst_reg, vramAddr: e.vram_addr,
+                       wramAddr: e.wram_addr, callerPc: e.caller_pc, frame: e.frame,
+                       complete: e.complete != 0)
+        }
+    }
+
+    /// Decompressed bytes of the stream identified by `key`, re-resolved
+    /// against a fresh snapshot so streams logged since the caller's
+    /// list was built don't shift the index. Nil once evicted/cleared.
+    func sdd1StreamData(_ key: SDD1Stream.Key) -> Data? {
+        guard let h = handle else { return nil }
+        let streams = sdd1Streams()
+        guard let i = streams.firstIndex(where: { $0.key == key }) else { return nil }
+        var buf = [UInt8](repeating: 0, count: Int(streams[i].captured))
+        let n = buf.withUnsafeMutableBufferPointer { p -> UInt32 in
+            kintsuki_sdd1_log_data(h, UInt32(i), p.baseAddress, UInt32(p.count))
+        }
+        return Data(buf.prefix(Int(n)))
+    }
+
+    func sdd1LogClear() {
+        guard let h = handle else { return }
+        kintsuki_sdd1_log_clear(h)
+    }
+
     struct BacktraceFrame: Identifiable, Equatable, Codable {
         var id = UUID()
         var callsite: UInt32   // 24-bit
@@ -793,6 +865,15 @@ final class Emulator {
             return nil
         }
         return (String(cString: p), off)
+    }
+
+    /// "FooRoutine+12" when `.adbg` / project labels cover `pc`,
+    /// otherwise "$BB:AAAA". Compact enough for list rows.
+    func pcLabel(_ pc: UInt32) -> String {
+        if let (name, off) = lookupLabelContaining(addr: pc) {
+            return off == 0 ? name : "\(name)+\(String(off, radix: 16))"
+        }
+        return String(format: "$%02X:%04X", (pc >> 16) & 0xFF, pc & 0xFFFF)
     }
 
     // ---- Project: labels overlay (slice 2) -----------------------------

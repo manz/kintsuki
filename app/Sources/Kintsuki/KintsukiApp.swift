@@ -63,6 +63,10 @@ struct KintsukiApp: App {
             HDMAInspectorView(emulator: emulator)
         }
 
+        Window("S-DD1 Viewer", id: "sdd1") {
+            SDD1ViewerView(emulator: emulator)
+        }
+
         Window("Project Labels", id: "labels") {
             ProjectLabelsView(emulator: emulator)
         }
@@ -133,6 +137,9 @@ struct KintsukiApp: App {
                     .keyboardShortcut("m", modifiers: [.command, .shift])
                 Button("HDMA Inspector") { toggleToolWindow("hdma") }
                     .keyboardShortcut("h", modifiers: [.command, .shift])
+                Button("S-DD1 Viewer") { toggleToolWindow("sdd1") }
+                    .keyboardShortcut("u", modifiers: [.command, .shift])
+                    .disabled(emulator.loadedROM == nil || !emulator.sdd1Present)
                 Button("Debugger") { toggleToolWindow("debugger") }
                     .keyboardShortcut("d", modifiers: [.command, .shift])
                 Button("Project Labels") { toggleToolWindow("labels") }
