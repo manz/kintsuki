@@ -111,6 +111,7 @@ auto Program::video(Node::Video::Screen, const u32* data, u32 pitch, u32 width, 
     std::memcpy(dst, src, width * sizeof(u32));
   }
   framesRendered++;
+  if(frameHook) frameHook();
 }
 
 auto Program::audio(Node::Audio::Stream stream) -> void {

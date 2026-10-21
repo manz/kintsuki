@@ -178,6 +178,8 @@ struct Program : ares::Platform {
   u32 fbWidth = 0;
   u32 fbHeight = 0;
   u64 framesRendered = 0;
+  // Called after each rendered frame (libkintsuki samples its master clock).
+  void (*frameHook)() = nullptr;
 
   // Per-port input bitmask. 12 bits used.
   uint16_t inputState[2] = {0, 0};

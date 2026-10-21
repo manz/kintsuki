@@ -116,7 +116,8 @@ std::unordered_map<uint32_t, ProfStat> g_profileStats;
 // delta straddling a reduce event. The counter is u32 and wraps roughly
 // every 2^32 ticks (~200s of emulated wall time at 21.477MHz). We widen
 // to u64 by detecting any backward step as a wrap and adding 2^32 to a
-// running base; profile_start resets both.
+// running base. Program::frameHook samples it every frame so a long
+// run_frames can't skip a wrap.
 uint32_t                      g_lastMasterCounter = 0;
 uint64_t                      g_masterCounterBase = 0;
 
@@ -291,6 +292,8 @@ kintsuki_t* kintsuki_create(void) {
   if(g_handle) return g_handle;
   auto* h = new kintsuki_t();
   h->program = std::make_unique<Program>();
+  // Sampled every frame so the widened master clock never skips a wrap.
+  h->program->frameHook = [] { profileMasterCycles(); };
   kintsukiProgram = h->program.get();
   g_handle = h;
   // Wire the call/return hooks now and leave them on for the handle's
@@ -420,8 +423,9 @@ void kintsuki_run_frames(kintsuki_t* h, uint32_t n) {
 uint64_t kintsuki_frame_count(kintsuki_t* h) { return h ? h->program->framesRendered : 0; }
 
 uint64_t kintsuki_master_clock(kintsuki_t* h) {
-  if(!h) return 0;
-  return ares::SuperFamicom::cpu.clock();
+  // Not cpu.clock(): the scheduler's reduce pass rewrites thread clocks, so
+  // deltas across it jump (even negative).
+  return h ? profileMasterCycles() : 0;
 }
 
 void kintsuki_live_counters(kintsuki_t* h, kintsuki_live_counters_t* out) {
@@ -437,11 +441,9 @@ int64_t kintsuki_clock_skew(kintsuki_t* h) {
 
 uint64_t kintsuki_cpu_cycles(kintsuki_t* h) {
   if(!h) return 0;
-  // SNES CPU runs at master/6. Thread clock is in ares-scaled units; the
-  // scalar collapses the ratio to nominal cycles for the lowest-frequency
-  // thread we care about. Dividing the master count by 6 keeps the unit
-  // intuitive for asm developers reading per-instruction timings.
-  return (uint64_t)ares::SuperFamicom::cpu.clock() / 6;
+  // Nominal 65816 cycles: master / 6. FastROM and slow accesses are already
+  // in the master count, so this is a time unit, not an exact cycle count.
+  return profileMasterCycles() / 6;
 }
 
 uint8_t kintsuki_read_u8(kintsuki_t* h, uint32_t addr) { return h ? h->program->memRead(addr) : 0; }
@@ -1623,11 +1625,6 @@ void kintsuki_profile_start(kintsuki_t* h, uint32_t lo, uint32_t hi) {
   clearProfileFrames();
   g_profileLo = lo & 0xFFFFFF;
   g_profileHi = hi & 0xFFFFFF;
-  // Re-baseline the master-cycle widener. We don't reset the ares core
-  // counter (private, lives in the cpu Counter struct); instead we
-  // snapshot its current value as the new origin.
-  g_lastMasterCounter = ares::SuperFamicom::cpu.masterCycleCounter();
-  g_masterCounterBase = 0;
   g_profileActive = true;
   // Stack switches (TCS/TXS) are seen by the exec hook: keep it armed for
   // the profile window.

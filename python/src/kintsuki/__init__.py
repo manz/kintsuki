@@ -1056,14 +1056,15 @@ class Emu:
 
     @property
     def master_cycles(self) -> int:
-        # ares-scaled master clock; monotonic u64. Use raw deltas for relative
-        # measurement — the absolute unit is "master ticks since reset".
+        """Master clock ticks (21.477 MHz NTSC, 357366 a frame); monotonic,
+        use deltas. The same clock as :meth:`live_counters`; a state load
+        moves it with the loaded CPU."""
         return int(_native.lib.kintsuki_master_clock(self._handle))
 
     def live_counters(self) -> LiveCounters:
         """Master cycles + scanline/dot at the instruction being executed.
-        Unlike :attr:`master_cycles` (a scheduler-slice clock) and the PPU's
-        latched counters, these are exact inside exec/read/write callbacks:
+        Unlike :attr:`frame_count` and the PPU's latched counters, these are
+        exact inside exec/read/write callbacks:
         e.g. a write callback on a frame-ready flag can time the main loop
         against the NMI."""
         raw = _native.LiveCountersRaw()
@@ -1079,8 +1080,9 @@ class Emu:
 
     @property
     def cpu_cycles(self) -> int:
-        # master / 6 ≈ 65816 CPU cycles. Standard mode; FastROM and IO waits
-        # are already folded into the master clock by the ares core.
+        """:attr:`master_cycles` / 6: nominal 65816 cycles. FastROM and slow
+        accesses are already in the master count, so it is a time unit, not
+        an exact count of CPU cycles."""
         return int(_native.lib.kintsuki_cpu_cycles(self._handle))
 
     # ------------------------------------------------------------------ Mem

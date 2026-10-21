@@ -125,10 +125,31 @@ def test_profiler_master_cycles_property(assemble_rom):
         before = emu.master_cycles
         emu.run_frames(2)
         after = emu.master_cycles
-        # Within a single short burst the ares scheduler should not have
-        # reduced; raw clock progresses forward. (Across many run_frames
-        # calls the absolute value is non-monotonic — documented caveat.)
         assert after > before
+
+
+def test_master_cycles_counts_a_frame_every_frame(assemble_rom):
+    """Across scheduler reduces (which rewrite thread clocks), each frame
+    still advances the master clock by about 357366 ticks."""
+    rom = assemble_rom("test_profiler.s")
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        emu.run_frames(2)
+        deltas = []
+        for _ in range(600):
+            before = emu.master_cycles
+            emu.run_frames(1)
+            deltas.append(emu.master_cycles - before)
+        assert all(350_000 < d < 365_000 for d in deltas)
+
+
+def test_cpu_cycles_is_master_over_six(assemble_rom):
+    rom = assemble_rom("test_profiler.s")
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        before = emu.cpu_cycles
+        emu.run_frames(60)
+        assert abs((emu.cpu_cycles - before) - 60 * 357366 // 6) < 60 * 2000
 
 
 def test_profiler_pairs_jsr_indexed_indirect(assemble_rom):
