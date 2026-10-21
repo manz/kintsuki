@@ -97,6 +97,8 @@ struct KintsukiApp: App {
                 Divider()
                 Button("Load Save File (.srm)…") { loadSRMViaPanel() }
                     .disabled(emulator.loadedROM == nil)
+                Button("Export Save File (.srm)…") { exportSRMViaPanel() }
+                    .disabled(emulator.loadedROM == nil)
                 Divider()
                 Button("Open Crash Dump…") { openCrashDumpViaPanel() }
                     .keyboardShortcut("o", modifiers: [.command, .shift])
@@ -290,6 +292,21 @@ struct KintsukiApp: App {
                 alert.informativeText = "Could not inject \(url.lastPathComponent) into cart SRAM."
                 alert.runModal()
             }
+        }
+    }
+
+    private func exportSRMViaPanel() {
+        let panel = NSSavePanel()
+        panel.message = "Save the cart's SRAM"
+        panel.prompt = "Save"
+        let stem = emulator.loadedROM?.deletingPathExtension().lastPathComponent ?? "save"
+        panel.nameFieldStringValue = "\(stem).srm"
+        if panel.runModal() == .OK, let url = panel.url, !emulator.saveSRM(url: url) {
+            let alert = NSAlert()
+            alert.alertStyle = .warning
+            alert.messageText = "SRM save failed"
+            alert.informativeText = "Could not write the cart SRAM to \(url.lastPathComponent)."
+            alert.runModal()
         }
     }
 

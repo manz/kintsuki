@@ -2057,6 +2057,29 @@ final class Emulator {
         return true
     }
 
+    /// Write the cart's in-memory SRAM to a `.srm` file. Returns false if
+    /// the cart has no SRAM or the write fails.
+    func saveSRM(url: URL) -> Bool {
+        guard let h = handle else { return false }
+        let size = kintsuki_read_sram(h, nil, 0)
+        guard size > 0 else {
+            NSLog("kintsuki: saveSRM: cart has no SRAM")
+            return false
+        }
+        var data = Data(count: Int(size))
+        data.withUnsafeMutableBytes { raw in
+            _ = kintsuki_read_sram(h, raw.bindMemory(to: UInt8.self).baseAddress, size)
+        }
+        do {
+            try data.write(to: url, options: .atomic)
+        } catch {
+            NSLog("kintsuki: saveSRM write failed: \(url.path): \(error)")
+            return false
+        }
+        NSLog("kintsuki: wrote \(size) bytes of SRAM to \(url.lastPathComponent)")
+        return true
+    }
+
     /// Re-read the current ROM file from disk (re-applies any IPS
     /// sidecar) and reboot. Different from `reset()` only insofar as
     /// `kintsuki_load_rom` re-parses the cart manifest from the file -
