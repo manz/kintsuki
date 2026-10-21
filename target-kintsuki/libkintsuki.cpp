@@ -266,7 +266,9 @@ const std::string& traceName(uint32_t pc) {
   if(it != g_traceNames.end()) return it->second;
   std::string name;
   if(auto* label = g_project ? g_project->get_label(pc) : nullptr) name = label->name;
-  if(name.empty()) if(const char* adbg = g_labels.lookup(pc)) name = adbg;
+  // "__" names are the assembler's own (anonymous allocs): the address reads better.
+  const char* adbg = g_labels.lookup(pc);
+  if(name.empty() && adbg && std::strncmp(adbg, "__", 2) != 0) name = adbg;
   if(name.empty()) {
     char hex[16];
     std::snprintf(hex, sizeof hex, "%02X:%04X", pc >> 16, pc & 0xFFFF);
