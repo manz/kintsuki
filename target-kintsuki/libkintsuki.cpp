@@ -30,6 +30,8 @@ namespace ares::SuperFamicom {
   extern KintsukiDmaHook kintsukiDmaHook;
   typedef void (*KintsukiHdmaHook)(uint8_t, uint16_t, uint8_t);
   extern KintsukiHdmaHook kintsukiHdmaHook;
+  typedef void (*KintsukiPpuDropHook)(uint8_t);
+  extern KintsukiPpuDropHook kintsukiPpuDropHook;
   typedef void (*KintsukiSdd1Hook)(uint8_t, uint8_t, uint32_t, uint32_t,
                                    uint16_t, uint32_t, uint8_t);
   extern KintsukiSdd1Hook kintsukiSdd1Hook;
@@ -247,6 +249,8 @@ void clearProfileFrames() {
 kintsuki::PerfettoTrace g_trace;
 uint64_t g_traceCpu = 0;
 uint64_t g_traceFrames = 0;
+uint64_t g_traceOverruns = 0;
+uint8_t g_traceDropped = 0;  // ports already marked this frame (bit 0 VRAM, 1 OAM, 2 CGRAM)
 uint64_t g_traceMarks = 0;
 uint64_t g_traceDma[8] = {};
 uint64_t g_traceHdma[8] = {};
@@ -346,7 +350,19 @@ void traceHdma(uint8_t channel, uint16_t line, uint8_t dst) {
   run.lastMaster = master;
 }
 
+// The first write a port drops in a frame: the frame overran vblank.
+void tracePpuDrop(uint8_t port) {
+  if(!g_trace.active()) return;
+  uint8_t bit = port == 0x18 ? 1 : port == 0x04 ? 2 : 4;
+  if(g_traceDropped & bit) return;
+  g_traceDropped |= bit;
+  const char* name = bit == 1 ? "VRAM overrun" : bit == 2 ? "OAM overrun" : "CGRAM overrun";
+  g_trace.instant(g_traceOverruns, traceNow(), name,
+                  {{"line", ares::SuperFamicom::cpu.vcounter()}, {"pc", ares::SuperFamicom::cpu.r.pc.d}});
+}
+
 void traceFrame() {
+  g_traceDropped = 0;
   if(!g_trace.active()) return;
   uint64_t frame = kintsukiProgram ? kintsukiProgram->framesRendered : 0;
   uint64_t now = traceNow();
@@ -1753,6 +1769,7 @@ int kintsuki_timeline_start(kintsuki_t* h, const char* path, uint32_t screenshot
   g_traceDepth = 0;
   g_traceCpu = g_trace.track("65816");
   g_traceFrames = g_trace.track("Frames");
+  g_traceOverruns = g_trace.track("Overruns");
   g_traceMarks = g_trace.track("Marks");
   uint64_t dma = g_trace.track("DMA");
   for(int i = 0; i < 8; i++) g_traceDma[i] = g_trace.track("DMA " + std::to_string(i), dma);
@@ -2025,7 +2042,10 @@ void hdmaHookFn(uint8_t channel, uint16_t scanline, uint8_t dst) {
 }
 
 struct HdmaHookInstaller {
-  HdmaHookInstaller() { ares::SuperFamicom::kintsukiHdmaHook = &hdmaHookFn; }
+  HdmaHookInstaller() {
+    ares::SuperFamicom::kintsukiHdmaHook = &hdmaHookFn;
+    ares::SuperFamicom::kintsukiPpuDropHook = &tracePpuDrop;
+  }
 } g_hdmaHookInstaller;
 }
 

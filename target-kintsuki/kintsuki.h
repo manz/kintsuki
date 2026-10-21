@@ -520,6 +520,8 @@ typedef struct {
 // Timeline: a Perfetto trace (open in ui.perfetto.dev) streamed to `path` a slice per
 // JSR/JSL and NMI/IRQ on a "65816" track, a slice per DMA channel run and
 // per run of consecutive HDMA lines, a "frame" instant per rendered frame,
+// an "Overruns" instant the first time a frame's VRAM/OAM/CGRAM write is
+// dropped outside blanking,
 // and every `screenshot_every` frames
 // (0: never) a JPEG of the frame the UI shows on a Screenshots track.
 // Returns 0 if the file can't be opened.

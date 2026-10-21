@@ -103,6 +103,13 @@ typedef void (*KintsukiHdmaHook)(uint8_t channel,
 __attribute__((visibility("default")))
 KintsukiHdmaHook kintsukiHdmaHook = nullptr;
 
+// kintsuki: a VRAM / OAM / CGRAM data-port write the PPU drops (or
+// redirects) because the screen is on and the beam is in the visible
+// area. `port` is the $21xx low byte (0x18 VRAM, 0x04 OAM, 0x22 CGRAM).
+typedef void (*KintsukiPpuDropHook)(uint8_t port);
+__attribute__((visibility("default")))
+KintsukiPpuDropHook kintsukiPpuDropHook = nullptr;
+
 auto System::load(Node::System& root, string name) -> bool {
   if(node) unload();
 

@@ -605,7 +605,9 @@ class Emu:
         """Stream a Perfetto trace to ``path`` (open it in ui.perfetto.dev):
         a slice per JSR/JSL and NMI/IRQ on the "65816" track (labels from the
         project or .adbg), a slice per DMA channel run and per run of
-        consecutive HDMA lines, a "frame" instant per rendered frame.
+        consecutive HDMA lines, a "frame" instant per rendered frame, an
+        "Overruns" instant (``line``, ``pc``) the first time in a frame the PPU
+        drops a VRAM/OAM/CGRAM write because the screen is on and drawing.
         Timestamps are the master clock in nanoseconds.
         ``screenshot_every=N`` adds a JPEG of every Nth frame (~25 KB each),
         shown on the UI's Screenshots track."""

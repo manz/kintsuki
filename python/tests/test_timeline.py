@@ -209,6 +209,20 @@ def test_timeline_has_an_hdma_slice_per_frame_for_its_lines(recorded):
     assert 990_000 < end.ts - begin.ts < 1_040_000  # 16 lines of 1364 master cycles ~ 1.016 ms
 
 
+def test_timeline_has_no_overruns_under_forced_blank(recorded):
+    assert not [e for e in _decode(recorded) if e.track == "Overruns"]
+
+
+def test_timeline_marks_each_frame_a_vram_write_is_dropped(emu_rom, tmp_path):
+    path = tmp_path / "t.pftrace"
+    emu_rom.write(0x7E0100, 1)  # OVERRUN in test_timeline.s
+    with emu_rom.timeline(path):
+        emu_rom.run_frames(3)
+    overruns = [e for e in _decode(path) if e.track == "Overruns"]
+    assert [e.name for e in overruns] == ["VRAM overrun"] * 3
+    assert all(0 <= e.args["line"] < 225 for e in overruns)
+
+
 def test_timeline_mark_lands_on_the_marks_track(emu_rom, tmp_path):
     path = tmp_path / "t.pftrace"
     sub = _symbol(emu_rom, "nmi_sub")
