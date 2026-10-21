@@ -606,6 +606,7 @@ final class Emulator {
             object: nil, queue: .main) { [weak self] _ in
             MainActor.assumeIsolated {
                 _ = self?.saveAutosave()
+                self?.timelineStop()  // flush the tail of an open recording
             }
         }
     }
@@ -728,6 +729,7 @@ final class Emulator {
             NSLog("kintsuki: loadROM called with nil handle")
             return
         }
+        timelineStop()  // a recording belongs to the ROM it started on
         let path = url.path
         NSLog("kintsuki: loadROM path=\(path)")
         let ok = path.withCString { kintsuki_load_rom(h, $0) }
@@ -2678,6 +2680,36 @@ final class Emulator {
         }
         profileStats = out
         return out
+    }
+
+    /// Perfetto timeline being recorded; nil when idle. Drives the menu
+    /// label flip (Record ↔ Stop).
+    private(set) var timelineURL: URL?
+
+    /// Stream a Perfetto timeline to `url` (open it in ui.perfetto.dev):
+    /// calls, NMI/IRQ, DMA and HDMA runs, vblank overruns, and a screenshot
+    /// every `screenshotEvery` frames. Same recorder as the Python
+    /// `timeline_start`.
+    @discardableResult
+    func timelineStart(url: URL, screenshotEvery: UInt32 = 4) -> Bool {
+        guard let h = handle, timelineURL == nil else { return false }
+        let ok = url.path.withCString { kintsuki_timeline_start(h, $0, screenshotEvery) }
+        guard ok != 0 else {
+            NSLog("kintsuki: timeline failed to open \(url.path)")
+            return false
+        }
+        timelineURL = url
+        return true
+    }
+
+    /// Close the timeline file. Returns its URL, nil if none was recording.
+    @discardableResult
+    func timelineStop() -> URL? {
+        guard let h = handle, let url = timelineURL else { return nil }
+        let bytes = kintsuki_timeline_stop(h)
+        timelineURL = nil
+        NSLog("kintsuki: wrote timeline (\(bytes) bytes) to \(url.path)")
+        return url
     }
 
     /// Discard cached stats. Does not flip `profileActive` — start a new
