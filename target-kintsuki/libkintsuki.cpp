@@ -8,6 +8,7 @@
 #include "kintsuki.h"
 #include "adbg.hpp"
 #include "project.hpp"
+#include "perfetto.hpp"
 
 #include <cstdint>
 #include <cstdio>
@@ -162,6 +163,8 @@ void profileOnReturn() {
   }
 }
 
+void traceCloseSlices();
+
 // ---- Shadow-stack switching (tasks, fibers, coroutines) ----------------
 // One shadow stack per hardware stack. A TCS/TXS that moves S off the live
 // stack parks its frames (shadow callstack + profiler frames) and resumes the
@@ -200,6 +203,7 @@ void switchShadowStack(uint16_t new_s) {
     }
   }
   if(g_callstack.empty() && best < 0) return;  // nothing to park or resume
+  traceCloseSlices();
   uint64_t now = profileMasterCycles();
   ParkedStack resumed;
   if(best >= 0) {
@@ -224,6 +228,7 @@ void switchShadowStack(uint16_t new_s) {
 // Every live and parked frame: the call chain they describe is gone (reset,
 // state load, CPU rearm).
 void clearShadowStacks() {
+  traceCloseSlices();
   g_callstack.clear();
   g_callstackS.clear();
   g_parkedStacks.clear();
@@ -234,6 +239,82 @@ void clearShadowStacks() {
 void clearProfileFrames() {
   g_profileStack.clear();
   for(auto& p : g_parkedStacks) p.prof.clear();
+}
+
+// ---- Perfetto trace -----------------------------------------------------
+// kintsuki_timeline_start streams one slice per call (JSR/JSL, NMI/IRQ) on the
+// "65816" track, one per DMA channel run, and frame / mark instants.
+kintsuki::PerfettoTrace g_trace;
+uint64_t g_traceCpu = 0;
+uint64_t g_traceFrames = 0;
+uint64_t g_traceMarks = 0;
+uint64_t g_traceDma[8] = {};
+uint32_t g_traceDepth = 0;
+std::unordered_map<uint32_t, std::string> g_traceNames;
+
+uint64_t traceNs(uint64_t master) {
+  double hz = ares::SuperFamicom::system.cpuFrequency();
+  return (uint64_t)((long double)master * 1e9L / hz);
+}
+
+uint64_t traceNow() { return traceNs(profileMasterCycles()); }
+
+uint64_t traceLine() { return ares::SuperFamicom::cpu.vcounter(); }
+
+const std::string& traceName(uint32_t pc) {
+  auto it = g_traceNames.find(pc);
+  if(it != g_traceNames.end()) return it->second;
+  std::string name;
+  if(auto* label = g_project ? g_project->get_label(pc) : nullptr) name = label->name;
+  if(name.empty()) if(const char* adbg = g_labels.lookup(pc)) name = adbg;
+  if(name.empty()) {
+    char hex[16];
+    std::snprintf(hex, sizeof hex, "%02X:%04X", pc >> 16, pc & 0xFFFF);
+    name = hex;
+  }
+  return g_traceNames.emplace(pc, std::move(name)).first->second;
+}
+
+void traceCall(uint32_t callsite_pc, uint32_t target_pc, uint8_t kind) {
+  if(!g_trace.active()) return;
+  if(kind >= 2) {
+    std::string name = (kind == 2 ? "NMI " : "IRQ ") + traceName(target_pc);
+    g_trace.begin(g_traceCpu, traceNow(), name,
+                  {{"line", traceLine()}, {"from", callsite_pc}});
+  } else {
+    g_trace.begin(g_traceCpu, traceNow(), traceName(target_pc));
+  }
+  g_traceDepth++;
+}
+
+void traceReturn() {
+  if(!g_trace.active() || !g_traceDepth) return;
+  g_trace.end(g_traceCpu, traceNow());
+  g_traceDepth--;
+}
+
+// The call chain the open slices describe is gone (stack switch, reset).
+void traceCloseSlices() {
+  if(!g_trace.active()) return;
+  uint64_t now = traceNow();
+  for(; g_traceDepth; g_traceDepth--) g_trace.end(g_traceCpu, now);
+}
+
+void traceDma(uint8_t channel, uint32_t src, uint8_t dst, uint16_t size) {
+  if(!g_trace.active() || channel >= 8) return;
+  uint64_t master = profileMasterCycles();
+  uint32_t bytes = size ? size : 0x10000;
+  char name[16];
+  std::snprintf(name, sizeof name, "$21%02X", dst);
+  g_trace.begin(g_traceDma[channel], traceNs(master), name,
+                {{"src", src}, {"bytes", bytes}, {"line", traceLine()}});
+  g_trace.end(g_traceDma[channel], traceNs(master + 8 + 8ull * bytes));  // 8 master cycles a byte
+}
+
+void traceFrame() {
+  if(!g_trace.active()) return;
+  uint64_t frame = kintsukiProgram ? kintsukiProgram->framesRendered : 0;
+  g_trace.instant(g_traceFrames, traceNow(), "frame", {{"frame", frame}});
 }
 
 void cOnCall(uint32_t callsite_pc, uint32_t target_pc, uint8_t kind) {
@@ -248,6 +329,7 @@ void cOnCall(uint32_t callsite_pc, uint32_t target_pc, uint8_t kind) {
   g_callstack.push_back(f);
   g_callstackS.push_back(ares::SuperFamicom::cpu.r.s.w);
   profileOnCall(target_pc);
+  traceCall(callsite_pc, target_pc, kind);
   // Auto-seed entry flags at every JSR/JSL target so cold-cache disasm at
   // any reached function knows the caller's M/X/E. First writer wins —
   // manual edits are not clobbered. An interrupt keeps the interrupted
@@ -268,6 +350,7 @@ void cOnReturn(uint8_t kind) {
   g_callstack.pop_back();
   g_callstackS.pop_back();
   profileOnReturn();
+  traceReturn();
   if(g_project) {
     // exit_pc = the RTS/RTL opcode address. cOnExec stashes the last
     // PC it saw; ares' returnHook fires after PC has moved to the
@@ -294,7 +377,10 @@ kintsuki_t* kintsuki_create(void) {
   auto* h = new kintsuki_t();
   h->program = std::make_unique<Program>();
   // Sampled every frame so the widened master clock never skips a wrap.
-  h->program->frameHook = [] { profileMasterCycles(); };
+  h->program->frameHook = [] {
+    profileMasterCycles();
+    traceFrame();
+  };
   kintsukiProgram = h->program.get();
   g_handle = h;
   // Wire the call/return hooks now and leave them on for the handle's
@@ -1620,6 +1706,33 @@ void kintsuki_callstack_clear(kintsuki_t* h) {
   clearShadowStacks();
 }
 
+int kintsuki_timeline_start(kintsuki_t* h, const char* path) {
+  if(!h || !path) return 0;
+  traceCloseSlices();
+  if(!g_trace.open(path)) return 0;
+  g_traceNames.clear();
+  g_traceDepth = 0;
+  g_traceCpu = g_trace.track("65816");
+  g_traceFrames = g_trace.track("Frames");
+  g_traceMarks = g_trace.track("Marks");
+  uint64_t dma = g_trace.track("DMA");
+  for(int i = 0; i < 8; i++) g_traceDma[i] = g_trace.track("DMA " + std::to_string(i), dma);
+  return 1;
+}
+
+void kintsuki_timeline_mark(kintsuki_t* h, const char* name) {
+  if(!h || !name) return;
+  g_trace.instant(g_traceMarks, traceNow(), name, {{"line", traceLine()}});
+}
+
+uint64_t kintsuki_timeline_stop(kintsuki_t* h) {
+  if(!h || !g_trace.active()) return 0;
+  traceCloseSlices();
+  uint64_t bytes = g_trace.bytes();
+  g_trace.close();
+  return bytes;
+}
+
 void kintsuki_profile_start(kintsuki_t* h, uint32_t lo, uint32_t hi) {
   if(!h) return;
   g_profileStats.clear();
@@ -1789,6 +1902,7 @@ void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
   uint32_t callerPc = g_callstack.empty()
     ? ((uint32_t)ares::SuperFamicom::cpu.r.pc.d & 0xFFFFFF)
     : (g_callstack.back().target_pc & 0xFFFFFF);
+  traceDma(channel, src, dst, size);
   // Project-file auto-classification: tag the ROM source range by the
   // destination PPU register class (graphics/palette/...) — no-op when
   // no project is open.

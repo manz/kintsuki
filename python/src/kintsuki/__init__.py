@@ -600,6 +600,28 @@ class Emu:
     def callstack_clear(self) -> None:
         _native.lib.kintsuki_callstack_clear(self._handle)
 
+    # ----------------------------------------------------------------- Timeline
+    def timeline_start(self, path: str | os.PathLike[str]) -> None:
+        """Stream a Perfetto trace to ``path`` (open it in ui.perfetto.dev):
+        a slice per JSR/JSL and NMI/IRQ on the "65816" track (labels from the
+        project or .adbg), a slice per DMA channel run, a "frame" instant per
+        rendered frame. Timestamps are the master clock in nanoseconds."""
+        if not _native.lib.kintsuki_timeline_start(self._handle, os.fsencode(path)):
+            raise OSError(f"cannot write timeline to {path}")
+
+    def timeline_mark(self, name: str) -> None:
+        """An instant on the "Marks" track, with the current scanline; call it
+        from an exec callback to mark milestones (pass start, pass end...)."""
+        _native.lib.kintsuki_timeline_mark(self._handle, name.encode("utf-8"))
+
+    def timeline_stop(self) -> int:
+        """Close open slices and the file; returns the bytes written."""
+        return int(_native.lib.kintsuki_timeline_stop(self._handle))
+
+    def timeline(self, path: str | os.PathLike[str]) -> "_TimelineSession":
+        """Context-manager wrapper: `with emu.timeline("t.pftrace"): emu.run_frames(60)`."""
+        return _TimelineSession(self, path)
+
     # ------------------------------------------------------------------ Profile
     def profile_start(self, lo: int | None = None, hi: int | None = None) -> None:
         """Begin per-function cycle aggregation. Calls into JSR/JSL/RTS/RTL
@@ -1794,6 +1816,21 @@ class Emu:
             self.close()
         except Exception:
             pass
+
+
+class _TimelineSession:
+    """Starts a timeline on enter, stops it on exit."""
+
+    def __init__(self, emu: Emu, path: str | os.PathLike[str]) -> None:
+        self._emu = emu
+        self._path = path
+
+    def __enter__(self) -> "_TimelineSession":
+        self._emu.timeline_start(self._path)
+        return self
+
+    def __exit__(self, *_) -> None:
+        self._emu.timeline_stop()
 
 
 class _TracerSession:

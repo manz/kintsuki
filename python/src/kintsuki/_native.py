@@ -190,6 +190,9 @@ class FnStatRaw(Structure):
     ]
 
 
+_bind("kintsuki_timeline_start",         c_int,    [HANDLE, c_char_p])
+_bind("kintsuki_timeline_mark",          None,     [HANDLE, c_char_p])
+_bind("kintsuki_timeline_stop",          c_uint64, [HANDLE])
 _bind("kintsuki_profile_start",       None,     [HANDLE, c_uint32, c_uint32])
 _bind("kintsuki_profile_stop",        None,     [HANDLE])
 _bind("kintsuki_profile_reset",       None,     [HANDLE])

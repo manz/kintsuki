@@ -517,6 +517,15 @@ typedef struct {
   uint64_t min_cycles;    // smallest single-call inclusive delta
 } kintsuki_fn_stat_t;
 
+// Timeline: a Perfetto trace (open in ui.perfetto.dev) streamed to `path` a slice per
+// JSR/JSL and NMI/IRQ on a "65816" track, a slice per DMA channel run, a
+// "frame" instant per rendered frame. Returns 0 if the file can't be opened.
+int      kintsuki_timeline_start(kintsuki_t*, const char* path);
+// An instant named `name` on the "Marks" track (e.g. from an exec callback).
+void     kintsuki_timeline_mark(kintsuki_t*, const char* name);
+// Closes open slices and the file; returns the bytes written (0: no trace).
+uint64_t kintsuki_timeline_stop(kintsuki_t*);
+
 void     kintsuki_profile_start(kintsuki_t*, uint32_t lo, uint32_t hi);
 void     kintsuki_profile_stop(kintsuki_t*);
 void     kintsuki_profile_reset(kintsuki_t*);
