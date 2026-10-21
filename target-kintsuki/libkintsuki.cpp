@@ -398,6 +398,11 @@ uint32_t kintsuki_inject_sram(kintsuki_t* h, const uint8_t* data, uint32_t len) 
   return h->program->injectSram(data, len);
 }
 
+uint32_t kintsuki_read_sram(kintsuki_t* h, uint8_t* out, uint32_t cap) {
+  if(!h) return 0;
+  return h->program->readSram(out, cap);
+}
+
 void kintsuki_run_frames(kintsuki_t* h, uint32_t n) {
   if(!h) return;
   h->program->runFrames(n);

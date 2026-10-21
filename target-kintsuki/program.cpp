@@ -541,6 +541,14 @@ auto Program::injectSram(const u8* data, u32 len) -> u32 {
   return cap;
 }
 
+auto Program::readSram(u8* out, u32 cap) -> u32 {
+  if(!loaded) return 0;
+  auto& ram = SuperFamicom::cartridge.ram;
+  u32 size = (u32)ram.size();
+  if(out) std::memcpy(out, ram.data(), size < cap ? size : cap);
+  return size;
+}
+
 auto Program::runFrames(u32 n) -> void {
   if(!loaded) return;
   // Clear the sticky halt flag at the top so a previously-fired BP

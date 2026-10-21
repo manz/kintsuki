@@ -98,6 +98,11 @@ uint32_t    kintsuki_vram_size(kintsuki_t*);
 // SRAM size; 0 if no SRAM or no ROM).
 uint32_t    kintsuki_inject_sram(kintsuki_t*, const uint8_t* data, uint32_t len);
 
+// Copy the cart's in-memory SRAM into `out` (up to `cap` bytes), e.g. to
+// write a `.srm`. Returns the cart's SRAM size whatever `cap` is, so a NULL
+// `out` asks for the size (0 if no SRAM or no ROM).
+uint32_t    kintsuki_read_sram(kintsuki_t*, uint8_t* out, uint32_t cap);
+
 // SRAM size mismatches. Incoming SRAM - kintsuki_inject_sram, the .srm sidecar
 // at load, a savestate's cart.sram region (KSSF footer) - whose size differs
 // from the cart's declared SRAM goes through the policy:
