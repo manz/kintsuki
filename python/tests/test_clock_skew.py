@@ -1,5 +1,5 @@
-"""load_state keeps the CPU in step with the PPU: HDMA writes (timed by the
-CPU) land on the scanlines the PPU draws them on."""
+"""load_state and rearm_cpu keep the CPU in step with the PPU: HDMA writes
+(timed by the CPU) land on the scanlines the PPU draws them on."""
 
 from __future__ import annotations
 
@@ -52,3 +52,14 @@ def test_load_realigns_a_skewed_cpu_clock(assemble_rom):
         assert emu.clock_skew == 0
     assert _frame_after(skewed, rom) == _frame_after(state, rom)
 
+
+def test_rearm_after_load_keeps_the_cpu_clock(assemble_rom):
+    """rearm_cpu right after a load leaves the CPU clock where the state put it,
+    even when that is not 0."""
+    rom = str(assemble_rom("test_hdma_bands.s"))
+    shifted = _shifted(_state(rom), 640, threads=2)
+    with Emu() as emu:
+        emu.load_rom(rom)
+        emu.load_state(shifted)
+        emu.rearm_cpu()
+        assert emu.clock_skew == 0

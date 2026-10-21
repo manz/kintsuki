@@ -1550,8 +1550,10 @@ void kintsuki_rearm_cpu(kintsuki_t* h) {
   // (which would re-randomize WRAM and re-run the boot vector). The
   // coroutine's host-side stack is replaced by a fresh one; the next
   // scheduler entry calls CPU::main from the top with a clean stack.
-  ares::SuperFamicom::cpu.create(
-    ares::SuperFamicom::system.cpuFrequency(),
+  // restart, not create: create zeroes the thread clock, which puts the
+  // CPU (and the HDMA it drives) out of step with the PPU, e.g. one
+  // scanline late, and that skew is then saved into every later state.
+  ares::SuperFamicom::cpu.restart(
     std::bind_front(&ares::SuperFamicom::CPU::main,
                     &ares::SuperFamicom::cpu));
   // Clear the halt flags + pending interrupts on the WDC65816 register
