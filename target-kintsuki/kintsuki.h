@@ -248,6 +248,12 @@ typedef struct {
 
 void kintsuki_get_ppu_state(kintsuki_t*, kintsuki_ppu_state_t* out);
 
+// Read back a write-only PPU register the way the MiSTer core's savestate
+// port does ($C1:21xx, PPU.vhd SS_DO): `reg` $00-$33 is the register's low
+// (or only) byte, $40/$41 COLDATA green/red, $4D-$60 the high byte of the
+// two-write register at reg - $40, $61 the CGADD byte latch.
+uint8_t kintsuki_ppu_ss_read(kintsuki_t*, uint8_t reg);
+
 // Savestate. Two-call style: pass buf=NULL,cap=0 to query required size,
 // then call again with a buffer of at least the returned size. Returns
 // the required size on success or 0 on failure.
@@ -420,6 +426,8 @@ void kintsuki_spc_set_state(kintsuki_t*, const kintsuki_spc_state_t* in);
 // copied. ARAM (the 64KB sample/echo store) is the separate
 // kintsuki_spc_read_aram window.
 uint32_t kintsuki_dsp_registers(kintsuki_t*, uint8_t* out, uint32_t len);
+// Write one S-DSP register ($00-$7F) as the SMP's $F3 port would.
+void     kintsuki_dsp_write_register(kintsuki_t*, uint8_t addr, uint8_t value);
 
 // ---- SPC700 execution debug ---------------------------------------------
 // Breakpoints / single-step / run-until / disassembly for the audio CPU,
