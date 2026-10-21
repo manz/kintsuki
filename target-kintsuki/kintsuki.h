@@ -519,8 +519,10 @@ typedef struct {
 
 // Timeline: a Perfetto trace (open in ui.perfetto.dev) streamed to `path` a slice per
 // JSR/JSL and NMI/IRQ on a "65816" track, a slice per DMA channel run, a
-// "frame" instant per rendered frame. Returns 0 if the file can't be opened.
-int      kintsuki_timeline_start(kintsuki_t*, const char* path);
+// "frame" instant per rendered frame, and every `screenshot_every` frames
+// (0: never) a JPEG of the frame the UI shows on a Screenshots track.
+// Returns 0 if the file can't be opened.
+int      kintsuki_timeline_start(kintsuki_t*, const char* path, uint32_t screenshot_every);
 // An instant named `name` on the "Marks" track (e.g. from an exec callback).
 void     kintsuki_timeline_mark(kintsuki_t*, const char* name);
 // Closes open slices and the file; returns the bytes written (0: no trace).

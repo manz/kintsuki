@@ -1026,8 +1026,7 @@ auto Program::frameOutputWidth() const -> u32 {
   return ares::SuperFamicom::ppuPerformanceImpl.hires() ? fbWidth : fbWidth / 2;
 }
 
-auto Program::writePNG(const char* path) -> bool {
-  if(!fbWidth || !fbHeight) return false;
+auto Program::frameRGB() const -> std::vector<uint8_t> {
   bool hires = ares::SuperFamicom::ppuPerformanceImpl.hires();
   u32 outW = hires ? fbWidth : fbWidth / 2;
   std::vector<uint8_t> rgb(size_t(outW) * fbHeight * 3);
@@ -1041,7 +1040,26 @@ auto Program::writePNG(const char* path) -> bool {
       dst[2] = (uint8_t)((px >>  0) & 0xff);
     }
   }
+  return rgb;
+}
+
+auto Program::writePNG(const char* path) -> bool {
+  if(!fbWidth || !fbHeight) return false;
+  u32 outW = frameOutputWidth();
+  auto rgb = frameRGB();
   return stbi_write_png(path, outW, fbHeight, 3, rgb.data(), outW * 3) != 0;
+}
+
+auto Program::encodeJPEG(int quality) -> std::vector<uint8_t> {
+  std::vector<uint8_t> out;
+  if(!fbWidth || !fbHeight) return out;
+  auto rgb = frameRGB();
+  auto append = [](void* ctx, void* data, int size) {
+    auto* bytes = (const uint8_t*)data;
+    ((std::vector<uint8_t>*)ctx)->insert(((std::vector<uint8_t>*)ctx)->end(), bytes, bytes + size);
+  };
+  stbi_write_jpg_to_func(append, &out, frameOutputWidth(), fbHeight, 3, rgb.data(), quality);
+  return out;
 }
 
 auto Program::writePPM(const char* path) -> bool {

@@ -250,6 +250,8 @@ uint64_t g_traceFrames = 0;
 uint64_t g_traceMarks = 0;
 uint64_t g_traceDma[8] = {};
 uint32_t g_traceDepth = 0;
+uint32_t g_traceScreenshotEvery = 0;  // frames; 0: no screenshots
+constexpr int kTraceJpegQuality = 80;
 std::unordered_map<uint32_t, std::string> g_traceNames;
 
 uint64_t traceNs(uint64_t master) {
@@ -316,7 +318,10 @@ void traceDma(uint8_t channel, uint32_t src, uint8_t dst, uint16_t size) {
 void traceFrame() {
   if(!g_trace.active()) return;
   uint64_t frame = kintsukiProgram ? kintsukiProgram->framesRendered : 0;
-  g_trace.instant(g_traceFrames, traceNow(), "frame", {{"frame", frame}});
+  uint64_t now = traceNow();
+  g_trace.instant(g_traceFrames, now, "frame", {{"frame", frame}});
+  if(g_traceScreenshotEvery && kintsukiProgram && frame % g_traceScreenshotEvery == 0)
+    g_trace.screenshot(g_traceFrames, now, kintsukiProgram->encodeJPEG(kTraceJpegQuality));
 }
 
 void cOnCall(uint32_t callsite_pc, uint32_t target_pc, uint8_t kind) {
@@ -1708,8 +1713,9 @@ void kintsuki_callstack_clear(kintsuki_t* h) {
   clearShadowStacks();
 }
 
-int kintsuki_timeline_start(kintsuki_t* h, const char* path) {
+int kintsuki_timeline_start(kintsuki_t* h, const char* path, uint32_t screenshot_every) {
   if(!h || !path) return 0;
+  g_traceScreenshotEvery = screenshot_every;
   traceCloseSlices();
   if(!g_trace.open(path)) return 0;
   g_traceNames.clear();

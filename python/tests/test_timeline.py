@@ -53,6 +53,8 @@ class Event:
     ts: int
     name: str
     args: dict[str, int] = field(default_factory=dict)
+    category: str = ""
+    jpeg: bytes = b""
 
 
 def _bytes(value: Field) -> bytes:
@@ -93,7 +95,9 @@ def _decode(path: Path) -> list[Event]:
                 a = dict(_fields(_bytes(ann)))
                 args[_bytes(a[10]).decode()] = _int(a[3])
         name = names.get(_int(d.get(10, 0)), "")
-        events.append(Event(_int(d[9]), tracks[_int(d[11])], ts, name, args))
+        category = _bytes(d[22]).decode() if 22 in d else ""
+        jpeg = _bytes(dict(_fields(_bytes(d[50])))[1]) if 50 in d else b""
+        events.append(Event(_int(d[9]), tracks[_int(d[11])], ts, name, args, category, jpeg))
     return events
 
 
@@ -203,6 +207,19 @@ def test_timeline_mark_lands_on_the_marks_track(emu_rom, tmp_path):
         emu_rom.run_frames(3)
     marks = [e for e in _decode(path) if e.track == "Marks"]
     assert [e.name for e in marks] == ["sub"] * 3
+
+
+def test_timeline_has_no_screenshots_by_default(recorded):
+    assert not [e for e in _decode(recorded) if e.name == "Screenshot"]
+
+
+def test_timeline_screenshots_every_nth_frame_as_jpeg(emu_rom, tmp_path):
+    path = tmp_path / "t.pftrace"
+    with emu_rom.timeline(path, screenshot_every=2):
+        emu_rom.run_frames(4)
+    shots = [e for e in _decode(path) if e.name == "Screenshot"]
+    assert len(shots) == 2
+    assert all(e.category == "android_screenshot" and e.jpeg[:2] == b"\xff\xd8" for e in shots)
 
 
 def test_nmi_is_a_callstack_frame(emu_rom):

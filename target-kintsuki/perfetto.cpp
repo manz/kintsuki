@@ -15,6 +15,9 @@ enum : uint32_t {
   kTrackName = 2,
   kTrackParent = 5,
   kEventAnnotations = 4,         // TrackEvent
+  kEventCategories = 22,
+  kEventScreenshot = 50,
+  kScreenshotJpeg = 1,           // Screenshot
   kEventType = 9,
   kEventNameIid = 10,
   kEventTrack = 11,
@@ -100,8 +103,17 @@ void PerfettoTrace::instant(uint64_t track, uint64_t ts_ns, const std::string& n
   event(kInstant, track, ts_ns, &name, args);
 }
 
+void PerfettoTrace::screenshot(uint64_t track, uint64_t ts_ns, const std::vector<uint8_t>& jpeg) {
+  std::string shot, extra;
+  bytesField(shot, kScreenshotJpeg, std::string(jpeg.begin(), jpeg.end()));
+  bytesField(extra, kEventCategories, "android_screenshot");
+  bytesField(extra, kEventScreenshot, shot);
+  static const std::string name = "Screenshot";
+  event(kInstant, track, ts_ns, &name, {}, extra);
+}
+
 void PerfettoTrace::event(int type, uint64_t track, uint64_t ts_ns, const std::string* name,
-                          const std::vector<TraceArg>& args) {
+                          const std::vector<TraceArg>& args, const std::string& extra) {
   if(!file_) return;
   std::string body;
   uintField(body, kTimestamp, ts_ns);
@@ -132,6 +144,7 @@ void PerfettoTrace::event(int type, uint64_t track, uint64_t ts_ns, const std::s
     uintField(ann, kAnnotationUint, a.value);
     bytesField(ev, kEventAnnotations, ann);
   }
+  ev += extra;
   bytesField(body, kTrackEvent, ev);
   packet(body);
 }

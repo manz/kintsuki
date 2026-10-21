@@ -601,12 +601,14 @@ class Emu:
         _native.lib.kintsuki_callstack_clear(self._handle)
 
     # ----------------------------------------------------------------- Timeline
-    def timeline_start(self, path: str | os.PathLike[str]) -> None:
+    def timeline_start(self, path: str | os.PathLike[str], *, screenshot_every: int = 0) -> None:
         """Stream a Perfetto trace to ``path`` (open it in ui.perfetto.dev):
         a slice per JSR/JSL and NMI/IRQ on the "65816" track (labels from the
         project or .adbg), a slice per DMA channel run, a "frame" instant per
-        rendered frame. Timestamps are the master clock in nanoseconds."""
-        if not _native.lib.kintsuki_timeline_start(self._handle, os.fsencode(path)):
+        rendered frame. Timestamps are the master clock in nanoseconds.
+        ``screenshot_every=N`` adds a JPEG of every Nth frame (~10 KB each),
+        shown on the UI's Screenshots track."""
+        if not _native.lib.kintsuki_timeline_start(self._handle, os.fsencode(path), screenshot_every):
             raise OSError(f"cannot write timeline to {path}")
 
     def timeline_mark(self, name: str) -> None:
@@ -618,9 +620,10 @@ class Emu:
         """Close open slices and the file; returns the bytes written."""
         return int(_native.lib.kintsuki_timeline_stop(self._handle))
 
-    def timeline(self, path: str | os.PathLike[str]) -> "_TimelineSession":
+    def timeline(self, path: str | os.PathLike[str], *,
+                 screenshot_every: int = 0) -> "_TimelineSession":
         """Context-manager wrapper: `with emu.timeline("t.pftrace"): emu.run_frames(60)`."""
-        return _TimelineSession(self, path)
+        return _TimelineSession(self, path, screenshot_every)
 
     # ------------------------------------------------------------------ Profile
     def profile_start(self, lo: int | None = None, hi: int | None = None) -> None:
@@ -1821,12 +1824,13 @@ class Emu:
 class _TimelineSession:
     """Starts a timeline on enter, stops it on exit."""
 
-    def __init__(self, emu: Emu, path: str | os.PathLike[str]) -> None:
+    def __init__(self, emu: Emu, path: str | os.PathLike[str], screenshot_every: int) -> None:
         self._emu = emu
         self._path = path
+        self._screenshot_every = screenshot_every
 
     def __enter__(self) -> "_TimelineSession":
-        self._emu.timeline_start(self._path)
+        self._emu.timeline_start(self._path, screenshot_every=self._screenshot_every)
         return self
 
     def __exit__(self, *_) -> None:

@@ -32,10 +32,13 @@ public:
   void end(uint64_t track, uint64_t ts_ns);
   void instant(uint64_t track, uint64_t ts_ns, const std::string& name,
                const std::vector<TraceArg>& args = {});
+  // An instant the UI's Screenshots track shows (category android_screenshot).
+  void screenshot(uint64_t track, uint64_t ts_ns, const std::vector<uint8_t>& jpeg);
 
 private:
+  // `extra`: TrackEvent fields already encoded, appended as is.
   void event(int type, uint64_t track, uint64_t ts_ns, const std::string* name,
-             const std::vector<TraceArg>& args);
+             const std::vector<TraceArg>& args, const std::string& extra = {});
   void packet(const std::string& body);
   void flush();
 
