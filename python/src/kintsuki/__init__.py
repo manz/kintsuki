@@ -587,7 +587,8 @@ class Emu:
 
     def callstack(self, max_frames: int = 256) -> list[tuple[int, int, int]]:
         """Snapshot the shadow callstack (deepest frame first). Each entry
-        is ``(callsite_pc, target_pc, kind)`` where kind is 0=JSR / 1=JSL.
+        is ``(callsite_pc, target_pc, kind)`` where kind is 0=JSR / 1=JSL /
+        2=NMI / 3=IRQ (callsite_pc: the interrupted PC).
         Empty when nothing has been called yet (or after ``load_state``)."""
         if max_frames <= 0:
             return []

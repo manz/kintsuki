@@ -250,8 +250,9 @@ void cOnCall(uint32_t callsite_pc, uint32_t target_pc, uint8_t kind) {
   profileOnCall(target_pc);
   // Auto-seed entry flags at every JSR/JSL target so cold-cache disasm at
   // any reached function knows the caller's M/X/E. First writer wins —
-  // manual edits are not clobbered.
-  if(g_project) {
+  // manual edits are not clobbered. An interrupt keeps the interrupted
+  // code's flags: nothing to seed.
+  if(g_project && kind < 2) {
     auto& r = ares::SuperFamicom::cpu.r;
     g_project->record_entry_flags(target_pc,
                                   (int8_t)r.p.m, (int8_t)r.p.x, (int8_t)r.e,

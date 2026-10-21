@@ -125,6 +125,7 @@ E XF = 1, MF = 1;
   L PC.b = pull();
   }
   idleJump();
+  if(returnHook) returnHook(2);
 }
 
 auto WDC65816::instructionReturnShort() -> void {

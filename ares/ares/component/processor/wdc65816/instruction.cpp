@@ -1,4 +1,5 @@
 auto WDC65816::interrupt() -> void {
+  u32 from = PC.d;
   read(PC.d);
   idle();
 N push(PC.b);
@@ -11,6 +12,11 @@ N push(PC.b);
 L PC.h = read(r.vector + 1);
   PC.b = 0x00;
   idleJump();
+  // kintsuki: NMI and IRQ enter like a call (kind 2 / 3), RTI returns.
+  if(callHook && r.vector != 0xfffc) {
+    bool nmi = r.vector == 0xffea || r.vector == 0xfffa;
+    callHook(from, PC.d, nmi ? 2 : 3);
+  }
 }
 
 //both the accumulator and index registers can independently be in either 8-bit or 16-bit mode.
