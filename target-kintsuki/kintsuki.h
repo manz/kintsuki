@@ -32,6 +32,11 @@ typedef enum {
 // just returned by the bus; for write it is the byte being written.
 typedef void (*kintsuki_cb_t)(uint32_t addr, uint8_t value, void* userdata);
 
+// Read override signature. Return 0-255 to replace the byte the CPU bus reads
+// at `addr` (data loads and opcode fetches), or -1 to leave the read alone.
+// `open_bus` is the bus value the read would otherwise start from.
+typedef int (*kintsuki_read_override_t)(uint32_t addr, uint8_t open_bus, void* userdata);
+
 // Lifecycle
 kintsuki_t* kintsuki_create(void);
 void        kintsuki_destroy(kintsuki_t*);
@@ -434,6 +439,14 @@ int         kintsuki_add_callback_ex(kintsuki_t*, int kind, uint32_t lo, uint32_
                                      int halt,
                                      kintsuki_cb_t fn, void* userdata);
 void        kintsuki_remove_callback(kintsuki_t*, int kind, int id);
+
+// Read overrides: stand in for a memory-mapped device over [lo, hi]. The
+// first active override covering the address that returns a value wins.
+// WRAM mirrors arrive de-mirrored ($00:0000-$1FFF as $7E:xxxx). Read
+// callbacks see the overridden value. Returns a 1-based id, 0 on failure.
+int         kintsuki_add_read_override(kintsuki_t*, uint32_t lo, uint32_t hi,
+                                       kintsuki_read_override_t fn, void* userdata);
+void        kintsuki_remove_read_override(kintsuki_t*, int id);
 
 // ---- Shadow callstack ----------------------------------------------------
 // Maintained transparently by the WDC65816 JSR/JSL/RTS/RTL hooks, one shadow

@@ -6,6 +6,7 @@ Bus bus;
 
 BusHook memReadHook = nullptr;
 BusHook memWriteHook = nullptr;
+BusReadOverride memReadOverride = nullptr;
 ExecHook execHook = nullptr;
 
 SmpExecHook smpExecHook = nullptr;

@@ -95,6 +95,10 @@ HANDLE = c_void_p
 # Callback signature: void (*)(uint32_t addr, uint8_t value, void* userdata)
 CALLBACK = CFUNCTYPE(None, c_uint32, c_uint8, c_void_p)
 
+# Read override: int (*)(uint32_t addr, uint8_t open_bus, void* userdata),
+# returning 0-255 to replace the read or -1 to pass through.
+READ_OVERRIDE = CFUNCTYPE(c_int, c_uint32, c_uint8, c_void_p)
+
 
 # Callback kind constants (must match libkintsuki.cpp).
 CB_EXEC = 0
@@ -450,6 +454,8 @@ _bind("kintsuki_press", None, [HANDLE, c_int, c_int, c_int])
 # Callbacks
 _bind("kintsuki_add_callback", c_int, [HANDLE, c_int, c_uint32, c_uint32, CALLBACK, c_void_p])
 _bind("kintsuki_remove_callback", None, [HANDLE, c_int, c_int])
+_bind("kintsuki_add_read_override", c_int, [HANDLE, c_uint32, c_uint32, READ_OVERRIDE, c_void_p])
+_bind("kintsuki_remove_read_override", None, [HANDLE, c_int])
 
 
 # Project file (slice 1: map.bin classification).
