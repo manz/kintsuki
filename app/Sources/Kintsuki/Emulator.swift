@@ -347,6 +347,30 @@ final class Emulator {
         var isWRAMWrite: Bool { dstReg == 0x80 }
     }
 
+    /// Patch libkintsuki found next to the ROM at the last load.
+    struct PatchInfo: Equatable {
+        let kind: String        // "ips" / "bps"
+        let path: String
+        let metadata: String    // BPS metadata blob, "" for IPS
+        let status: String      // "" when applied, else why it was rejected
+        var applied: Bool { status.isEmpty }
+    }
+
+    /// Refreshed after every `kintsuki_load_rom`; nil when no patch file
+    /// sat next to the ROM.
+    private(set) var patch: PatchInfo?
+
+    private func refreshPatchInfo() {
+        guard let h = handle else { patch = nil; return }
+        var raw = kintsuki_patch_info_t()
+        let found = kintsuki_patch_info(h, &raw) != 0
+        let next = found ? PatchInfo(kind: String(cString: raw.kind),
+                                     path: String(cString: raw.path),
+                                     metadata: String(cString: raw.metadata),
+                                     status: String(cString: raw.status)) : nil
+        if next != patch { patch = next }
+    }
+
     /// True when the loaded cart carries an S-DD1.
     var sdd1Present: Bool {
         guard let h = handle else { return false }
@@ -462,7 +486,17 @@ final class Emulator {
     private var rewindBuffer = RewindBuffer(capacity: 3600,
                                             keyframeInterval: 60)
     /// Frames currently retained in the rewind buffer (for the status pill).
-    private(set) var rewindFrames: Int = 0
+    private(set) var rewindFrames: Int = 0 {
+        didSet {
+            let can = rewindFrames >= 2
+            if can != canRewind { canRewind = can }
+        }
+    }
+    /// `rewindFrames >= 2`, written only when it flips. The menu bar reads
+    /// this instead of `rewindFrames`: every observed change rebuilds the
+    /// `.commands` menus, which dismisses any open submenu (Open Recent)
+    /// while the buffer fills at ~6 Hz.
+    private(set) var canRewind: Bool = false
     /// Set true while a rewind is in progress so the run loop pauses
     /// captures (otherwise we'd push the rewound state right back onto
     /// the buffer and never make progress).
@@ -542,6 +576,9 @@ final class Emulator {
             // hack whose header declares 128 KB) is fitted rather than
             // refused: zero-filled when shorter, truncated when longer.
             _ = kintsuki_set_sram_policy(h, UInt32(KINTSUKI_SRAM_FIT))
+            // The app applies a `<rom>.bps` sidecar; the library default
+            // (and Python) leaves it off unless asked.
+            kintsuki_set_bps_sidecar(h, 1)
             let out = AudioOutput(handle: h)
             out.setMuted(muted)
             audioOutput = out
@@ -694,6 +731,7 @@ final class Emulator {
         let path = url.path
         NSLog("kintsuki: loadROM path=\(path)")
         let ok = path.withCString { kintsuki_load_rom(h, $0) }
+        refreshPatchInfo()
         guard ok != 0 else {
             NSLog("kintsuki: failed to load ROM at \(path)")
             return
@@ -2201,6 +2239,7 @@ final class Emulator {
         stopRunLoop()
         let path = url.path
         let ok = path.withCString { kintsuki_load_rom(h, $0) }
+        refreshPatchInfo()
         guard ok != 0 else {
             NSLog("kintsuki: hot-reload load_rom failed at \(path)")
             return

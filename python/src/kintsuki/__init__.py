@@ -34,9 +34,28 @@ __all__ = [
     "FnStat",
     "SramSizeError",
     "SramSizeWarning",
+    "PatchInfo",
+    "PatchRejectedWarning",
     "SRAM_POLICIES",
     "LiveCounters",
 ]
+
+
+@dataclass(frozen=True)
+class PatchInfo:
+    """The patch :meth:`Emu.load_rom` found next to the ROM. ``kind`` is
+    ``"ips"`` or ``"bps"``; ``metadata`` is the BPS metadata blob (``""``
+    for IPS). ``status`` is ``""`` when the patch was applied, otherwise why
+    it was rejected, in which case the ROM was loaded unpatched."""
+
+    kind: str
+    path: str
+    metadata: str
+    status: str
+
+    @property
+    def applied(self) -> bool:
+        return not self.status
 
 
 @dataclass(frozen=True)
@@ -362,6 +381,11 @@ class SramSizeError(RuntimeError):
     refused it; the message says how to load it anyway."""
 
 
+class PatchRejectedWarning(UserWarning):
+    """A patch sat next to the ROM but was rejected (bad format, CRC
+    mismatch); the ROM was loaded unpatched. See :meth:`Emu.patch_info`."""
+
+
 class SramSizeWarning(UserWarning):
     """A .srm sidecar's size didn't match the cart; the policy ignored it."""
 
@@ -378,6 +402,7 @@ class Emu:
     _live: "weakref.WeakSet[Emu]" = weakref.WeakSet()
 
     def __init__(self, *, load_srm_sidecar: bool | None = None,
+                 load_bps_sidecar: bool = False,
                  vram_size: int = VRAM_BYTES,
                  sram_policy: str = "error") -> None:
         # kintsuki runs one emulator per process (a single native handle). An
@@ -399,6 +424,9 @@ class Emu:
         self._registered: list[_Registered] = []
         on = Emu.default_load_srm_sidecar if load_srm_sidecar is None else load_srm_sidecar
         _native.lib.kintsuki_set_srm_sidecar(self._handle, 1 if on else 0)
+        # Opt-in: a `<rom>.bps` / `<stem>.bps` is applied at load_rom only
+        # when asked for (IPS sidecars are always applied).
+        _native.lib.kintsuki_set_bps_sidecar(self._handle, 1 if load_bps_sidecar else 0)
         self.set_vram_size(vram_size)
         self.sram_policy = sram_policy
 
@@ -452,8 +480,25 @@ class Emu:
             raise RuntimeError(f"failed to load ROM: {path}")
         if self.last_error:  # a .srm sidecar the SRAM policy refused
             warnings.warn(self.last_error, SramSizeWarning, stacklevel=2)
+        patch = self.patch_info()
+        if patch is not None and not patch.applied:
+            warnings.warn(f"{patch.path}: {patch.status}", PatchRejectedWarning, stacklevel=2)
         if adbg is not None:
             self.load_adbg(adbg)
+
+    def patch_info(self) -> PatchInfo | None:
+        """The IPS/BPS patch found next to the ROM at the last
+        :meth:`load_rom`, or ``None`` when there was none. BPS sidecars are
+        only looked for with ``Emu(load_bps_sidecar=True)``."""
+        raw = _native.PatchInfoRaw()
+        if not _native.lib.kintsuki_patch_info(self._handle, ctypes.byref(raw)):
+            return None
+        return PatchInfo(
+            kind=raw.kind.decode("utf-8"),
+            path=os.fsdecode(raw.path),
+            metadata=raw.metadata.decode("utf-8", errors="replace"),
+            status=raw.status.decode("utf-8"),
+        )
 
     def load_adbg(self, path: str | os.PathLike[str]) -> None:
         """Load an ``.adbg`` debug-info file (LABEL symbols only). Replaces

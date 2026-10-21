@@ -353,6 +353,20 @@ void kintsuki_set_srm_sidecar(kintsuki_t* h, int enable) {
   h->program->loadSrmSidecar = (enable != 0);
 }
 
+void kintsuki_set_bps_sidecar(kintsuki_t* h, int enable) {
+  if(!h) return;
+  h->program->loadBpsSidecar = (enable != 0);
+}
+
+int kintsuki_patch_info(kintsuki_t* h, kintsuki_patch_info_t* out) {
+  if(!out) return 0;
+  *out = {"", "", "", ""};
+  if(!h) return 0;
+  auto& p = h->program->patch;
+  *out = {p.kind.c_str(), p.path.c_str(), p.metadata.c_str(), p.status.c_str()};
+  return p.kind.empty() ? 0 : 1;
+}
+
 int kintsuki_set_vram_size(kintsuki_t* h, uint32_t bytes) {
   if(!h) return 0;
   if(bytes != 0x10000 && bytes != 0x20000) return 0;

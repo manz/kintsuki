@@ -175,6 +175,16 @@ struct Program : ares::Platform {
   // sidecar if one exists. Tests flip this off so deterministic SRAM
   // doesn't get clobbered by an accidental save file.
   bool loadSrmSidecar = true;
+  // When true, `loadRom` applies a `<rom>.bps` / `<stem>.bps` sidecar before
+  // looking for an IPS. Off by default: the app opts in, library callers
+  // (Python, tests) get the bytes on disk unless they ask otherwise.
+  bool loadBpsSidecar = false;
+  // Patch `loadRom` found next to the ROM. kind is "" (none), "ips" or
+  // "bps"; status is "" when applied cleanly, else why it was rejected
+  // (the ROM is then left unpatched). metadata is the BPS metadata blob.
+  struct PatchInfo {
+    std::string kind, path, metadata, status;
+  } patch;
   // What to do when incoming SRAM (inject_sram, the .srm sidecar, a savestate's
   // cart.sram region) doesn't match the cart's declared size: KINTSUKI_SRAM_*
   // (kintsuki.h). The default refuses with a message in lastError.

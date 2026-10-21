@@ -9,6 +9,8 @@
 #include "program.hpp"
 #include "heuristics.hpp"
 
+#include <nall/beat/single/apply.hpp>
+
 #define STB_IMAGE_WRITE_IMPLEMENTATION
 #include "stb_image_write.h"
 
@@ -214,31 +216,68 @@ auto Program::loadRom(const char* path) -> bool {
     romPristineSha256 = std::string{h.digest().data()};
   }
 
-  // Auto-apply an IPS patch sitting next to the ROM. ares' upstream loader
+  // Auto-apply a patch sitting next to the ROM. ares' upstream loader
   // doesn't do this in headless — we duplicate mia's behaviour here.
-  // Two locations: <rom>.ips (preferred) and <rom-without-ext>.ips.
-  auto tryPatch = [&](const std::string& patchPath) {
+  // Candidates per format: <rom>.<ext> (preferred), then <stem>.<ext>.
+  // BPS (opt-in, loadBpsSidecar) wins over IPS when both are present.
+  patch = {};
+  std::string p = path;
+  auto candidates = [&](const char* ext) {
+    std::vector<std::string> out{p + "." + ext};
+    auto dot = p.find_last_of('.');
+    if(dot != std::string::npos) out.push_back(p.substr(0, dot) + "." + ext);
+    return out;
+  };
+
+  // A BPS carries CRC32s of the source and target: a mismatch means the
+  // wrong base ROM (or a corrupt patch), so the ROM stays unpatched and
+  // the reason lands in patch.status.
+  auto tryBps = [&](const std::string& patchPath) {
+    auto bps = readFile(patchPath.c_str());
+    if(bps.empty()) return false;   // missing or zero-byte file, silent
+    string manifest, result;
+    auto target = Beat::Single::apply(std::span<const u8>(romData.data(), romData.size()),
+                                      std::span<const u8>(bps.data(), bps.size()),
+                                      manifest, result);
+    patch = {"bps", patchPath, std::string{manifest.data(), manifest.size()}, ""};
+    if(!target || result.size()) {
+      patch.status = result.size() ? std::string{result.data()} : "error: unknown";
+      std::fprintf(stderr, "kintsuki: rejected BPS %s (%s)\n",
+                   patchPath.c_str(), patch.status.c_str());
+      return false;
+    }
+    romData = std::move(*target);
+    std::fprintf(stderr, "kintsuki: applied BPS %s (%zu bytes)\n",
+                 patchPath.c_str(), bps.size());
+    return true;
+  };
+
+  auto tryIps = [&](const std::string& patchPath) {
     auto ips = readFile(patchPath.c_str());
     if(ips.empty()) return false;   // missing or zero-byte file, silent
     bool ok = kintsuki::applyIpsPatch(romData, std::span<const uint8_t>(ips.data(), ips.size()));
     if(ok) {
+      patch = {"ips", patchPath, "", ""};
       std::fprintf(stderr, "kintsuki: applied IPS %s (%zu bytes)\n",
                    patchPath.c_str(), ips.size());
     } else {
       // Existing file but malformed / truncated / wrong magic. Warn so
       // users notice — a silent reject looks identical to "no patch
       // present" and causes hours of "why isn't my fix loading".
+      // A rejected BPS takes precedence in patch.status.
+      if(patch.kind.empty()) patch = {"ips", patchPath, "", "error: invalid format"};
       std::fprintf(stderr, "kintsuki: rejected IPS %s (%zu bytes, invalid format)\n",
                    patchPath.c_str(), ips.size());
     }
     return ok;
   };
-  std::string p = path;
-  // <rom>.ips
-  if(!tryPatch(p + ".ips")) {
-    // <rom-without-extension>.ips
-    auto dot = p.find_last_of('.');
-    if(dot != std::string::npos) tryPatch(p.substr(0, dot) + ".ips");
+
+  bool patched = false;
+  if(loadBpsSidecar) {
+    for(auto& c : candidates("bps")) if((patched = tryBps(c)) || !patch.kind.empty()) break;
+  }
+  if(!patched) {
+    for(auto& c : candidates("ips")) if(tryIps(c)) break;
   }
 
   kintsuki::RomInfo info;

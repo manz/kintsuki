@@ -78,6 +78,10 @@ struct KintsukiApp: App {
         Window("Profiler", id: "profiler") {
             ProfilerView(emulator: emulator)
         }
+
+        Window("Patch Info", id: "patch") {
+            PatchInfoView(emulator: emulator)
+        }
         .commands {
             CommandGroup(replacing: .newItem) {
                 Button("Open ROM…") {
@@ -124,10 +128,10 @@ struct KintsukiApp: App {
                     .keyboardShortcut(".", modifiers: .command)
                 Button("Rewind 1 Frame") { emulator.rewindOneFrame() }
                     .keyboardShortcut(.leftArrow, modifiers: .command)
-                    .disabled(emulator.rewindFrames < 2)
+                    .disabled(!emulator.canRewind)
                 Button("Rewind 1 Second") { emulator.rewindBy(frames: 60) }
                     .keyboardShortcut(.leftArrow, modifiers: [.command, .shift])
-                    .disabled(emulator.rewindFrames < 2)
+                    .disabled(!emulator.canRewind)
                 Divider()
                 Button("Tilemap Viewer") { toggleToolWindow("tilemap") }
                     .keyboardShortcut("t", modifiers: [.command, .shift])
@@ -148,6 +152,9 @@ struct KintsukiApp: App {
                     .keyboardShortcut("b", modifiers: [.command, .shift])
                 Button("Profiler") { toggleToolWindow("profiler") }
                     .keyboardShortcut("f", modifiers: [.command, .shift])
+                Button("Patch Info") { toggleToolWindow("patch") }
+                    .keyboardShortcut("i", modifiers: [.command, .shift])
+                    .disabled(emulator.loadedROM == nil)
                 Divider()
                 Button("Save Screenshot") { saveScreenshotToPicturesFolder() }
                     .keyboardShortcut("p", modifiers: [.command, .shift])

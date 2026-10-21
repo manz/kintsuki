@@ -361,6 +361,19 @@ _bind("kintsuki_set_sram_policy", c_int, [HANDLE, c_uint32])
 _bind("kintsuki_sram_policy", c_uint32, [HANDLE])
 _bind("kintsuki_last_error", c_char_p, [HANDLE])
 _bind("kintsuki_set_srm_sidecar", None, [HANDLE, c_int])
+_bind("kintsuki_set_bps_sidecar", None, [HANDLE, c_int])
+
+
+class PatchInfoRaw(Structure):
+    _fields_ = [
+        ("kind",     c_char_p),
+        ("path",     c_char_p),
+        ("metadata", c_char_p),
+        ("status",   c_char_p),
+    ]
+
+
+_bind("kintsuki_patch_info", c_int, [HANDLE, POINTER(PatchInfoRaw)])
 _bind("kintsuki_set_vram_size", c_int, [HANDLE, c_uint32])
 _bind("kintsuki_vram_size", c_uint32, [HANDLE])
 
