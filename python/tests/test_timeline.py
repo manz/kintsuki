@@ -199,6 +199,16 @@ def test_timeline_dma_slice_lasts_its_bytes(recorded):
     assert 11_000 < end.ts - begin.ts < 13_000  # (8 + 32 * 8) master cycles ~ 12.3 us
 
 
+def test_timeline_has_an_hdma_slice_per_frame_for_its_lines(recorded):
+    events = [e for e in _decode(recorded) if e.track == "HDMA 1"]
+    begins = [e for e in events if e.type == BEGIN]
+    assert len(begins) == 5
+    assert all(e.name == "$2132" and e.args["line"] == 0 for e in begins)
+    begin, end = events[0], events[1]
+    assert end.type == END
+    assert 990_000 < end.ts - begin.ts < 1_040_000  # 16 lines of 1364 master cycles ~ 1.016 ms
+
+
 def test_timeline_mark_lands_on_the_marks_track(emu_rom, tmp_path):
     path = tmp_path / "t.pftrace"
     sub = _symbol(emu_rom, "nmi_sub")

@@ -604,9 +604,10 @@ class Emu:
     def timeline_start(self, path: str | os.PathLike[str], *, screenshot_every: int = 0) -> None:
         """Stream a Perfetto trace to ``path`` (open it in ui.perfetto.dev):
         a slice per JSR/JSL and NMI/IRQ on the "65816" track (labels from the
-        project or .adbg), a slice per DMA channel run, a "frame" instant per
-        rendered frame. Timestamps are the master clock in nanoseconds.
-        ``screenshot_every=N`` adds a JPEG of every Nth frame (~10 KB each),
+        project or .adbg), a slice per DMA channel run and per run of
+        consecutive HDMA lines, a "frame" instant per rendered frame.
+        Timestamps are the master clock in nanoseconds.
+        ``screenshot_every=N`` adds a JPEG of every Nth frame (~25 KB each),
         shown on the UI's Screenshots track."""
         if not _native.lib.kintsuki_timeline_start(self._handle, os.fsencode(path), screenshot_every):
             raise OSError(f"cannot write timeline to {path}")

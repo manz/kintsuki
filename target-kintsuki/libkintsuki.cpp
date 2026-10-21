@@ -249,6 +249,15 @@ uint64_t g_traceCpu = 0;
 uint64_t g_traceFrames = 0;
 uint64_t g_traceMarks = 0;
 uint64_t g_traceDma[8] = {};
+uint64_t g_traceHdma[8] = {};
+// A channel's run of consecutive HDMA lines, open as one slice.
+struct HdmaRun {
+  bool     open = false;
+  uint16_t last = 0;
+  uint64_t lastMaster = 0;
+};
+HdmaRun g_traceHdmaRun[8];
+constexpr uint64_t kLineMaster = 1364;
 uint32_t g_traceDepth = 0;
 uint32_t g_traceScreenshotEvery = 0;  // frames; 0: no screenshots
 constexpr int kTraceJpegQuality = 80;
@@ -313,6 +322,28 @@ void traceDma(uint8_t channel, uint32_t src, uint8_t dst, uint16_t size) {
   g_trace.begin(g_traceDma[channel], traceNs(master), name,
                 {{"src", src}, {"bytes", bytes}, {"line", traceLine()}});
   g_trace.end(g_traceDma[channel], traceNs(master + 8 + 8ull * bytes));  // 8 master cycles a byte
+}
+
+void traceHdmaClose(uint8_t channel) {
+  auto& run = g_traceHdmaRun[channel];
+  if(!run.open) return;
+  g_trace.end(g_traceHdma[channel], traceNs(run.lastMaster + kLineMaster));
+  run.open = false;
+}
+
+void traceHdma(uint8_t channel, uint16_t line, uint8_t dst) {
+  if(!g_trace.active() || channel >= 8) return;
+  auto& run = g_traceHdmaRun[channel];
+  uint64_t master = profileMasterCycles();
+  if(!(run.open && line == run.last + 1)) {
+    traceHdmaClose(channel);
+    char name[16];
+    std::snprintf(name, sizeof name, "$21%02X", dst);
+    g_trace.begin(g_traceHdma[channel], traceNs(master), name, {{"line", line}});
+    run.open = true;
+  }
+  run.last = line;
+  run.lastMaster = master;
 }
 
 void traceFrame() {
@@ -1725,6 +1756,11 @@ int kintsuki_timeline_start(kintsuki_t* h, const char* path, uint32_t screenshot
   g_traceMarks = g_trace.track("Marks");
   uint64_t dma = g_trace.track("DMA");
   for(int i = 0; i < 8; i++) g_traceDma[i] = g_trace.track("DMA " + std::to_string(i), dma);
+  uint64_t hdma = g_trace.track("HDMA");
+  for(int i = 0; i < 8; i++) {
+    g_traceHdma[i] = g_trace.track("HDMA " + std::to_string(i), hdma);
+    g_traceHdmaRun[i] = {};
+  }
   return 1;
 }
 
@@ -1736,6 +1772,7 @@ void kintsuki_timeline_mark(kintsuki_t* h, const char* name) {
 uint64_t kintsuki_timeline_stop(kintsuki_t* h) {
   if(!h || !g_trace.active()) return 0;
   traceCloseSlices();
+  for(uint8_t i = 0; i < 8; i++) traceHdmaClose(i);
   uint64_t bytes = g_trace.bytes();
   g_trace.close();
   return bytes;
@@ -1973,7 +2010,8 @@ uint8_t g_hdmaCurrent[kHdmaScanlines] = {};
 uint8_t g_hdmaLatched[kHdmaScanlines] = {};
 uint64_t g_hdmaCurrentFrame = 0;
 
-void hdmaHookFn(uint8_t channel, uint16_t scanline, uint8_t /*dst*/) {
+void hdmaHookFn(uint8_t channel, uint16_t scanline, uint8_t dst) {
+  traceHdma(channel, scanline, dst);
   uint64_t frame = g_handle ? g_handle->program->framesRendered : 0;
   if(frame != g_hdmaCurrentFrame) {
     // Frame just rolled over — latch what we accumulated and clear.
