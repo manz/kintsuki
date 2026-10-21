@@ -431,6 +431,10 @@ void kintsuki_live_counters(kintsuki_t* h, kintsuki_live_counters_t* out) {
   out->h = (uint16_t)ares::SuperFamicom::cpu.hcounter();
 }
 
+int64_t kintsuki_clock_skew(kintsuki_t* h) {
+  return h ? h->program->cpuClockSkew() : 0;
+}
+
 uint64_t kintsuki_cpu_cycles(kintsuki_t* h) {
   if(!h) return 0;
   // SNES CPU runs at master/6. Thread clock is in ares-scaled units; the
@@ -1546,8 +1550,10 @@ void kintsuki_rearm_cpu(kintsuki_t* h) {
   // (which would re-randomize WRAM and re-run the boot vector). The
   // coroutine's host-side stack is replaced by a fresh one; the next
   // scheduler entry calls CPU::main from the top with a clean stack.
-  ares::SuperFamicom::cpu.create(
-    ares::SuperFamicom::system.cpuFrequency(),
+  // restart, not create: create zeroes the thread clock, which puts the
+  // CPU (and the HDMA it drives) out of step with the PPU, e.g. one
+  // scanline late, and that skew is then saved into every later state.
+  ares::SuperFamicom::cpu.restart(
     std::bind_front(&ares::SuperFamicom::CPU::main,
                     &ares::SuperFamicom::cpu));
   // Clear the halt flags + pending interrupts on the WDC65816 register

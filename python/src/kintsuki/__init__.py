@@ -1071,6 +1071,13 @@ class Emu:
         return LiveCounters(master=int(raw.master), v=int(raw.v), h=int(raw.h))
 
     @property
+    def clock_skew(self) -> int:
+        """CPU thread clock minus where the CPU/PPU counters place it, in
+        master cycles: 0 after a load (load_state realigns states saved with
+        a skewed CPU clock, which put HDMA on the wrong scanlines)."""
+        return int(_native.lib.kintsuki_clock_skew(self._handle))
+
+    @property
     def cpu_cycles(self) -> int:
         # master / 6 ≈ 65816 CPU cycles. Standard mode; FastROM and IO waits
         # are already folded into the master clock by the ares core.

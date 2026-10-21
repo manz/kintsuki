@@ -806,7 +806,38 @@ auto parseKssfFooter(const uint8_t* data, uint32_t size) -> KssfFooter {
   return f;
 }
 
+// A loaded state with its CPU clock realigned on the PPU (Program::realignCpuClock).
+auto unserializeState(Program& program, serializer& s) -> bool {
+  if(!SuperFamicom::system.unserialize(s)) return false;
+  program.realignCpuClock();
+  return true;
+}
+
 }  // anonymous namespace
+
+auto Program::cpuClockSkew() const -> s64 {
+  // Both threads count master cycles in the same scaled units; the counters
+  // place each one in the frame. Lines are taken as 1364 cycles (240 can be
+  // 4 short, hence SkewTolerance).
+  auto& cpu = SuperFamicom::cpu;
+  auto& ppu = SuperFamicom::ppuPerformanceImpl;
+  s64 scalar = (s64)cpu.scalar();
+  s64 clocks = ((s64)(cpu.clock() - ppu.clock())) / scalar;
+  s64 line = 1364;
+  s64 frame = line * (SuperFamicom::Region::PAL() ? 312 : 262);
+  s64 position = ((s64)cpu.vcounter() - (s64)ppu.vcounter()) * line
+               + (s64)cpu.hcounter() - (s64)ppu.hcounter();
+  if(position > frame / 2) position -= frame;
+  if(position < -frame / 2) position += frame;
+  return clocks - position;
+}
+
+auto Program::realignCpuClock() -> void {
+  s64 skew = cpuClockSkew();
+  if(skew >= -SkewTolerance && skew <= SkewTolerance) return;
+  auto& cpu = SuperFamicom::cpu;
+  cpu.setClock(cpu.clock() - (u64)(skew * (s64)cpu.scalar()));
+}
 
 auto Program::saveStateBlob() -> std::vector<uint8_t> {
   serializer s = SuperFamicom::system.serialize(true);
@@ -868,11 +899,11 @@ auto Program::loadStateBlob(const uint8_t* data, u32 size) -> bool {
     patched.insert(patched.end(), sram.begin(), sram.end());
     patched.insert(patched.end(), data + srcOff + srcLen, data + footer.aresBlobLen);
     serializer s(patched.data(), (u32)patched.size());
-    return SuperFamicom::system.unserialize(s);
+    return unserializeState(*this, s);
   }
   u32 aresLen = footer.present ? footer.aresBlobLen : size;
   serializer s(data, aresLen);
-  return SuperFamicom::system.unserialize(s);
+  return unserializeState(*this, s);
 }
 
 auto Program::loadStateBlobEx(const uint8_t* data, u32 size,
@@ -950,7 +981,7 @@ auto Program::loadStateBlobEx(const uint8_t* data, u32 size,
                    data + footer.aresBlobLen);
 
     serializer s(patched.data(), (u32)patched.size());
-    return SuperFamicom::system.unserialize(s) ? 1 : 0;
+    return unserializeState(*this, s) ? 1 : 0;
   }
 
   if(sizeMismatch) return 0;  // no flag covers this case → reject
@@ -958,7 +989,7 @@ auto Program::loadStateBlobEx(const uint8_t* data, u32 size,
   // Default path: equivalent to loadStateBlob.
   u32 aresLen = footer.present ? footer.aresBlobLen : size;
   serializer s(data, aresLen);
-  return SuperFamicom::system.unserialize(s) ? 1 : 0;
+  return unserializeState(*this, s) ? 1 : 0;
 }
 
 auto Program::saveStateFile(const char* path) -> bool {
