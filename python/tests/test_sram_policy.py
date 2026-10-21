@@ -152,3 +152,16 @@ def test_a_mismatched_sidecar_loads_under_fit(rom8: Path, tmp_path: Path) -> Non
     with Emu(load_srm_sidecar=True, sram_policy="fit") as emu:
         emu.load_rom(str(rom))
         assert _sram_of(emu) == b"\x66" * (2 * KB) + bytes(6 * KB)
+
+
+# --- read_sram -----------------------------------------------------------------
+
+def test_read_sram_returns_what_was_injected(rom8: Path) -> None:
+    with _booted(rom8) as emu:
+        emu.inject_sram(bytes(range(256)) * 32)
+        assert emu.read_sram() == bytes(range(256)) * 32
+
+
+def test_read_sram_matches_the_state_region(rom32: Path) -> None:
+    with _booted(rom32) as emu:
+        assert emu.read_sram() == _sram_of(emu)

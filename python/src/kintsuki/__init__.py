@@ -1180,6 +1180,14 @@ class Emu:
             raise SramSizeError(self.last_error or "inject_sram failed")
         return n
 
+    def read_sram(self) -> bytes:
+        """The cart's in-memory SRAM, e.g. to write a `.srm`; empty if the
+        cart has none."""
+        size = int(_native.lib.kintsuki_read_sram(self._handle, None, 0))
+        buf = (ctypes.c_uint8 * size)()
+        _native.lib.kintsuki_read_sram(self._handle, buf, size)
+        return bytes(buf)
+
     def set_state(self, s: CpuState) -> None:
         _native.lib.kintsuki_set_state(self._handle, ctypes.byref(s))
 

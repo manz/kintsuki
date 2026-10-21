@@ -97,6 +97,7 @@ struct Program : ares::Platform {
   // True once bootSpc (or bootRom) has powered the system.
   auto isLoaded() const -> bool { return loaded; }
   auto injectSram(const u8* data, u32 len) -> u32;
+  auto readSram(u8* out, u32 cap) -> u32;
 
   // Memory: CPU bus (24-bit address)
   auto memRead(u32 addr) -> u8;
