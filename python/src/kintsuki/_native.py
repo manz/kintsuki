@@ -349,6 +349,7 @@ class PpuStateRaw(Structure):
 
 
 _bind("kintsuki_get_ppu_state", None, [HANDLE, POINTER(PpuStateRaw)])
+_bind("kintsuki_ppu_ss_read", c_uint8, [HANDLE, c_uint8])
 
 # Tracer
 TRACE_RING = 0
@@ -411,6 +412,7 @@ _bind("kintsuki_spc_run_samples", c_uint32, [HANDLE, c_uint32])
 _bind("kintsuki_spc_get_state", None, [HANDLE, POINTER(SpcStateRaw)])
 _bind("kintsuki_spc_set_state", None, [HANDLE, POINTER(SpcStateRaw)])
 _bind("kintsuki_dsp_registers", c_uint32, [HANDLE, POINTER(c_uint8), c_uint32])
+_bind("kintsuki_dsp_write_register", None, [HANDLE, c_uint8, c_uint8])
 
 
 class SpcDisasmLine(Structure):

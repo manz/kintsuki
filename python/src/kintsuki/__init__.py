@@ -1135,6 +1135,13 @@ class Emu:
         _native.lib.kintsuki_get_ppu_state(self._handle, ctypes.byref(raw))
         return PpuState._from_raw(raw)
 
+    def ppu_ss_read(self, reg: int) -> int:
+        """Read back a write-only PPU register as the MiSTer core's
+        savestate port answers $C1:21xx: `reg` $00-$33 the low (or only)
+        byte, $40/$41 COLDATA green/red, $4D-$60 the high byte of the
+        two-write register at reg - $40, $61 the CGADD byte latch."""
+        return int(_native.lib.kintsuki_ppu_ss_read(self._handle, reg & 0xFF))
+
     # ----------------------------------------------------------------- Tracer
     def tracer_start(self, lo: int, hi: int, *, ring_capacity: int = 4096,
                      path: str | None = None) -> None:
@@ -1397,6 +1404,10 @@ class Emu:
         buf = (ctypes.c_uint8 * 128)()
         n = _native.lib.kintsuki_dsp_registers(self._handle, buf, 128)
         return bytes(buf[:n])
+
+    def dsp_write_register(self, addr: int, value: int) -> None:
+        """Write one S-DSP register ($00-$7F) as the SMP's $F3 port would."""
+        _native.lib.kintsuki_dsp_write_register(self._handle, addr & 0x7F, value & 0xFF)
 
     def dsp_voice(self, index: int, regs: bytes | None = None) -> DspVoice:
         """Decode one S-DSP voice (0..7). Pass `regs` from a prior

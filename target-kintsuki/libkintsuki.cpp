@@ -529,6 +529,113 @@ void kintsuki_set_state(kintsuki_t* h, const kintsuki_cpu_state_t* in) {
 
 // PPU/DMA state snapshot — types declared in kintsuki.h.
 
+// Savestate readback of the PPU's write-only registers, as the MiSTer core's
+// PPU.vhd answers it on $C1:21xx (SS_A). $40-$41 are COLDATA green/red and
+// $4D-$61 the high bytes of the two-write registers at $0D-$21.
+uint8_t kintsuki_ppu_ss_read(kintsuki_t* h, uint8_t reg) {
+  if(!h) return 0;
+  auto& p = ares::SuperFamicom::ppuPerformanceImpl;
+  using Source = ares::SuperFamicom::PPUPerformance::Source;
+  auto b = [](bool v, int bit) -> uint8_t { return v ? (uint8_t)(1u << bit) : 0; };
+  auto sc = [](auto& bg) -> uint8_t {
+    return (uint8_t)((bg.io.screenAddress >> 10) << 2 | bg.io.screenSize);
+  };
+  auto wsel = [&](auto& w1, auto& w2) -> uint8_t {
+    return b(w1.oneInvert, 0) | b(w1.oneEnable, 1) | b(w1.twoInvert, 2) | b(w1.twoEnable, 3)
+         | b(w2.oneInvert, 4) | b(w2.oneEnable, 5) | b(w2.twoInvert, 6) | b(w2.twoEnable, 7);
+  };
+  bool m7 = p.io.bgMode == 7;
+  uint16_t oamadd = (uint16_t)(p.io.oamBaseAddress >> 1);
+  switch(reg) {
+  case 0x00: return b(p.io.displayDisable, 7) | (uint8_t)p.io.displayBrightness;
+  case 0x01: return (uint8_t)(p.obj.io.baseSize << 5 | p.obj.io.nameselect << 3
+                             | p.obj.io.tiledataAddress >> 13);
+  case 0x02: return (uint8_t)oamadd;
+  case 0x03: return b(p.io.oamPriority, 7) | (uint8_t)(oamadd >> 8 & 1);
+  case 0x05: return b(p.bg4.io.tileSize, 7) | b(p.bg3.io.tileSize, 6) | b(p.bg2.io.tileSize, 5)
+                  | b(p.bg1.io.tileSize, 4) | b(p.io.bgPriority, 3) | (uint8_t)p.io.bgMode;
+  case 0x06: return (uint8_t)((p.mosaic.size - 1) << 4)
+                  | b(p.bg4.io.mosaicEnable, 3) | b(p.bg3.io.mosaicEnable, 2)
+                  | b(p.bg2.io.mosaicEnable, 1) | b(p.bg1.io.mosaicEnable, 0);
+  case 0x07: return sc(p.bg1);
+  case 0x08: return sc(p.bg2);
+  case 0x09: return sc(p.bg3);
+  case 0x0a: return sc(p.bg4);
+  case 0x0b: return (uint8_t)(p.bg2.io.tiledataAddress >> 12 << 4 | p.bg1.io.tiledataAddress >> 12);
+  case 0x0c: return (uint8_t)(p.bg4.io.tiledataAddress >> 12 << 4 | p.bg3.io.tiledataAddress >> 12);
+  case 0x0d: return (uint8_t)(m7 ? p.mode7.hoffset : p.bg1.io.hoffset);
+  case 0x0e: return (uint8_t)(m7 ? p.mode7.voffset : p.bg1.io.voffset);
+  case 0x0f: return (uint8_t)p.bg2.io.hoffset;
+  case 0x10: return (uint8_t)p.bg2.io.voffset;
+  case 0x11: return (uint8_t)p.bg3.io.hoffset;
+  case 0x12: return (uint8_t)p.bg3.io.voffset;
+  case 0x13: return (uint8_t)p.bg4.io.hoffset;
+  case 0x14: return (uint8_t)p.bg4.io.voffset;
+  case 0x15: {
+    uint8_t inc = p.vram.increment == 1 ? 0 : p.vram.increment == 32 ? 1 : 2;
+    return b(p.vram.mode, 7) | (uint8_t)(p.vram.mapping << 2) | inc;
+  }
+  case 0x16: return (uint8_t)p.vram.address;
+  case 0x17: return (uint8_t)(p.vram.address >> 8);
+  case 0x1a: return (uint8_t)(p.mode7.repeat << 6) | b(p.mode7.vflip, 1) | b(p.mode7.hflip, 0);
+  case 0x1b: return (uint8_t)p.mode7.a;
+  case 0x1c: return (uint8_t)p.mode7.b;
+  case 0x1d: return (uint8_t)p.mode7.c;
+  case 0x1e: return (uint8_t)p.mode7.d;
+  case 0x1f: return (uint8_t)p.mode7.hcenter;
+  case 0x20: return (uint8_t)p.mode7.vcenter;
+  case 0x21: return (uint8_t)p.io.cgramAddress;
+  case 0x22: return (uint8_t)p.latch.cgram;
+  case 0x23: return wsel(p.bg1.window, p.bg2.window);
+  case 0x24: return wsel(p.bg3.window, p.bg4.window);
+  case 0x25: return wsel(p.obj.window, p.dac.window);
+  case 0x26: return (uint8_t)p.window.io.oneLeft;
+  case 0x27: return (uint8_t)p.window.io.oneRight;
+  case 0x28: return (uint8_t)p.window.io.twoLeft;
+  case 0x29: return (uint8_t)p.window.io.twoRight;
+  case 0x2a: return (uint8_t)(p.bg4.window.mask << 6 | p.bg3.window.mask << 4
+                             | p.bg2.window.mask << 2 | p.bg1.window.mask);
+  case 0x2b: return (uint8_t)(p.dac.window.mask << 2 | p.obj.window.mask);
+  case 0x2c: return b(p.obj.io.aboveEnable, 4) | b(p.bg4.io.aboveEnable, 3) | b(p.bg3.io.aboveEnable, 2)
+                  | b(p.bg2.io.aboveEnable, 1) | b(p.bg1.io.aboveEnable, 0);
+  case 0x2d: return b(p.obj.io.belowEnable, 4) | b(p.bg4.io.belowEnable, 3) | b(p.bg3.io.belowEnable, 2)
+                  | b(p.bg2.io.belowEnable, 1) | b(p.bg1.io.belowEnable, 0);
+  case 0x2e: return b(p.obj.window.aboveEnable, 4) | b(p.bg4.window.aboveEnable, 3)
+                  | b(p.bg3.window.aboveEnable, 2) | b(p.bg2.window.aboveEnable, 1)
+                  | b(p.bg1.window.aboveEnable, 0);
+  case 0x2f: return b(p.obj.window.belowEnable, 4) | b(p.bg4.window.belowEnable, 3)
+                  | b(p.bg3.window.belowEnable, 2) | b(p.bg2.window.belowEnable, 1)
+                  | b(p.bg1.window.belowEnable, 0);
+  case 0x30: return (uint8_t)(p.dac.window.aboveMask << 6 | p.dac.window.belowMask << 4)
+                  | b(p.dac.io.blendMode, 1) | b(p.dac.io.directColor, 0);
+  case 0x31: return b(p.dac.io.colorMode, 7) | b(p.dac.io.colorHalve, 6)
+                  | b(p.dac.io.colorEnable[Source::COL], 5) | b(p.dac.io.colorEnable[Source::OBJ2], 4)
+                  | b(p.dac.io.colorEnable[Source::BG4], 3) | b(p.dac.io.colorEnable[Source::BG3], 2)
+                  | b(p.dac.io.colorEnable[Source::BG2], 1) | b(p.dac.io.colorEnable[Source::BG1], 0);
+  case 0x32: return 0x80 | (uint8_t)p.dac.io.colorBlue;
+  case 0x33: return b(p.io.extbg, 6) | b(p.io.pseudoHires, 3) | b(p.io.overscan, 2)
+                  | b(p.obj.io.interlace, 1) | b(p.io.interlace, 0);
+  case 0x40: return 0x40 | (uint8_t)p.dac.io.colorGreen;
+  case 0x41: return 0x20 | (uint8_t)p.dac.io.colorRed;
+  case 0x4d: return (uint8_t)(m7 ? p.mode7.hoffset >> 8 & 0x1f : p.bg1.io.hoffset >> 8 & 3);
+  case 0x4e: return (uint8_t)(m7 ? p.mode7.voffset >> 8 & 0x1f : p.bg1.io.voffset >> 8 & 3);
+  case 0x4f: return (uint8_t)(p.bg2.io.hoffset >> 8 & 3);
+  case 0x50: return (uint8_t)(p.bg2.io.voffset >> 8 & 3);
+  case 0x51: return (uint8_t)(p.bg3.io.hoffset >> 8 & 3);
+  case 0x52: return (uint8_t)(p.bg3.io.voffset >> 8 & 3);
+  case 0x53: return (uint8_t)(p.bg4.io.hoffset >> 8 & 3);
+  case 0x54: return (uint8_t)(p.bg4.io.voffset >> 8 & 3);
+  case 0x5b: return (uint8_t)(p.mode7.a >> 8);
+  case 0x5c: return (uint8_t)(p.mode7.b >> 8);
+  case 0x5d: return (uint8_t)(p.mode7.c >> 8);
+  case 0x5e: return (uint8_t)(p.mode7.d >> 8);
+  case 0x5f: return (uint8_t)(p.mode7.hcenter >> 8 & 0x1f);
+  case 0x60: return (uint8_t)(p.mode7.vcenter >> 8 & 0x1f);
+  case 0x61: return (uint8_t)p.io.cgramAddressLatch;
+  default:   return 0;
+  }
+}
+
 void kintsuki_get_ppu_state(kintsuki_t* h, kintsuki_ppu_state_t* out) {
   if(!h || !out) return;
   std::memset(out, 0, sizeof(*out));
@@ -790,6 +897,11 @@ void kintsuki_spc_set_state(kintsuki_t* h, const kintsuki_spc_state_t* in) {
 uint32_t kintsuki_dsp_registers(kintsuki_t* h, uint8_t* out, uint32_t len) {
   if(!h) return 0;
   return h->program->dspRegisters(out, len);
+}
+
+void kintsuki_dsp_write_register(kintsuki_t* h, uint8_t addr, uint8_t value) {
+  if(!h) return;
+  ares::SuperFamicom::dsp.write(addr & 0x7f, value);
 }
 
 // 1 when the PPU is in BGMODE 5/6 or pseudo-hires (each emitted column
