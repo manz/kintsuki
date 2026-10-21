@@ -59,6 +59,12 @@ using BusHook = void (*)(u32 addr, u8 value);
 extern BusHook memReadHook;
 extern BusHook memWriteHook;
 
+// kintsuki read override: return true with *out set to replace the byte the
+// CPU bus would read (data loads and opcode fetches). Checked after cheats,
+// before the mapped reader; memReadHook still sees the final value.
+using BusReadOverride = bool (*)(u32 addr, u8 openBus, u8* out);
+extern BusReadOverride memReadOverride;
+
 // CPU exec hook fires before each WDC65816 instruction with the current
 // 24-bit PC (cpu.r.pc.d).
 using ExecHook = void (*)(u32 pc);

@@ -27,7 +27,10 @@ alwaysinline auto Bus::read(n24 address, n8 data) -> n8 {
   if(!(address & 0x40e000)) address = 0x7e0000 | (address & 0x1fff);  //de-mirror WRAM
   if(auto result = platform->cheat(address)) return *result;
 
-  n8 value = reader[lookup[address]](target[address], data);
+  n8 value;
+  u8 overridden;
+  if(memReadOverride && memReadOverride(address, data, &overridden)) value = overridden;
+  else value = reader[lookup[address]](target[address], data);
   if(memReadHook) memReadHook(address, value);
   return value;
 }

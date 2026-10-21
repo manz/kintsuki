@@ -271,6 +271,10 @@ class CallbackKind:
     WRITE = CB_WRITE
 
 
+# Bookkeeping kind for read overrides (SPC callbacks use 0x100 | kind).
+_READ_OVERRIDE = 0x200
+
+
 @dataclass
 class _Registered:
     """Bookkeeping for a registered callback. We hold the CFUNCTYPE so the
@@ -427,6 +431,7 @@ class Emu:
         self._handle = h
         Emu._live.add(self)
         self._registered: list[_Registered] = []
+        self._override_error: BaseException | None = None
         on = Emu.default_load_srm_sidecar if load_srm_sidecar is None else load_srm_sidecar
         _native.lib.kintsuki_set_srm_sidecar(self._handle, 1 if on else 0)
         # Opt-in: a `<rom>.bps` / `<stem>.bps` is applied at load_rom only
@@ -1108,9 +1113,11 @@ class Emu:
     # -------------------------------------------------------------- Run/step
     def run_frames(self, n: int) -> None:
         _native.lib.kintsuki_run_frames(self._handle, n)
+        self._raise_override_error()
 
     def step(self) -> None:
         _native.lib.kintsuki_step(self._handle)
+        self._raise_override_error()
 
     @property
     def frame_count(self) -> int:
@@ -1672,6 +1679,52 @@ class Emu:
     def add_write_callback(self, lo: int, hi: int, fn: Callable[[int, int], None]) -> int:
         return self._add_callback(CB_WRITE, lo, hi, fn)
 
+    def add_read_override(
+        self, lo: int, hi: int, fn: Callable[[int, int], int | None]
+    ) -> int:
+        """Stand in for a memory-mapped device over the 24-bit bus range
+        [lo, hi]. `fn(addr, open_bus)` returns the byte the CPU reads
+        (data loads and opcode fetches alike) or None to let the bus answer.
+        WRAM mirrors arrive de-mirrored ($00:0000-$1FFF as $7E:xxxx).
+
+        An exception in `fn`, or a value outside 0-255, is raised from the
+        run call that triggered it; the read itself passes through."""
+
+        def trampoline(addr, open_bus, _ud):
+            if self._override_error is not None:
+                return -1
+            try:
+                value = fn(int(addr), int(open_bus))
+                if value is None:
+                    return -1
+                if not 0 <= value <= 0xFF:
+                    raise ValueError(
+                        f"read override for ${int(addr):06X} returned {value!r}, not a byte"
+                    )
+                return value
+            except BaseException as exc:  # surfaced by _raise_override_error
+                self._override_error = exc
+                return -1
+
+        c_fn = _native.READ_OVERRIDE(trampoline)
+        oid = _native.lib.kintsuki_add_read_override(self._handle, lo, hi, c_fn, None)
+        if oid == 0:
+            raise RuntimeError("add_read_override failed")
+        self._registered.append(_Registered(kind=_READ_OVERRIDE, cb_id=oid, trampoline=c_fn))
+        return oid
+
+    def remove_read_override(self, override_id: int) -> None:
+        _native.lib.kintsuki_remove_read_override(self._handle, override_id)
+        self._registered = [
+            r for r in self._registered
+            if not (r.kind == _READ_OVERRIDE and r.cb_id == override_id)
+        ]
+
+    def _raise_override_error(self) -> None:
+        exc, self._override_error = self._override_error, None
+        if exc is not None:
+            raise exc
+
     def remove_callback(self, kind: int, cb_id: int) -> None:
         _native.lib.kintsuki_remove_callback(self._handle, kind, cb_id)
         self._registered = [
@@ -1705,6 +1758,7 @@ class Emu:
     ) -> bool:
         """Run until PC == target_pc. Mid-frame bail. Returns True on hit."""
         rc = _native.lib.kintsuki_run_until(self._handle, target_pc, max_frames)
+        self._raise_override_error()
         return rc != 0
 
     def run_until_ex(
@@ -1721,6 +1775,7 @@ class Emu:
         rc = _native.lib.kintsuki_run_until_ex(
             self._handle, target_pc, max_frames, ctypes.byref(out)
         )
+        self._raise_override_error()
         return rc != 0, int(out.value)
 
     def rearm_cpu(self) -> None:
@@ -1839,7 +1894,9 @@ class Emu:
             # Unregister this Emu's callbacks before the trampolines are freed
             # below, so the C side can never call one that's gone.
             for r in self._registered:
-                if r.kind & 0x100:
+                if r.kind == _READ_OVERRIDE:
+                    _native.lib.kintsuki_remove_read_override(self._handle, r.cb_id)
+                elif r.kind & 0x100:
                     _native.lib.kintsuki_spc_remove_callback(self._handle, r.kind & 0xFF, r.cb_id)
                 else:
                     _native.lib.kintsuki_remove_callback(self._handle, r.kind, r.cb_id)

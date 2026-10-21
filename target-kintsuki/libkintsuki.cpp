@@ -1034,8 +1034,18 @@ void kintsuki_press(kintsuki_t* h, int port, int button, int pressed) {
 // Callbacks (function-pointer style for ctypes/swift interop)
 // =============================================================================
 typedef void (*kintsuki_cb_t)(uint32_t addr, uint8_t value, void* userdata);
+typedef int (*kintsuki_read_override_t)(uint32_t addr, uint8_t open_bus, void* userdata);
 
 namespace {
+
+struct ReadOverride {
+  uint32_t lo, hi;
+  kintsuki_read_override_t fn;
+  void* userdata;
+  bool active;
+};
+std::vector<ReadOverride> g_cOverride;
+uint8_t g_cOverridePages[65536] = {};
 
 struct CCallback {
   uint32_t lo, hi;
@@ -1098,6 +1108,8 @@ static void resetAllCallbacks() {
   g_cExec.clear();
   g_cRead.clear();
   g_cWrite.clear();
+  g_cOverride.clear();
+  std::memset(g_cOverridePages, 0, sizeof(g_cOverridePages));
   std::memset(g_cExecPages,  0, sizeof(g_cExecPages));
   std::memset(g_cReadPages,  0, sizeof(g_cReadPages));
   std::memset(g_cWritePages, 0, sizeof(g_cWritePages));
@@ -1229,6 +1241,20 @@ void cOnWrite(uint32_t addr, uint8_t value) {
   }
   if(g_cWritePages[(addr & 0xffffff) >> 8] == 0) return;
   cFire(g_cWrite, addr, value);
+}
+
+bool cOnReadOverride(uint32_t addr, uint8_t openBus, uint8_t* out) {
+  if(g_cOverridePages[(addr & 0xffffff) >> 8] == 0) return false;
+  // By index, on a copy: an override may register another one.
+  for(size_t i = 0; i < g_cOverride.size(); i++) {
+    ReadOverride o = g_cOverride[i];
+    if(!o.active || addr < o.lo || addr > o.hi) continue;
+    int v = o.fn(addr, openBus, o.userdata);
+    if(v < 0 || v > 0xff) continue;
+    *out = (uint8_t)v;
+    return true;
+  }
+  return false;
 }
 
 auto pickList(int kind) -> std::vector<CCallback>* {
@@ -1371,6 +1397,27 @@ void kintsuki_remove_callback(kintsuki_t* h, int kind, int id) {
     if(kind == CB_READ  && !g_project) ares::SuperFamicom::memReadHook = nullptr;
     if(kind == CB_WRITE)               ares::SuperFamicom::memWriteHook = nullptr;
   }
+}
+
+int kintsuki_add_read_override(kintsuki_t* h, uint32_t lo, uint32_t hi,
+                               kintsuki_read_override_t fn, void* userdata) {
+  (void)h;
+  if(!fn) return 0;
+  g_cOverride.push_back({lo, hi, fn, userdata, true});
+  markCPages(g_cOverridePages, lo, hi, +1);
+  ares::SuperFamicom::memReadOverride = &cOnReadOverride;
+  return (int)g_cOverride.size();
+}
+
+void kintsuki_remove_read_override(kintsuki_t* h, int id) {
+  (void)h;
+  if(id < 1 || (size_t)id > g_cOverride.size()) return;
+  auto& o = g_cOverride[id - 1];
+  if(!o.active) return;
+  markCPages(g_cOverridePages, o.lo, o.hi, -1);
+  o.active = false;
+  for(auto& other : g_cOverride) if(other.active) return;
+  ares::SuperFamicom::memReadOverride = nullptr;
 }
 
 // ---- SPC700 execution debug: breakpoints / step / run-until / disasm ----
