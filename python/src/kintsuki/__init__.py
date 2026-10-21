@@ -1642,6 +1642,9 @@ class Emu:
             payload += EXIT_OPCODE
         self.write_range(load_addr, payload)
 
+        # A frame can end mid-instruction; resuming it after moving PC would
+        # finish the old instruction against the stub address.
+        self.rearm_cpu()
         s = self.get_state()
         s.pc = load_addr & 0xFFFFFF
         s.a = a & 0xFFFF
@@ -1683,6 +1686,7 @@ class Emu:
         rtl_exit = 0x000000 | sentinel_lo
         rts_exit = (func_addr & 0xFF0000) | sentinel_lo
 
+        self.rearm_cpu()  # see run_asm: don't resume a half-run instruction
         s = self.get_state()
         s.pc = func_addr & 0xFFFFFF
         s.a = a & 0xFFFF
@@ -1696,7 +1700,7 @@ class Emu:
         # bytes; the bank byte we push above is then unused but doesn't
         # hurt anything.
         self.push_byte((rtl_exit >> 16) & 0xFF)
-        self.push_word(sentinel_lo)
+        self.push_word(sentinel_lo - 1)  # RTS/RTL resume at popped + 1
 
         # Try RTL exit first (long-form return); if that doesn't fire,
         # fall through to RTS exit in the function's bank.
