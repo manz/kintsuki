@@ -129,6 +129,16 @@ struct Program : ares::Platform {
   auto loadStateBlobEx(const uint8_t* data, u32 size,
                        u32 flags, u32 expectedSramSize) -> int;
 
+  // CPU thread clock minus where the CPU/PPU counters say it should be, in
+  // master cycles: 0 in a state saved by a sound session. States saved after
+  // an old kintsuki_rearm_cpu (which zeroed the CPU clock) carry a skew that
+  // puts HDMA on the wrong scanlines; loading realigns it.
+  // Skews within SkewTolerance are left alone: the counter positions assume
+  // 1364-cycle lines, and a short line 240 accounts for up to 4.
+  static constexpr s64 SkewTolerance = 4;
+  auto cpuClockSkew() const -> s64;
+  auto realignCpuClock() -> void;
+
   // Screenshot
   auto writePNG(const char* path) -> bool;
   auto writePPM(const char* path) -> bool;

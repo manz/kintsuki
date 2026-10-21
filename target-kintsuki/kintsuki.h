@@ -147,6 +147,10 @@ typedef struct {
 } kintsuki_live_counters_t;
 void        kintsuki_live_counters(kintsuki_t*, kintsuki_live_counters_t* out);
 
+// CPU thread clock minus where the CPU/PPU counters place it, in master
+// cycles: 0 once a state is loaded (load_state realigns a skewed one).
+int64_t     kintsuki_clock_skew(kintsuki_t*);
+
 // Mid-frame run-until. Yields the scheduler the moment the CPU is about
 // to execute target_pc — does NOT wait for vblank. Returns 1 on hit,
 // 0 if max_frames of emulated time elapsed without reaching the target.

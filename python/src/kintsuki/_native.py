@@ -133,6 +133,7 @@ class LiveCountersRaw(Structure):
 
 
 _bind("kintsuki_live_counters", None, [HANDLE, POINTER(LiveCountersRaw)])
+_bind("kintsuki_clock_skew", ctypes.c_int64, [HANDLE])
 _bind("kintsuki_run_until", c_int, [HANDLE, c_uint32, c_uint32])
 _bind("kintsuki_run_until_ex", c_int,
       [HANDLE, c_uint32, c_uint32, POINTER(c_uint64)])
