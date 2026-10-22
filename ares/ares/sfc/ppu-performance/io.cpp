@@ -23,6 +23,8 @@ extern KintsukiPpuDropHook kintsukiPpuDropHook;
 static inline auto kintsukiPpuDrop(uint8_t port) -> void {
   if(kintsukiPpuDropHook) kintsukiPpuDropHook(port);
 }
+typedef void (*KintsukiVramWriteHook)(uint16_t address);
+extern KintsukiVramWriteHook kintsukiVramWriteHook;
 typedef void (*KintsukiPpuLandHook)(uint8_t port);
 extern KintsukiPpuLandHook kintsukiPpuLandHook;
 static inline auto kintsukiPpuLand(uint8_t port) -> void {
@@ -39,6 +41,7 @@ alwaysinline auto PPU::writeVRAM(n1 byte, n8 data) -> void {
   if(!io.displayDisable && cpu.vcounter() < vdisp()) return kintsukiPpuDrop(0x18);
   if(!io.displayDisable) kintsukiPpuLand(0x18);
   auto address = addressVRAM();
+  if(kintsukiVramWriteHook) kintsukiVramWriteHook(address & vram.mask);
   vram[address].byte(byte) = data;
 }
 

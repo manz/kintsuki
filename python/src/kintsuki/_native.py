@@ -266,6 +266,12 @@ _bind("kintsuki_ppu_writes_stop",     None,     [HANDLE])
 _bind("kintsuki_ppu_writes_count",    c_uint32, [HANDLE])
 _bind("kintsuki_ppu_writes_snapshot", c_uint32, [HANDLE, POINTER(PpuWriteRaw), c_uint32])
 
+_bind("kintsuki_vram_map_start",    None,     [HANDLE])
+_bind("kintsuki_vram_map_stop",     None,     [HANDLE])
+_bind("kintsuki_vram_map_clear",    None,     [HANDLE])
+_bind("kintsuki_vram_map_snapshot", c_uint32,
+      [HANDLE, POINTER(c_uint16), POINTER(c_uint32), POINTER(c_uint32), c_uint32])
+
 # .adbg label table.
 _bind("kintsuki_load_adbg",     c_int,    [HANDLE, c_char_p])
 _bind("kintsuki_clear_adbg",    None,     [HANDLE])
@@ -345,6 +351,7 @@ class PpuStateRaw(Structure):
         ("dma", DmaChannelRaw * 8),
         ("mdmaen", c_uint8),
         ("hdmaen", c_uint8),
+        ("obsel", c_uint8),
     ]
 
 

@@ -110,6 +110,15 @@ typedef void (*KintsukiPpuDropHook)(uint8_t port);
 __attribute__((visibility("default")))
 KintsukiPpuDropHook kintsukiPpuDropHook = nullptr;
 
+// kintsuki: a VRAM word the PPU fetches to draw gets its layer's bit (see
+// ppu-performance/ppu.hpp); a VRAM write that lands rings the host with its
+// word address.
+__attribute__((visibility("default")))
+uint16_t* kintsukiVramReads = nullptr;
+typedef void (*KintsukiVramWriteHook)(uint16_t address);
+__attribute__((visibility("default")))
+KintsukiVramWriteHook kintsukiVramWriteHook = nullptr;
+
 // kintsuki: a VRAM / OAM data-port write that lands while the screen is on,
 // so in vblank: the later it lands, the less vblank the frame had to spare.
 typedef void (*KintsukiPpuLandHook)(uint8_t port);

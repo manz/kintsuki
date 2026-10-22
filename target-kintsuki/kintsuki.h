@@ -238,6 +238,7 @@ typedef struct {
   uint16_t hcounter, vcounter;
   kintsuki_dma_channel_t dma[8];
   uint8_t  mdmaen, hdmaen;  // reconstructed from cpu.channels[].dmaEnable/hdmaEnable
+  uint8_t  obsel;         // $2101 reconstructed
 } kintsuki_ppu_state_t;
 
 void kintsuki_get_ppu_state(kintsuki_t*, kintsuki_ppu_state_t* out);
@@ -771,6 +772,22 @@ uint32_t kintsuki_ppu_writes_count(kintsuki_t*);
 uint32_t kintsuki_ppu_writes_snapshot(kintsuki_t*,
                                       kintsuki_ppu_write_t* out,
                                       uint32_t cap);
+
+// VRAM map: while recording, every VRAM word the PPU fetches to draw gets
+// its layer's bit, and every write that lands is counted with the routine
+// that made it (top of the shadow callstack).
+#define KINTSUKI_VRAM_BG_MAP(n)   (1u << (n))         // BG1-4 tilemap, n = 0-3
+#define KINTSUKI_VRAM_BG_TILES(n) (0x10u << (n))      // BG1-4 tiles (mode 7: BG1 map + tiles)
+#define KINTSUKI_VRAM_OBJ_TILES   0x100u
+// Start clears the map and records from now on; stop keeps it to read.
+void     kintsuki_vram_map_start(kintsuki_t*);
+void     kintsuki_vram_map_stop(kintsuki_t*);
+void     kintsuki_vram_map_clear(kintsuki_t*);
+// Copies up to `cap` words of each array that isn't NULL: the read bits,
+// the writes and the last writer's routine. Returns the words copied, at
+// most VRAM's (32768, or 65536 with the VA15 mod); 0 before any start.
+uint32_t kintsuki_vram_map_snapshot(kintsuki_t*, uint16_t* reads, uint32_t* writes,
+                                    uint32_t* writers, uint32_t cap);
 
 // Per-scanline HDMA channel mask for the most recently completed
 // frame (double-buffered). `out[i]` = bitmask of channels that fired

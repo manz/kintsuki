@@ -10,6 +10,7 @@
 #include "project.hpp"
 #include "perfetto.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -36,6 +37,8 @@ namespace ares::SuperFamicom {
   extern KintsukiPpuLandHook kintsukiPpuLandHook;
   typedef void (*KintsukiVblankHook)(uint8_t);
   extern KintsukiVblankHook kintsukiVblankHook;
+  typedef void (*KintsukiVramWriteHook)(uint16_t);
+  extern KintsukiVramWriteHook kintsukiVramWriteHook;
   typedef void (*KintsukiSdd1Hook)(uint8_t, uint8_t, uint32_t, uint32_t,
                                    uint16_t, uint32_t, uint8_t);
   extern KintsukiSdd1Hook kintsukiSdd1Hook;
@@ -875,6 +878,7 @@ void kintsuki_get_ppu_state(kintsuki_t* h, kintsuki_ppu_state_t* out) {
   }
   out->mdmaen = mdmaen;
   out->hdmaen = hdmaen;
+  out->obsel = (uint8_t)(p.obj.io.baseSize << 5 | p.obj.io.nameselect << 3 | p.obj.io.tiledataAddress >> 13);
 }
 
 uint32_t kintsuki_save_state(kintsuki_t* h, void* buf, uint32_t cap) {
@@ -2007,14 +2011,18 @@ constexpr size_t kDmaLogCap = 64;
 DmaLogEntry g_dmaLog[kDmaLogCap] = {};
 size_t g_dmaLogSize = 0;
 
-void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
-               uint32_t src, uint8_t dst, uint16_t size) {
-  // Caller PC: top of the shadow callstack (the most recently entered
-  // routine), falling back to live cpu.r.pc.d if no JSR/JSL is on the
-  // stack yet (cold boot, IRQ context). 24-bit.
-  uint32_t callerPc = g_callstack.empty()
+// Caller PC: top of the shadow callstack (the most recently entered
+// routine), falling back to live cpu.r.pc.d if no JSR/JSL is on the
+// stack yet (cold boot, IRQ context). 24-bit.
+uint32_t currentRoutine() {
+  return g_callstack.empty()
     ? ((uint32_t)ares::SuperFamicom::cpu.r.pc.d & 0xFFFFFF)
     : (g_callstack.back().target_pc & 0xFFFFFF);
+}
+
+void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
+               uint32_t src, uint8_t dst, uint16_t size) {
+  uint32_t callerPc = currentRoutine();
   traceDma(channel, src, dst, size, callerPc);
   // Project-file auto-classification: tag the ROM source range by the
   // destination PPU register class (graphics/palette/...) — no-op when
@@ -2269,6 +2277,52 @@ uint32_t kintsuki_sdd1_decompress(kintsuki_t* h, uint32_t bus_addr,
   for(uint32_t i = 0; i < size; i++) out[i] = (uint8_t)d->read();
   if(out_compressed_size) *out_compressed_size = d->im.position() - (bus_addr & 0xFFFFFF);
   return size;
+}
+
+// ---- VRAM map --------------------------------------------------------------
+// Per VRAM word: the layers the PPU fetched it for (ares ORs the bits into
+// g_vramReads), how many writes landed in it and the routine of the last one.
+namespace {
+constexpr size_t kVramWords = 0x10000;  // 128K with the VA15 mod; 64K uses the low half
+std::vector<uint16_t> g_vramReads;
+std::vector<uint32_t> g_vramWrites;
+std::vector<uint32_t> g_vramWriter;
+
+void vramWriteHookFn(uint16_t address) {
+  g_vramWrites[address]++;
+  g_vramWriter[address] = currentRoutine();
+}
+}
+
+void kintsuki_vram_map_clear(kintsuki_t* h) {
+  if(!h) return;
+  g_vramReads.assign(kVramWords, 0);
+  g_vramWrites.assign(kVramWords, 0);
+  g_vramWriter.assign(kVramWords, 0);
+}
+
+void kintsuki_vram_map_start(kintsuki_t* h) {
+  if(!h) return;
+  kintsuki_vram_map_clear(h);
+  ares::SuperFamicom::kintsukiVramReads = g_vramReads.data();
+  ares::SuperFamicom::kintsukiVramWriteHook = &vramWriteHookFn;
+}
+
+void kintsuki_vram_map_stop(kintsuki_t* h) {
+  if(!h) return;
+  ares::SuperFamicom::kintsukiVramReads = nullptr;
+  ares::SuperFamicom::kintsukiVramWriteHook = nullptr;
+}
+
+uint32_t kintsuki_vram_map_snapshot(kintsuki_t* h, uint16_t* reads, uint32_t* writes,
+                                    uint32_t* writers, uint32_t cap) {
+  if(!h || g_vramReads.empty()) return 0;
+  uint32_t words = (uint32_t)ares::SuperFamicom::ppuPerformanceImpl.vram.mask + 1;
+  uint32_t n = words < cap ? words : cap;
+  if(reads) std::copy_n(g_vramReads.begin(), n, reads);
+  if(writes) std::copy_n(g_vramWrites.begin(), n, writes);
+  if(writers) std::copy_n(g_vramWriter.begin(), n, writers);
+  return n;
 }
 
 // ---- PPU register write log --------------------------------------------

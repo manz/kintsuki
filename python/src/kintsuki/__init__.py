@@ -20,6 +20,7 @@ from typing import Callable
 
 from . import _native
 from ._native import CB_EXEC, CB_READ, CB_WRITE, CpuState, PpuStateRaw, DmaChannelRaw
+from .vram_map import VramMap, VramRun
 
 __version__ = "0.1.0"
 
@@ -38,6 +39,8 @@ __all__ = [
     "PatchRejectedWarning",
     "SRAM_POLICIES",
     "LiveCounters",
+    "VramMap",
+    "VramRun",
 ]
 
 
@@ -146,6 +149,7 @@ class PpuState:
     dma: tuple  # 8x DmaChannelState
     mdmaen: int
     hdmaen: int
+    obsel: int
 
     @classmethod
     def _from_raw(cls, raw: PpuStateRaw) -> "PpuState":
@@ -179,6 +183,7 @@ class PpuState:
             cgwsel=raw.cgwsel, cgadsub=raw.cgadsub, setini=raw.setini,
             hcounter=raw.hcounter, vcounter=raw.vcounter,
             dma=dma, mdmaen=raw.mdmaen, hdmaen=raw.hdmaen,
+            obsel=raw.obsel,
         )
 
     # --- Convenience helpers ------------------------------------------------
@@ -822,6 +827,31 @@ class Emu:
                 "frame": int(e.frame),
             })
         return out
+
+    # ---------------------------------------------------------------- VRAM map
+    def vram_map_start(self) -> None:
+        """Clear the VRAM map and record from now on: every VRAM word the PPU
+        fetches to draw gets its layer's bit, every write that lands is counted
+        with the routine that made it. Read it with :meth:`vram_map`."""
+        _native.lib.kintsuki_vram_map_start(self._handle)
+
+    def vram_map_stop(self) -> None:
+        """Stop recording; the map stays readable."""
+        _native.lib.kintsuki_vram_map_stop(self._handle)
+
+    def vram_map_clear(self) -> None:
+        _native.lib.kintsuki_vram_map_clear(self._handle)
+
+    def vram_map(self) -> VramMap:
+        """The VRAM map recorded since :meth:`vram_map_start`, a word per VRAM
+        word (32768, or 65536 with the VA15 mod; none before any start)."""
+        cap = self.vram_size // 2
+        reads = (ctypes.c_uint16 * cap)()
+        writes = (ctypes.c_uint32 * cap)()
+        writers = (ctypes.c_uint32 * cap)()
+        n = _native.lib.kintsuki_vram_map_snapshot(self._handle, reads, writes, writers, cap)
+        return VramMap(array.array("H", reads[:n]), array.array("I", writes[:n]),
+                       array.array("I", writers[:n]))
 
     # ----------------------------------------------------------------- Project
     def project_open(self, dir: str | os.PathLike[str]) -> None:

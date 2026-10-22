@@ -1,5 +1,10 @@
 #define PPU PPUPerformance
 
+// kintsuki: the host's VRAM read map, layer bits OR-ed into each VRAM word the
+// PPU fetches to draw (bit n: BGn+1's tilemap, bit 4+n: its tiles, bit 8: OBJ
+// tiles); null when off.
+extern uint16_t* kintsukiVramReads;
+
 struct PPU : PPUBase::Implementation, PPUcounter {
   Node::Object node;
   Node::Setting::Natural vramSize;
@@ -28,6 +33,9 @@ struct PPU : PPUBase::Implementation, PPUcounter {
 
   auto height() const -> u32 { return Region::PAL() ? 288 : 242; }
   auto hires() const -> bool { return io.pseudoHires || io.bgMode == 5 || io.bgMode == 6; }
+  alwaysinline auto kintsukiRead(u32 address, u16 bit) -> void {
+    if(kintsukiVramReads) kintsukiVramReads[address & vram.mask] |= bit;
+  }
   auto interlace() const -> bool { return state.interlace; }
   auto overscan() const -> bool { return state.overscan; }
   auto vdisp() const -> u32 { return state.vdisp; }
