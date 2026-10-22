@@ -196,7 +196,13 @@ def test_timeline_nests_the_nmi_handler_call_inside_the_nmi(recorded):
 def test_timeline_has_a_dma_slice_per_transfer(recorded):
     dma = [e for e in _decode(recorded) if e.track == "DMA 0" and e.type == BEGIN]
     assert len(dma) == 5
-    assert all(e.name == "$2118" and e.args["bytes"] == 32 for e in dma)
+    assert all(e.name == "VRAM $1234" and e.args["bytes"] == 32 for e in dma)
+
+
+def test_timeline_dma_slice_says_where_it_writes(emu_rom, recorded):
+    begin = next(e for e in _decode(recorded) if e.track == "DMA 0" and e.type == BEGIN)
+    assert (begin.args["reg"], begin.args["vram"], begin.args["vmain"]) == (0x2118, 0x1234, 0x80)
+    assert begin.args["caller"] == _symbol(emu_rom, "nmi")
 
 
 def test_timeline_dma_slice_lasts_its_bytes(recorded):

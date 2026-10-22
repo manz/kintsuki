@@ -324,14 +324,32 @@ void traceCloseSlices() {
   for(; g_traceDepth; g_traceDepth--) g_trace.end(g_traceCpu, now);
 }
 
-void traceDma(uint8_t channel, uint32_t src, uint8_t dst, uint16_t size) {
+// A DMA slice is named for where it writes: "VRAM $4800" (VMADD, a word address),
+// "CGRAM $10" (CGADD), "OAM $000" (OAMADD), else its B-bus register.
+void traceDma(uint8_t channel, uint32_t src, uint8_t dst, uint16_t size, uint32_t caller) {
   if(!g_trace.active() || channel >= 8) return;
+  auto& ppu = ares::SuperFamicom::ppuPerformanceImpl;
   uint64_t master = profileMasterCycles();
   uint32_t bytes = size ? size : 0x10000;
-  char name[16];
-  std::snprintf(name, sizeof name, "$21%02X", dst);
-  g_trace.begin(g_traceDma[channel], traceNs(master), name,
-                {{"src", src}, {"bytes", bytes}, {"line", traceLine()}});
+  std::vector<kintsuki::TraceArg> args{{"src", src}, {"bytes", bytes}, {"line", traceLine()}, {"caller", caller}};
+  char name[24];
+  if(dst == 0x18 || dst == 0x19 || dst == 0x39 || dst == 0x3A) {
+    uint32_t vmain = ppu.vram.mode << 7 | ppu.vram.mapping << 2
+                   | (ppu.vram.increment == 1 ? 0 : ppu.vram.increment == 32 ? 1 : 2);
+    std::snprintf(name, sizeof name, "VRAM $%04X", (unsigned)ppu.vram.address);
+    args.push_back({"vram", (uint64_t)ppu.vram.address});
+    args.push_back({"vmain", vmain});
+  } else if(dst == 0x22 || dst == 0x3B) {
+    std::snprintf(name, sizeof name, "CGRAM $%02X", (unsigned)ppu.io.cgramAddress);
+    args.push_back({"cg", (uint64_t)ppu.io.cgramAddress});
+  } else if(dst == 0x04 || dst == 0x38) {
+    std::snprintf(name, sizeof name, "OAM $%03X", (unsigned)ppu.io.oamAddress);
+    args.push_back({"oam", (uint64_t)ppu.io.oamAddress});
+  } else {
+    std::snprintf(name, sizeof name, "$21%02X", dst);
+  }
+  args.push_back({"reg", (uint64_t)(0x2100 | dst)});
+  g_trace.begin(g_traceDma[channel], traceNs(master), name, args);
   g_trace.end(g_traceDma[channel], traceNs(master + 8 + 8ull * bytes));  // 8 master cycles a byte
 }
 
@@ -1997,7 +2015,7 @@ void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
   uint32_t callerPc = g_callstack.empty()
     ? ((uint32_t)ares::SuperFamicom::cpu.r.pc.d & 0xFFFFFF)
     : (g_callstack.back().target_pc & 0xFFFFFF);
-  traceDma(channel, src, dst, size);
+  traceDma(channel, src, dst, size, callerPc);
   // Project-file auto-classification: tag the ROM source range by the
   // destination PPU register class (graphics/palette/...) — no-op when
   // no project is open.

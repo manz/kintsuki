@@ -1,9 +1,9 @@
 """
 Timeline exercise ROM: the main loop calls `work` forever; each NMI calls `nmi_sub`, fires a 32-byte DMA (WRAM
-$7E:9000 -> VMDATA) and returns with RTI; HDMA channel 1 writes COLDATA on lines 0-15. A timeline sees `work`
-slices, an NMI slice per frame wrapping `nmi_sub`, a DMA slice and a 16-line HDMA slice per frame; the callstack and
-profiler see the NMI as a frame. Setting `OVERRUN` turns the screen on and writes VMDATA from the main loop, a write
-the PPU drops on visible lines.
+$7E:9000 -> VMDATA at word $1234) and returns with RTI; HDMA channel 1 writes COLDATA on lines 0-15. A timeline sees
+`work` slices, an NMI slice per frame wrapping `nmi_sub`, a DMA slice and a 16-line HDMA slice per frame; the
+callstack and profiler see the NMI as a frame. Setting `OVERRUN` turns the screen on and writes VMDATA from the main
+loop, a write the PPU drops on visible lines.
 """
 
 .import "@std/snes/ppu"
@@ -21,6 +21,7 @@ hdma1 := (DMA_BASE + sizeof(DMAChannel) as DMAChannel)
 HDMA_LINES = 16
 SOURCE = 0x7E9000
 BYTES = 0x20
+VRAM_WORD = 0x1234
 OVERRUN = 0x7E0100  ; nonzero: screen on, VRAM written mid-frame
 
 .alloc code at 0x008000 {
@@ -85,7 +86,7 @@ nmi:
     sta.l dma0.A1TL
     lda.w #BYTES
     sta.l dma0.DASL
-    lda.w #0x0000
+    lda.w #VRAM_WORD
     sta.l ppu.VMADDL
     sep #0x20
     lda.b #SOURCE >> 16
