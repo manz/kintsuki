@@ -7,6 +7,7 @@ reader (only the fields kintsuki writes), so the test needs no perfetto.
 
 from __future__ import annotations
 
+import struct
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -14,7 +15,8 @@ import pytest
 
 from kintsuki import Emu
 
-BEGIN, END, INSTANT = 1, 2, 3
+BEGIN, END, INSTANT, COUNTER = 1, 2, 3, 4
+VBLANK_LINES = 262 - 225  # NTSC, no overscan
 
 
 def _varint(buf: bytes, i: int) -> tuple[int, int]:
@@ -39,6 +41,9 @@ def _fields(buf: bytes) -> list[tuple[int, Field]]:
         if key & 7 == 0:
             value, i = _varint(buf, i)
             out.append((key >> 3, value))
+        elif key & 7 == 1:  # fixed64: a counter's double
+            out.append((key >> 3, buf[i:i + 8]))
+            i += 8
         else:
             size, i = _varint(buf, i)
             out.append((key >> 3, buf[i:i + size]))
@@ -55,6 +60,7 @@ class Event:
     args: dict[str, int] = field(default_factory=dict)
     category: str = ""
     jpeg: bytes = b""
+    value: float | None = None
 
 
 def _bytes(value: Field) -> bytes:
@@ -97,7 +103,8 @@ def _decode(path: Path) -> list[Event]:
         name = names.get(_int(d.get(10, 0)), "")
         category = _bytes(d[22]).decode() if 22 in d else ""
         jpeg = _bytes(dict(_fields(_bytes(d[50])))[1]) if 50 in d else b""
-        events.append(Event(_int(d[9]), tracks[_int(d[11])], ts, name, args, category, jpeg))
+        value = struct.unpack("<d", _bytes(d[44]))[0] if 44 in d else None
+        events.append(Event(_int(d[9]), tracks[_int(d[11])], ts, name, args, category, jpeg, value))
     return events
 
 
@@ -145,7 +152,7 @@ def test_timeline_start_rejects_an_unwritable_path(emu_rom, tmp_path):
 
 def test_timeline_declares_its_tracks(recorded):
     tracks = {e.track for e in _decode(recorded)}
-    assert {"65816", "Frames", "DMA 0"} <= tracks
+    assert {"65816", "Frames", "DMA 0", "Vblank margin"} <= tracks
 
 
 def test_timeline_slices_balance_on_every_track(recorded):
@@ -221,6 +228,26 @@ def test_timeline_marks_each_frame_a_vram_write_is_dropped(emu_rom, tmp_path):
     overruns = [e for e in _decode(path) if e.track == "Overruns"]
     assert [e.name for e in overruns] == ["VRAM overrun"] * 3
     assert all(0 <= e.args["line"] < 225 for e in overruns)
+
+
+def _margins(path: Path) -> list[float]:
+    return [e.value for e in _decode(path) if e.track == "Vblank margin" and e.type == COUNTER]
+
+
+def test_timeline_vblank_margin_is_the_whole_vblank_under_forced_blank(recorded):
+    margins = _margins(recorded)
+    assert len(margins) >= 4  # a sample per vblank the trace saw begin
+    assert margins == [VBLANK_LINES] * len(margins)
+
+
+def test_timeline_vblank_margin_counts_the_lines_after_the_last_landed_write(emu_rom, tmp_path):
+    path = tmp_path / "t.pftrace"
+    emu_rom.write(0x7E0100, 1)  # OVERRUN: screen on, `work` writes VMDATA all vblank long
+    with emu_rom.timeline(path):
+        emu_rom.run_frames(4)
+    margins = _margins(path)
+    assert len(margins) >= 3
+    assert all(0 <= m < 8 for m in margins)  # a `work` pass, its last write's distance to line 0, is ~6 lines
 
 
 def test_timeline_mark_lands_on_the_marks_track(emu_rom, tmp_path):

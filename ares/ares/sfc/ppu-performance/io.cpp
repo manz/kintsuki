@@ -16,11 +16,17 @@ alwaysinline auto PPU::addressVRAM() const -> n16 {
   unreachable;
 }
 
-// kintsuki: ring the host when a data-port write is dropped mid-display.
+// kintsuki: ring the host when a data-port write is dropped mid-display,
+// and when one lands in vblank with the screen on (the vblank margin).
 typedef void (*KintsukiPpuDropHook)(uint8_t port);
 extern KintsukiPpuDropHook kintsukiPpuDropHook;
 static inline auto kintsukiPpuDrop(uint8_t port) -> void {
   if(kintsukiPpuDropHook) kintsukiPpuDropHook(port);
+}
+typedef void (*KintsukiPpuLandHook)(uint8_t port);
+extern KintsukiPpuLandHook kintsukiPpuLandHook;
+static inline auto kintsukiPpuLand(uint8_t port) -> void {
+  if(kintsukiPpuLandHook) kintsukiPpuLandHook(port);
 }
 
 alwaysinline auto PPU::readVRAM() -> n16 {
@@ -31,6 +37,7 @@ alwaysinline auto PPU::readVRAM() -> n16 {
 
 alwaysinline auto PPU::writeVRAM(n1 byte, n8 data) -> void {
   if(!io.displayDisable && cpu.vcounter() < vdisp()) return kintsukiPpuDrop(0x18);
+  if(!io.displayDisable) kintsukiPpuLand(0x18);
   auto address = addressVRAM();
   vram[address].byte(byte) = data;
 }
@@ -42,6 +49,7 @@ alwaysinline auto PPU::readOAM(n10 address) -> n8 {
 
 alwaysinline auto PPU::writeOAM(n10 address, n8 data) -> void {
   if(!io.displayDisable && cpu.vcounter() < vdisp()) address = 0x0218, kintsukiPpuDrop(0x04);
+  else if(!io.displayDisable) kintsukiPpuLand(0x04);
   return obj.oam.write(address, data);
 }
 

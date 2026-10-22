@@ -110,6 +110,18 @@ typedef void (*KintsukiPpuDropHook)(uint8_t port);
 __attribute__((visibility("default")))
 KintsukiPpuDropHook kintsukiPpuDropHook = nullptr;
 
+// kintsuki: a VRAM / OAM data-port write that lands while the screen is on,
+// so in vblank: the later it lands, the less vblank the frame had to spare.
+typedef void (*KintsukiPpuLandHook)(uint8_t port);
+__attribute__((visibility("default")))
+KintsukiPpuLandHook kintsukiPpuLandHook = nullptr;
+
+// kintsuki: the PPU enters (begin = 1, line vdisp) or leaves (begin = 0,
+// line 0) vblank.
+typedef void (*KintsukiVblankHook)(uint8_t begin);
+__attribute__((visibility("default")))
+KintsukiVblankHook kintsukiVblankHook = nullptr;
+
 auto System::load(Node::System& root, string name) -> bool {
   if(node) unload();
 

@@ -27,15 +27,20 @@ public:
 
   // Declares a track (lane) under `parent` (0: top level); returns its uuid.
   uint64_t track(const std::string& name, uint64_t parent = 0);
+  // Declares a counter track: a value over time, drawn as a graph.
+  uint64_t counterTrack(const std::string& name, uint64_t parent = 0);
   void begin(uint64_t track, uint64_t ts_ns, const std::string& name,
              const std::vector<TraceArg>& args = {});
   void end(uint64_t track, uint64_t ts_ns);
   void instant(uint64_t track, uint64_t ts_ns, const std::string& name,
                const std::vector<TraceArg>& args = {});
+  // A counter track's value from `ts_ns` on.
+  void counter(uint64_t track, uint64_t ts_ns, double value);
   // An instant the UI's Screenshots track shows (category android_screenshot).
   void screenshot(uint64_t track, uint64_t ts_ns, const std::vector<uint8_t>& jpeg);
 
 private:
+  uint64_t declare(const std::string& name, uint64_t parent, bool counter);
   // `extra`: TrackEvent fields already encoded, appended as is.
   void event(int type, uint64_t track, uint64_t ts_ns, const std::string* name,
              const std::vector<TraceArg>& args, const std::string& extra = {});

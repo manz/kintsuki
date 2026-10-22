@@ -1,5 +1,7 @@
 #include "perfetto.hpp"
 
+#include <cstring>
+
 // Field numbers from perfetto's protos (trace_packet.proto, track_event.proto,
 // track_descriptor.proto, interned_data.proto, debug_annotation.proto).
 namespace {
@@ -14,6 +16,7 @@ enum : uint32_t {
   kTrackUuid = 1,                // TrackDescriptor
   kTrackName = 2,
   kTrackParent = 5,
+  kTrackCounter = 8,
   kEventAnnotations = 4,         // TrackEvent
   kEventCategories = 22,
   kEventScreenshot = 50,
@@ -21,13 +24,14 @@ enum : uint32_t {
   kEventType = 9,
   kEventNameIid = 10,
   kEventTrack = 11,
+  kEventDoubleCounterValue = 44,
   kInternEventNames = 2,         // InternedData
   kInternIid = 1,                // EventName
   kInternName = 2,
   kAnnotationUint = 3,           // DebugAnnotation
   kAnnotationName = 10,
 };
-enum : uint64_t { kSliceBegin = 1, kSliceEnd = 2, kInstant = 3 };
+enum : uint64_t { kSliceBegin = 1, kSliceEnd = 2, kInstant = 3, kCounter = 4 };
 enum : uint64_t { kStateCleared = 1, kNeedsState = 2 };
 constexpr uint32_t kSequence = 1;
 constexpr size_t kFlushAt = 1u << 20;
@@ -45,6 +49,13 @@ void tag(std::string& out, uint32_t field, uint32_t wire) { varint(out, (uint64_
 void uintField(std::string& out, uint32_t field, uint64_t v) {
   tag(out, field, 0);
   varint(out, v);
+}
+
+void doubleField(std::string& out, uint32_t field, double v) {
+  tag(out, field, 1);
+  uint64_t bits;
+  std::memcpy(&bits, &v, sizeof bits);
+  for(int i = 0; i < 8; i++) out.push_back(char(bits >> (8 * i)));
 }
 
 void bytesField(std::string& out, uint32_t field, const std::string& v) {
@@ -78,11 +89,20 @@ void PerfettoTrace::close() {
 }
 
 uint64_t PerfettoTrace::track(const std::string& name, uint64_t parent) {
+  return declare(name, parent, false);
+}
+
+uint64_t PerfettoTrace::counterTrack(const std::string& name, uint64_t parent) {
+  return declare(name, parent, true);
+}
+
+uint64_t PerfettoTrace::declare(const std::string& name, uint64_t parent, bool counter) {
   uint64_t uuid = nextUuid_++;
   std::string desc;
   uintField(desc, kTrackUuid, uuid);
   bytesField(desc, kTrackName, name);
   if(parent) uintField(desc, kTrackParent, parent);
+  if(counter) bytesField(desc, kTrackCounter, {});
   std::string body;
   bytesField(body, kTrackDescriptor, desc);
   packet(body);
@@ -101,6 +121,12 @@ void PerfettoTrace::end(uint64_t track, uint64_t ts_ns) {
 void PerfettoTrace::instant(uint64_t track, uint64_t ts_ns, const std::string& name,
                             const std::vector<TraceArg>& args) {
   event(kInstant, track, ts_ns, &name, args);
+}
+
+void PerfettoTrace::counter(uint64_t track, uint64_t ts_ns, double value) {
+  std::string extra;
+  doubleField(extra, kEventDoubleCounterValue, value);
+  event(kCounter, track, ts_ns, nullptr, {}, extra);
 }
 
 void PerfettoTrace::screenshot(uint64_t track, uint64_t ts_ns, const std::vector<uint8_t>& jpeg) {

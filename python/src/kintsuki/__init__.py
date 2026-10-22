@@ -607,8 +607,11 @@ class Emu:
         project or .adbg), a slice per DMA channel run and per run of
         consecutive HDMA lines, a "frame" instant per rendered frame, an
         "Overruns" instant (``line``, ``pc``) the first time in a frame the PPU
-        drops a VRAM/OAM/CGRAM write because the screen is on and drawing.
-        Timestamps are the master clock in nanoseconds.
+        drops a VRAM/OAM/CGRAM write because the screen is on and drawing,
+        and a "Vblank margin" counter at each vblank's end: the lines it had
+        left after its last screen-on VRAM/OAM write (the whole vblank when
+        none landed or all ran under forced blank), how close the frame came
+        to an overrun. Timestamps are the master clock in nanoseconds.
         ``screenshot_every=N`` adds a JPEG of every Nth frame (~25 KB each),
         shown on the UI's Screenshots track."""
         if not _native.lib.kintsuki_timeline_start(self._handle, os.fsencode(path), screenshot_every):

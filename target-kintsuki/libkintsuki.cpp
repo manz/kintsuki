@@ -32,6 +32,10 @@ namespace ares::SuperFamicom {
   extern KintsukiHdmaHook kintsukiHdmaHook;
   typedef void (*KintsukiPpuDropHook)(uint8_t);
   extern KintsukiPpuDropHook kintsukiPpuDropHook;
+  typedef void (*KintsukiPpuLandHook)(uint8_t);
+  extern KintsukiPpuLandHook kintsukiPpuLandHook;
+  typedef void (*KintsukiVblankHook)(uint8_t);
+  extern KintsukiVblankHook kintsukiVblankHook;
   typedef void (*KintsukiSdd1Hook)(uint8_t, uint8_t, uint32_t, uint32_t,
                                    uint16_t, uint32_t, uint8_t);
   extern KintsukiSdd1Hook kintsukiSdd1Hook;
@@ -251,6 +255,9 @@ uint64_t g_traceCpu = 0;
 uint64_t g_traceFrames = 0;
 uint64_t g_traceOverruns = 0;
 uint8_t g_traceDropped = 0;  // ports already marked this frame (bit 0 VRAM, 1 OAM, 2 CGRAM)
+uint64_t g_traceVblank = 0;  // "Vblank margin" counter track
+bool g_traceInVblank = false;  // the trace saw the current vblank begin
+double g_traceMargin = 0;  // lines the current vblank has left after its last screen-on VRAM/OAM write
 uint64_t g_traceMarks = 0;
 uint64_t g_traceDma[8] = {};
 uint64_t g_traceHdma[8] = {};
@@ -359,6 +366,30 @@ void tracePpuDrop(uint8_t port) {
   const char* name = bit == 1 ? "VRAM overrun" : bit == 2 ? "OAM overrun" : "CGRAM overrun";
   g_trace.instant(g_traceOverruns, traceNow(), name,
                   {{"line", ares::SuperFamicom::cpu.vcounter()}, {"pc", ares::SuperFamicom::cpu.r.pc.d}});
+}
+
+// A VRAM/OAM write landed with the screen on, so in vblank: the lines left after it, from
+// the beam the CPU sees (the PPU thread's own clock runs ahead of it).
+void tracePpuLand(uint8_t) {
+  if(!g_trace.active()) return;
+  using namespace ares::SuperFamicom;
+  uint32_t lines = Region::NTSC() ? 262 : 312;
+  g_traceMargin = double((lines - cpu.vcounter()) * kLineMaster - cpu.hcounter()) / kLineMaster;
+}
+
+// At vblank's end, the lines it had left after its last screen-on VRAM/OAM write (all of
+// them when none landed): how close the frame came to dropping writes.
+void traceVblank(uint8_t begin) {
+  if(!g_trace.active()) return;
+  using namespace ares::SuperFamicom;
+  if(begin) {
+    g_traceInVblank = true;
+    g_traceMargin = (Region::NTSC() ? 262 : 312) - ppu.vdisp();
+    return;
+  }
+  if(!g_traceInVblank) return;
+  g_trace.counter(g_traceVblank, traceNow(), g_traceMargin);
+  g_traceInVblank = false;
 }
 
 void traceFrame() {
@@ -1770,6 +1801,8 @@ int kintsuki_timeline_start(kintsuki_t* h, const char* path, uint32_t screenshot
   g_traceCpu = g_trace.track("65816");
   g_traceFrames = g_trace.track("Frames");
   g_traceOverruns = g_trace.track("Overruns");
+  g_traceVblank = g_trace.counterTrack("Vblank margin");
+  g_traceInVblank = false;
   g_traceMarks = g_trace.track("Marks");
   uint64_t dma = g_trace.track("DMA");
   for(int i = 0; i < 8; i++) g_traceDma[i] = g_trace.track("DMA " + std::to_string(i), dma);
@@ -2045,6 +2078,8 @@ struct HdmaHookInstaller {
   HdmaHookInstaller() {
     ares::SuperFamicom::kintsukiHdmaHook = &hdmaHookFn;
     ares::SuperFamicom::kintsukiPpuDropHook = &tracePpuDrop;
+    ares::SuperFamicom::kintsukiPpuLandHook = &tracePpuLand;
+    ares::SuperFamicom::kintsukiVblankHook = &traceVblank;
   }
 } g_hdmaHookInstaller;
 }

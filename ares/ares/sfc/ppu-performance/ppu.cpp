@@ -55,7 +55,13 @@ auto PPU::step(u32 clocks) -> void {
   Thread::synchronize(cpu);
 }
 
+// kintsuki: vblank edges for the host's vblank margin.
+typedef void (*KintsukiVblankHook)(uint8_t begin);
+extern KintsukiVblankHook kintsukiVblankHook;
+
 auto PPU::main() -> void {
+  if(kintsukiVblankHook && (vcounter() == 0 || vcounter() == vdisp())) kintsukiVblankHook(vcounter() != 0);
+
   if(vcounter() == 0) {
     state.interlace  = io.interlace;
     state.overscan   = io.overscan;
