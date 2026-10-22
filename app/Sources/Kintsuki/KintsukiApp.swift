@@ -55,6 +55,10 @@ struct KintsukiApp: App {
             VRAMViewerView(emulator: emulator)
         }
 
+        Window("VRAM Map", id: "vrammap") {
+            VRAMMapView(emulator: emulator)
+        }
+
         Window("Memory Viewer", id: "memory") {
             MemoryViewerView(emulator: emulator)
         }
@@ -139,6 +143,8 @@ struct KintsukiApp: App {
                     .keyboardShortcut("t", modifiers: [.command, .shift])
                 Button("VRAM Viewer") { toggleToolWindow("vram") }
                     .keyboardShortcut("v", modifiers: [.command, .shift])
+                Button("VRAM Map") { toggleToolWindow("vrammap") }
+                    .keyboardShortcut("k", modifiers: [.command, .shift])
                 Button("Memory Viewer") { toggleToolWindow("memory") }
                     .keyboardShortcut("m", modifiers: [.command, .shift])
                 Button("HDMA Inspector") { toggleToolWindow("hdma") }
