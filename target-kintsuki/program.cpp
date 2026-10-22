@@ -346,10 +346,19 @@ auto Program::loadRom(const char* path) -> bool {
     romData.resize(info.programSize, 0);
   }
   // ROM data lives in this->romData for the program lifetime — no keepalive.
+  // SPC7110 loads its program and data ROMs as two pak files (ares
+  // loadSPC7110 → prom / drom), split at the 1 MB program ROM.
+  size_t programBytes = info.dataSize ? info.programSize : romData.size();
   auto romFile = vfs::memory::open(
-    std::span<const uint8_t>(romData.data(), romData.size()));
+    std::span<const uint8_t>(romData.data(), programBytes));
   romFile->setName("program.rom");
   cartPak->append(romFile);
+  if(info.dataSize) {
+    auto dataFile = vfs::memory::open(
+      std::span<const uint8_t>(romData.data() + programBytes, info.dataSize));
+    dataFile->setName("data.rom");
+    cartPak->append(dataFile);
+  }
 
   return true;
 }

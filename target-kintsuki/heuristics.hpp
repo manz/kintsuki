@@ -24,6 +24,9 @@ struct RomInfo {
   bool exHiRom;          // map mode $x5: extended HiROM (>4MB, $40-$7D upper half)
   bool fastRom;          // 3.58 MHz vs 2.68 MHz
   bool sdd1;             // cart type $4x: S-DD1 decompression MCU (Star Ocean, SFA2)
+  bool spc7110;          // cart type $F5/$F9: SPC7110 (1 MB program ROM + data ROM behind the MCU)
+  bool spc7110Rtc;       // cart type $F9: SPC7110 + Epson RTC-4513
+  uint32_t dataSize;     // SPC7110 data ROM bytes (image past the 1 MB program ROM)
   bool hasSaveRam;
   uint32_t saveRamSize;  // bytes
 };
