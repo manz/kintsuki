@@ -58,8 +58,9 @@ def test_spc_program_sets_dsp_register():
         emu.spc_run_samples(64)           # plenty for ~5 instructions
         assert emu.dsp_global().main_vol_l == 0x7F
         # PC is parked on the spin (BRA at $0408); a run can stop mid-
-        # instruction, so accept the opcode or its operand byte.
-        assert emu.spc_state().pc in (0x0408, 0x0409)
+        # instruction, after the opcode or operand fetch and before the
+        # branch rewinds, so accept $0408-$040A.
+        assert emu.spc_state().pc in (0x0408, 0x0409, 0x040A)
 
 
 def _install_program(emu):

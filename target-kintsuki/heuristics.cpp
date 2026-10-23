@@ -98,6 +98,11 @@ bool detectRom(std::span<const uint8_t> rom, RomInfo& info) {
   // Cart type high nibble names the coprocessor; $4x = S-DD1. Its banks
   // C0-FF go through the MCU, so a plain LoROM board leaves them unmapped.
   info.sdd1 = (rom[off + 0x16] & 0xf0) == 0x40;
+  // $F5 / $F9 = SPC7110 (Far East of Eden Zero, Momotarou Dentetsu Happy,
+  // Super Power League 4); $F9 adds the Epson RTC.
+  info.spc7110 = rom[off + 0x16] == 0xf5 || rom[off + 0x16] == 0xf9;
+  info.spc7110Rtc = rom[off + 0x16] == 0xf9;
+  info.dataSize = 0;
 
   // SRAM size byte at $D8: bytes = 1024 << val (Nintendo SHVC convention).
   // val=3 → 8 KB (typical), val=5 → 32 KB. Cap to 256 KB.
@@ -117,11 +122,18 @@ bool detectRom(std::span<const uint8_t> rom, RomInfo& info) {
   uint32_t pow2 = 0x8000;
   while(pow2 < actual) pow2 <<= 1;
   info.programSize = pow2;
+  if(info.spc7110 && actual > 0x100000) {
+    // The MCU sees the image as two chips: the first 1 MB is the program
+    // ROM, everything past it the data ROM.
+    info.programSize = 0x100000;
+    info.dataSize = actual - 0x100000;
+  }
 
   // Pick the simplest matching SHVC board. boards.bml entries with multiple
   // revisions list them as "1A0N-(01,02,...)" — ares' loadBoard accepts the
   // bare name without revision, falling back to the first listed.
-  if(info.sdd1)                     info.board = info.hasSaveRam ? "SHVC-LN3B-01" : "SHVC-1N0N-01";
+  if(info.spc7110)                  info.board = info.spc7110Rtc ? "SHVC-LDH3C-01" : "SPC7110-RAM";
+  else if(info.sdd1)                info.board = info.hasSaveRam ? "SHVC-LN3B-01" : "SHVC-1N0N-01";
   else if(info.exHiRom)             info.board = "SHVC-1J3M-EXHI";
   else if(info.hiRom && info.hasSaveRam) info.board = "SHVC-1J3M-01";
   else if(info.hiRom)               info.board = "SHVC-1J0N-01";
@@ -147,6 +159,10 @@ std::string buildManifest(const RomInfo& info) {
   char buf[64];
   std::snprintf(buf, sizeof(buf), "    memory type=ROM content=Program size=0x%x\n", info.programSize);
   out += buf;
+  if(info.dataSize) {
+    std::snprintf(buf, sizeof(buf), "    memory type=ROM content=Data size=0x%x\n", info.dataSize);
+    out += buf;
+  }
 
   // SRAM block (if any).
   if(info.hasSaveRam) {
