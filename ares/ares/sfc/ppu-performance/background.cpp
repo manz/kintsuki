@@ -94,6 +94,8 @@ auto PPU::Background::render() -> void {
     n16 address;
     address = (tileNumber << colorShift) + (voffset & 7 ^ mirrorY);
 
+    for(u32 plane = 0; plane < 1u << io.mode; plane++) self.kintsukiRead(address + plane * 8, 0x10 << id);
+
     n64 data;
     data |= (n64)self.vram[address +  0] <<  0;
     data |= (n64)self.vram[address +  8] << 16;
@@ -157,6 +159,7 @@ auto PPU::Background::getTile(u32 hoffset, u32 voffset) -> n16 {
   u32  offset = (tileY & 0x1f) << 5 | (tileX & 0x1f);
   if(tileX & 0x20) offset += screenX;
   if(tileY & 0x20) offset += screenY;
+  self.kintsukiRead(io.screenAddress + offset, 1 << id);
   return self.vram[io.screenAddress + offset];
 }
 

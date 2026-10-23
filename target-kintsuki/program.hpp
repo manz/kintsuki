@@ -141,6 +141,8 @@ struct Program : ares::Platform {
 
   // Screenshot
   auto writePNG(const char* path) -> bool;
+  // The frame as JPEG bytes (empty before the first frame).
+  auto encodeJPEG(int quality) -> std::vector<uint8_t>;
   auto writePPM(const char* path) -> bool;
   auto writeScreenshot(const char* path) -> bool;
   // Width of the corrected (hires-aware) screenshot output: full native
@@ -148,6 +150,8 @@ struct Program : ares::Platform {
   // pixel) in normal mode where ares duplicates columns to keep the
   // renderer happy.
   auto frameOutputWidth() const -> u32;
+  // The frame as packed RGB at frameOutputWidth() x fbHeight.
+  auto frameRGB() const -> std::vector<uint8_t>;
 
   // ---- Audio output -----------------------------------------------------
   // ares pushes resampled stereo samples (at audioSampleRate) through the
@@ -178,6 +182,8 @@ struct Program : ares::Platform {
   u32 fbWidth = 0;
   u32 fbHeight = 0;
   u64 framesRendered = 0;
+  // Called after each rendered frame (libkintsuki samples its master clock).
+  void (*frameHook)() = nullptr;
 
   // Per-port input bitmask. 12 bits used.
   uint16_t inputState[2] = {0, 0};

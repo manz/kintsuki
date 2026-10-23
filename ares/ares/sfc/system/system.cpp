@@ -103,6 +103,34 @@ typedef void (*KintsukiHdmaHook)(uint8_t channel,
 __attribute__((visibility("default")))
 KintsukiHdmaHook kintsukiHdmaHook = nullptr;
 
+// kintsuki: a VRAM / OAM / CGRAM data-port write the PPU drops (or
+// redirects) because the screen is on and the beam is in the visible
+// area. `port` is the $21xx low byte (0x18 VRAM, 0x04 OAM, 0x22 CGRAM).
+typedef void (*KintsukiPpuDropHook)(uint8_t port);
+__attribute__((visibility("default")))
+KintsukiPpuDropHook kintsukiPpuDropHook = nullptr;
+
+// kintsuki: a VRAM word the PPU fetches to draw gets its layer's bit (see
+// ppu-performance/ppu.hpp); a VRAM write that lands rings the host with its
+// word address.
+__attribute__((visibility("default")))
+uint16_t* kintsukiVramReads = nullptr;
+typedef void (*KintsukiVramWriteHook)(uint16_t address);
+__attribute__((visibility("default")))
+KintsukiVramWriteHook kintsukiVramWriteHook = nullptr;
+
+// kintsuki: a VRAM / OAM data-port write that lands while the screen is on,
+// so in vblank: the later it lands, the less vblank the frame had to spare.
+typedef void (*KintsukiPpuLandHook)(uint8_t port);
+__attribute__((visibility("default")))
+KintsukiPpuLandHook kintsukiPpuLandHook = nullptr;
+
+// kintsuki: the PPU enters (begin = 1, line vdisp) or leaves (begin = 0,
+// line 0) vblank.
+typedef void (*KintsukiVblankHook)(uint8_t begin);
+__attribute__((visibility("default")))
+KintsukiVblankHook kintsukiVblankHook = nullptr;
+
 auto System::load(Node::System& root, string name) -> bool {
   if(node) unload();
 

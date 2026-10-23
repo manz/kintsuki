@@ -55,6 +55,10 @@ struct KintsukiApp: App {
             VRAMViewerView(emulator: emulator)
         }
 
+        Window("VRAM Map", id: "vrammap") {
+            VRAMMapView(emulator: emulator)
+        }
+
         Window("Memory Viewer", id: "memory") {
             MemoryViewerView(emulator: emulator)
         }
@@ -139,6 +143,8 @@ struct KintsukiApp: App {
                     .keyboardShortcut("t", modifiers: [.command, .shift])
                 Button("VRAM Viewer") { toggleToolWindow("vram") }
                     .keyboardShortcut("v", modifiers: [.command, .shift])
+                Button("VRAM Map") { toggleToolWindow("vrammap") }
+                    .keyboardShortcut("k", modifiers: [.command, .shift])
                 Button("Memory Viewer") { toggleToolWindow("memory") }
                     .keyboardShortcut("m", modifiers: [.command, .shift])
                 Button("HDMA Inspector") { toggleToolWindow("hdma") }
@@ -161,6 +167,11 @@ struct KintsukiApp: App {
                 Button("Save Screenshot") { saveScreenshotToPicturesFolder() }
                     .keyboardShortcut("p", modifiers: [.command, .shift])
                     .disabled(emulator.loadedROM == nil)
+                Button(emulator.timelineURL == nil ? "Record Timeline" : "Stop Timeline Recording") {
+                    toggleTimeline()
+                }
+                .keyboardShortcut("p", modifiers: [.command, .option])
+                .disabled(emulator.loadedROM == nil)
             }
             CommandMenu("Project") {
                 if emulator.projectIsOpen, let dir = emulator.projectDir {
@@ -222,16 +233,30 @@ struct KintsukiApp: App {
     /// usually a "grab this frame, keep playing" action. Folder is
     /// created on demand so a fresh install just works.
     private func saveScreenshotToPicturesFolder() {
+        _ = emulator.saveScreenshot(url: captureURL(stem: "screenshot", ext: "png"))
+    }
+
+    /// Start a Perfetto timeline next to the screenshots; on stop, show it
+    /// in Finder (drag it onto ui.perfetto.dev).
+    private func toggleTimeline() {
+        if let url = emulator.timelineStop() {
+            NSWorkspace.shared.activateFileViewerSelecting([url])
+        } else {
+            emulator.timelineStart(url: captureURL(stem: "timeline", ext: "pftrace"))
+        }
+    }
+
+    /// `~/Pictures/Kintsuki/<rom>-<timestamp>.<ext>`, `stem` when no ROM.
+    private func captureURL(stem: String, ext: String) -> URL {
         let fm = FileManager.default
         let pictures = fm.urls(for: .picturesDirectory, in: .userDomainMask).first
             ?? fm.homeDirectoryForCurrentUser.appendingPathComponent("Pictures")
         let dir = pictures.appendingPathComponent("Kintsuki", isDirectory: true)
         try? fm.createDirectory(at: dir, withIntermediateDirectories: true)
-        let stem = emulator.loadedROM?.deletingPathExtension().lastPathComponent ?? "screenshot"
+        let name = emulator.loadedROM?.deletingPathExtension().lastPathComponent ?? stem
         let f = DateFormatter()
         f.dateFormat = "yyyyMMdd-HHmmss"
-        let url = dir.appendingPathComponent("\(stem)-\(f.string(from: .now)).png")
-        _ = emulator.saveScreenshot(url: url)
+        return dir.appendingPathComponent("\(name)-\(f.string(from: .now)).\(ext)")
     }
 
     /// Honour `--recover <path>` on launch by loading a `.kcr` dump

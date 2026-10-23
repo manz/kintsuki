@@ -32,6 +32,11 @@ typedef enum {
 // just returned by the bus; for write it is the byte being written.
 typedef void (*kintsuki_cb_t)(uint32_t addr, uint8_t value, void* userdata);
 
+// Read override signature. Return 0-255 to replace the byte the CPU bus reads
+// at `addr` (data loads and opcode fetches), or -1 to leave the read alone.
+// `open_bus` is the bus value the read would otherwise start from.
+typedef int (*kintsuki_read_override_t)(uint32_t addr, uint8_t open_bus, void* userdata);
+
 // Lifecycle
 kintsuki_t* kintsuki_create(void);
 void        kintsuki_destroy(kintsuki_t*);
@@ -238,9 +243,16 @@ typedef struct {
   uint16_t hcounter, vcounter;
   kintsuki_dma_channel_t dma[8];
   uint8_t  mdmaen, hdmaen;  // reconstructed from cpu.channels[].dmaEnable/hdmaEnable
+  uint8_t  obsel;         // $2101 reconstructed
 } kintsuki_ppu_state_t;
 
 void kintsuki_get_ppu_state(kintsuki_t*, kintsuki_ppu_state_t* out);
+
+// Read back a write-only PPU register the way the MiSTer core's savestate
+// port does ($C1:21xx, PPU.vhd SS_DO): `reg` $00-$33 is the register's low
+// (or only) byte, $40/$41 COLDATA green/red, $4D-$60 the high byte of the
+// two-write register at reg - $40, $61 the CGADD byte latch.
+uint8_t kintsuki_ppu_ss_read(kintsuki_t*, uint8_t reg);
 
 // Savestate. Two-call style: pass buf=NULL,cap=0 to query required size,
 // then call again with a buffer of at least the returned size. Returns
@@ -414,6 +426,8 @@ void kintsuki_spc_set_state(kintsuki_t*, const kintsuki_spc_state_t* in);
 // copied. ARAM (the 64KB sample/echo store) is the separate
 // kintsuki_spc_read_aram window.
 uint32_t kintsuki_dsp_registers(kintsuki_t*, uint8_t* out, uint32_t len);
+// Write one S-DSP register ($00-$7F) as the SMP's $F3 port would.
+void     kintsuki_dsp_write_register(kintsuki_t*, uint8_t addr, uint8_t value);
 
 // ---- SPC700 execution debug ---------------------------------------------
 // Breakpoints / single-step / run-until / disassembly for the audio CPU,
@@ -469,6 +483,14 @@ int         kintsuki_add_callback_ex(kintsuki_t*, int kind, uint32_t lo, uint32_
                                      kintsuki_cb_t fn, void* userdata);
 void        kintsuki_remove_callback(kintsuki_t*, int kind, int id);
 
+// Read overrides: stand in for a memory-mapped device over [lo, hi]. The
+// first active override covering the address that returns a value wins.
+// WRAM mirrors arrive de-mirrored ($00:0000-$1FFF as $7E:xxxx). Read
+// callbacks see the overridden value. Returns a 1-based id, 0 on failure.
+int         kintsuki_add_read_override(kintsuki_t*, uint32_t lo, uint32_t hi,
+                                       kintsuki_read_override_t fn, void* userdata);
+void        kintsuki_remove_read_override(kintsuki_t*, int id);
+
 // ---- Shadow callstack ----------------------------------------------------
 // Maintained transparently by the WDC65816 JSR/JSL/RTS/RTL hooks, one shadow
 // stack per hardware stack while the exec hook is armed (an exec callback, a
@@ -516,6 +538,21 @@ typedef struct {
   uint64_t max_cycles;    // largest single-call inclusive delta
   uint64_t min_cycles;    // smallest single-call inclusive delta
 } kintsuki_fn_stat_t;
+
+// Timeline: a Perfetto trace (open in ui.perfetto.dev) streamed to `path` a slice per
+// JSR/JSL and NMI/IRQ on a "65816" track, a slice per DMA channel run and
+// per run of consecutive HDMA lines, a "frame" instant per rendered frame,
+// an "Overruns" instant the first time a frame's VRAM/OAM/CGRAM write is
+// dropped outside blanking, a "Vblank margin" counter per vblank (the lines
+// left after its last screen-on VRAM/OAM write, all of them when none landed),
+// and every `screenshot_every` frames
+// (0: never) a JPEG of the frame the UI shows on a Screenshots track.
+// Returns 0 if the file can't be opened.
+int      kintsuki_timeline_start(kintsuki_t*, const char* path, uint32_t screenshot_every);
+// An instant named `name` on the "Marks" track (e.g. from an exec callback).
+void     kintsuki_timeline_mark(kintsuki_t*, const char* name);
+// Closes open slices and the file; returns the bytes written (0: no trace).
+uint64_t kintsuki_timeline_stop(kintsuki_t*);
 
 void     kintsuki_profile_start(kintsuki_t*, uint32_t lo, uint32_t hi);
 void     kintsuki_profile_stop(kintsuki_t*);
@@ -756,6 +793,22 @@ uint32_t kintsuki_ppu_writes_count(kintsuki_t*);
 uint32_t kintsuki_ppu_writes_snapshot(kintsuki_t*,
                                       kintsuki_ppu_write_t* out,
                                       uint32_t cap);
+
+// VRAM map: while recording, every VRAM word the PPU fetches to draw gets
+// its layer's bit, and every write that lands is counted with the routine
+// that made it (top of the shadow callstack).
+#define KINTSUKI_VRAM_BG_MAP(n)   (1u << (n))         // BG1-4 tilemap, n = 0-3
+#define KINTSUKI_VRAM_BG_TILES(n) (0x10u << (n))      // BG1-4 tiles (mode 7: BG1 map + tiles)
+#define KINTSUKI_VRAM_OBJ_TILES   0x100u
+// Start clears the map and records from now on; stop keeps it to read.
+void     kintsuki_vram_map_start(kintsuki_t*);
+void     kintsuki_vram_map_stop(kintsuki_t*);
+void     kintsuki_vram_map_clear(kintsuki_t*);
+// Copies up to `cap` words of each array that isn't NULL: the read bits,
+// the writes and the last writer's routine. Returns the words copied, at
+// most VRAM's (32768, or 65536 with the VA15 mod); 0 before any start.
+uint32_t kintsuki_vram_map_snapshot(kintsuki_t*, uint16_t* reads, uint32_t* writes,
+                                    uint32_t* writers, uint32_t cap);
 
 // Per-scanline HDMA channel mask for the most recently completed
 // frame (double-buffered). `out[i]` = bitmask of channels that fired

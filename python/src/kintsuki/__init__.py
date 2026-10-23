@@ -20,6 +20,7 @@ from typing import Callable
 
 from . import _native
 from ._native import CB_EXEC, CB_READ, CB_WRITE, CpuState, PpuStateRaw, DmaChannelRaw
+from .vram_map import VramMap, VramRun
 
 __version__ = "0.1.0"
 
@@ -38,6 +39,8 @@ __all__ = [
     "PatchRejectedWarning",
     "SRAM_POLICIES",
     "LiveCounters",
+    "VramMap",
+    "VramRun",
 ]
 
 
@@ -146,6 +149,7 @@ class PpuState:
     dma: tuple  # 8x DmaChannelState
     mdmaen: int
     hdmaen: int
+    obsel: int
 
     @classmethod
     def _from_raw(cls, raw: PpuStateRaw) -> "PpuState":
@@ -179,6 +183,7 @@ class PpuState:
             cgwsel=raw.cgwsel, cgadsub=raw.cgadsub, setini=raw.setini,
             hcounter=raw.hcounter, vcounter=raw.vcounter,
             dma=dma, mdmaen=raw.mdmaen, hdmaen=raw.hdmaen,
+            obsel=raw.obsel,
         )
 
     # --- Convenience helpers ------------------------------------------------
@@ -264,6 +269,10 @@ class CallbackKind:
     EXEC = CB_EXEC
     READ = CB_READ
     WRITE = CB_WRITE
+
+
+# Bookkeeping kind for read overrides (SPC callbacks use 0x100 | kind).
+_READ_OVERRIDE = 0x200
 
 
 @dataclass
@@ -422,6 +431,7 @@ class Emu:
         self._handle = h
         Emu._live.add(self)
         self._registered: list[_Registered] = []
+        self._override_error: BaseException | None = None
         on = Emu.default_load_srm_sidecar if load_srm_sidecar is None else load_srm_sidecar
         _native.lib.kintsuki_set_srm_sidecar(self._handle, 1 if on else 0)
         # Opt-in: a `<rom>.bps` / `<stem>.bps` is applied at load_rom only
@@ -587,7 +597,8 @@ class Emu:
 
     def callstack(self, max_frames: int = 256) -> list[tuple[int, int, int]]:
         """Snapshot the shadow callstack (deepest frame first). Each entry
-        is ``(callsite_pc, target_pc, kind)`` where kind is 0=JSR / 1=JSL.
+        is ``(callsite_pc, target_pc, kind)`` where kind is 0=JSR / 1=JSL /
+        2=NMI / 3=IRQ (callsite_pc: the interrupted PC).
         Empty when nothing has been called yet (or after ``load_state``)."""
         if max_frames <= 0:
             return []
@@ -598,6 +609,37 @@ class Emu:
 
     def callstack_clear(self) -> None:
         _native.lib.kintsuki_callstack_clear(self._handle)
+
+    # ----------------------------------------------------------------- Timeline
+    def timeline_start(self, path: str | os.PathLike[str], *, screenshot_every: int = 0) -> None:
+        """Stream a Perfetto trace to ``path`` (open it in ui.perfetto.dev):
+        a slice per JSR/JSL and NMI/IRQ on the "65816" track (labels from the
+        project or .adbg), a slice per DMA channel run and per run of
+        consecutive HDMA lines, a "frame" instant per rendered frame, an
+        "Overruns" instant (``line``, ``pc``) the first time in a frame the PPU
+        drops a VRAM/OAM/CGRAM write because the screen is on and drawing,
+        and a "Vblank margin" counter at each vblank's end: the lines it had
+        left after its last screen-on VRAM/OAM write (the whole vblank when
+        none landed or all ran under forced blank), how close the frame came
+        to an overrun. Timestamps are the master clock in nanoseconds.
+        ``screenshot_every=N`` adds a JPEG of every Nth frame (~25 KB each),
+        shown on the UI's Screenshots track."""
+        if not _native.lib.kintsuki_timeline_start(self._handle, os.fsencode(path), screenshot_every):
+            raise OSError(f"cannot write timeline to {path}")
+
+    def timeline_mark(self, name: str) -> None:
+        """An instant on the "Marks" track, with the current scanline; call it
+        from an exec callback to mark milestones (pass start, pass end...)."""
+        _native.lib.kintsuki_timeline_mark(self._handle, name.encode("utf-8"))
+
+    def timeline_stop(self) -> int:
+        """Close open slices and the file; returns the bytes written."""
+        return int(_native.lib.kintsuki_timeline_stop(self._handle))
+
+    def timeline(self, path: str | os.PathLike[str], *,
+                 screenshot_every: int = 0) -> "_TimelineSession":
+        """Context-manager wrapper: `with emu.timeline("t.pftrace"): emu.run_frames(60)`."""
+        return _TimelineSession(self, path, screenshot_every)
 
     # ------------------------------------------------------------------ Profile
     def profile_start(self, lo: int | None = None, hi: int | None = None) -> None:
@@ -790,6 +832,31 @@ class Emu:
                 "frame": int(e.frame),
             })
         return out
+
+    # ---------------------------------------------------------------- VRAM map
+    def vram_map_start(self) -> None:
+        """Clear the VRAM map and record from now on: every VRAM word the PPU
+        fetches to draw gets its layer's bit, every write that lands is counted
+        with the routine that made it. Read it with :meth:`vram_map`."""
+        _native.lib.kintsuki_vram_map_start(self._handle)
+
+    def vram_map_stop(self) -> None:
+        """Stop recording; the map stays readable."""
+        _native.lib.kintsuki_vram_map_stop(self._handle)
+
+    def vram_map_clear(self) -> None:
+        _native.lib.kintsuki_vram_map_clear(self._handle)
+
+    def vram_map(self) -> VramMap:
+        """The VRAM map recorded since :meth:`vram_map_start`, a word per VRAM
+        word (32768, or 65536 with the VA15 mod; none before any start)."""
+        cap = self.vram_size // 2
+        reads = (ctypes.c_uint16 * cap)()
+        writes = (ctypes.c_uint32 * cap)()
+        writers = (ctypes.c_uint32 * cap)()
+        n = _native.lib.kintsuki_vram_map_snapshot(self._handle, reads, writes, writers, cap)
+        return VramMap(array.array("H", reads[:n]), array.array("I", writes[:n]),
+                       array.array("I", writers[:n]))
 
     # ----------------------------------------------------------------- Project
     def project_open(self, dir: str | os.PathLike[str]) -> None:
@@ -1046,9 +1113,11 @@ class Emu:
     # -------------------------------------------------------------- Run/step
     def run_frames(self, n: int) -> None:
         _native.lib.kintsuki_run_frames(self._handle, n)
+        self._raise_override_error()
 
     def step(self) -> None:
         _native.lib.kintsuki_step(self._handle)
+        self._raise_override_error()
 
     @property
     def frame_count(self) -> int:
@@ -1056,14 +1125,15 @@ class Emu:
 
     @property
     def master_cycles(self) -> int:
-        # ares-scaled master clock; monotonic u64. Use raw deltas for relative
-        # measurement — the absolute unit is "master ticks since reset".
+        """Master clock ticks (21.477 MHz NTSC, 357366 a frame); monotonic,
+        use deltas. The same clock as :meth:`live_counters`; a state load
+        moves it with the loaded CPU."""
         return int(_native.lib.kintsuki_master_clock(self._handle))
 
     def live_counters(self) -> LiveCounters:
         """Master cycles + scanline/dot at the instruction being executed.
-        Unlike :attr:`master_cycles` (a scheduler-slice clock) and the PPU's
-        latched counters, these are exact inside exec/read/write callbacks:
+        Unlike :attr:`frame_count` and the PPU's latched counters, these are
+        exact inside exec/read/write callbacks:
         e.g. a write callback on a frame-ready flag can time the main loop
         against the NMI."""
         raw = _native.LiveCountersRaw()
@@ -1079,8 +1149,9 @@ class Emu:
 
     @property
     def cpu_cycles(self) -> int:
-        # master / 6 ≈ 65816 CPU cycles. Standard mode; FastROM and IO waits
-        # are already folded into the master clock by the ares core.
+        """:attr:`master_cycles` / 6: nominal 65816 cycles. FastROM and slow
+        accesses are already in the master count, so it is a time unit, not
+        an exact count of CPU cycles."""
         return int(_native.lib.kintsuki_cpu_cycles(self._handle))
 
     # ------------------------------------------------------------------ Mem
@@ -1179,6 +1250,13 @@ class Emu:
         raw = PpuStateRaw()
         _native.lib.kintsuki_get_ppu_state(self._handle, ctypes.byref(raw))
         return PpuState._from_raw(raw)
+
+    def ppu_ss_read(self, reg: int) -> int:
+        """Read back a write-only PPU register as the MiSTer core's
+        savestate port answers $C1:21xx: `reg` $00-$33 the low (or only)
+        byte, $40/$41 COLDATA green/red, $4D-$60 the high byte of the
+        two-write register at reg - $40, $61 the CGADD byte latch."""
+        return int(_native.lib.kintsuki_ppu_ss_read(self._handle, reg & 0xFF))
 
     # ----------------------------------------------------------------- Tracer
     def tracer_start(self, lo: int, hi: int, *, ring_capacity: int = 4096,
@@ -1451,6 +1529,10 @@ class Emu:
         n = _native.lib.kintsuki_dsp_registers(self._handle, buf, 128)
         return bytes(buf[:n])
 
+    def dsp_write_register(self, addr: int, value: int) -> None:
+        """Write one S-DSP register ($00-$7F) as the SMP's $F3 port would."""
+        _native.lib.kintsuki_dsp_write_register(self._handle, addr & 0x7F, value & 0xFF)
+
     def dsp_voice(self, index: int, regs: bytes | None = None) -> DspVoice:
         """Decode one S-DSP voice (0..7). Pass `regs` from a prior
         :meth:`dsp_registers` to decode several voices off one snapshot."""
@@ -1608,6 +1690,52 @@ class Emu:
     def add_write_callback(self, lo: int, hi: int, fn: Callable[[int, int], None]) -> int:
         return self._add_callback(CB_WRITE, lo, hi, fn)
 
+    def add_read_override(
+        self, lo: int, hi: int, fn: Callable[[int, int], int | None]
+    ) -> int:
+        """Stand in for a memory-mapped device over the 24-bit bus range
+        [lo, hi]. `fn(addr, open_bus)` returns the byte the CPU reads
+        (data loads and opcode fetches alike) or None to let the bus answer.
+        WRAM mirrors arrive de-mirrored ($00:0000-$1FFF as $7E:xxxx).
+
+        An exception in `fn`, or a value outside 0-255, is raised from the
+        run call that triggered it; the read itself passes through."""
+
+        def trampoline(addr, open_bus, _ud):
+            if self._override_error is not None:
+                return -1
+            try:
+                value = fn(int(addr), int(open_bus))
+                if value is None:
+                    return -1
+                if not 0 <= value <= 0xFF:
+                    raise ValueError(
+                        f"read override for ${int(addr):06X} returned {value!r}, not a byte"
+                    )
+                return value
+            except BaseException as exc:  # surfaced by _raise_override_error
+                self._override_error = exc
+                return -1
+
+        c_fn = _native.READ_OVERRIDE(trampoline)
+        oid = _native.lib.kintsuki_add_read_override(self._handle, lo, hi, c_fn, None)
+        if oid == 0:
+            raise RuntimeError("add_read_override failed")
+        self._registered.append(_Registered(kind=_READ_OVERRIDE, cb_id=oid, trampoline=c_fn))
+        return oid
+
+    def remove_read_override(self, override_id: int) -> None:
+        _native.lib.kintsuki_remove_read_override(self._handle, override_id)
+        self._registered = [
+            r for r in self._registered
+            if not (r.kind == _READ_OVERRIDE and r.cb_id == override_id)
+        ]
+
+    def _raise_override_error(self) -> None:
+        exc, self._override_error = self._override_error, None
+        if exc is not None:
+            raise exc
+
     def remove_callback(self, kind: int, cb_id: int) -> None:
         _native.lib.kintsuki_remove_callback(self._handle, kind, cb_id)
         self._registered = [
@@ -1641,6 +1769,7 @@ class Emu:
     ) -> bool:
         """Run until PC == target_pc. Mid-frame bail. Returns True on hit."""
         rc = _native.lib.kintsuki_run_until(self._handle, target_pc, max_frames)
+        self._raise_override_error()
         return rc != 0
 
     def run_until_ex(
@@ -1657,6 +1786,7 @@ class Emu:
         rc = _native.lib.kintsuki_run_until_ex(
             self._handle, target_pc, max_frames, ctypes.byref(out)
         )
+        self._raise_override_error()
         return rc != 0, int(out.value)
 
     def rearm_cpu(self) -> None:
@@ -1702,6 +1832,9 @@ class Emu:
             payload += EXIT_OPCODE
         self.write_range(load_addr, payload)
 
+        # A frame can end mid-instruction; resuming it after moving PC would
+        # finish the old instruction against the stub address.
+        self.rearm_cpu()
         s = self.get_state()
         s.pc = load_addr & 0xFFFFFF
         s.a = a & 0xFFFF
@@ -1743,6 +1876,7 @@ class Emu:
         rtl_exit = 0x000000 | sentinel_lo
         rts_exit = (func_addr & 0xFF0000) | sentinel_lo
 
+        self.rearm_cpu()  # see run_asm: don't resume a half-run instruction
         s = self.get_state()
         s.pc = func_addr & 0xFFFFFF
         s.a = a & 0xFFFF
@@ -1756,7 +1890,7 @@ class Emu:
         # bytes; the bank byte we push above is then unused but doesn't
         # hurt anything.
         self.push_byte((rtl_exit >> 16) & 0xFF)
-        self.push_word(sentinel_lo)
+        self.push_word(sentinel_lo - 1)  # RTS/RTL resume at popped + 1
 
         # Try RTL exit first (long-form return); if that doesn't fire,
         # fall through to RTS exit in the function's bank.
@@ -1771,7 +1905,9 @@ class Emu:
             # Unregister this Emu's callbacks before the trampolines are freed
             # below, so the C side can never call one that's gone.
             for r in self._registered:
-                if r.kind & 0x100:
+                if r.kind == _READ_OVERRIDE:
+                    _native.lib.kintsuki_remove_read_override(self._handle, r.cb_id)
+                elif r.kind & 0x100:
                     _native.lib.kintsuki_spc_remove_callback(self._handle, r.kind & 0xFF, r.cb_id)
                 else:
                     _native.lib.kintsuki_remove_callback(self._handle, r.kind, r.cb_id)
@@ -1791,6 +1927,22 @@ class Emu:
             self.close()
         except Exception:
             pass
+
+
+class _TimelineSession:
+    """Starts a timeline on enter, stops it on exit."""
+
+    def __init__(self, emu: Emu, path: str | os.PathLike[str], screenshot_every: int) -> None:
+        self._emu = emu
+        self._path = path
+        self._screenshot_every = screenshot_every
+
+    def __enter__(self) -> "_TimelineSession":
+        self._emu.timeline_start(self._path, screenshot_every=self._screenshot_every)
+        return self
+
+    def __exit__(self, *_) -> None:
+        self._emu.timeline_stop()
 
 
 class _TracerSession:

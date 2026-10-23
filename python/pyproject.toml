@@ -52,9 +52,9 @@ dev = [
     "build>=1.0",
     "wheel>=0.42",
     # a816 assembler is a runtime dep of the test suite (conftest.py's
-    # assemble_rom fixture shells out to `a816 -f sfc`). Pinned to the
-    # latest 1.1.0 alpha that's been validated against this repo.
-    "a816>=1.1.0a11",
+    # assemble_rom fixture shells out to `a816 -f sfc`). Test ROMs use the
+    # stdlib, .alloc and .istruct: 1.1.7 or later.
+    "a816>=1.1.7",
     # kintsuki.visual pixel-diff oracle (vendored mapbox/pixelmatch port).
     "numpy>=1.26",
     "numba>=0.59",

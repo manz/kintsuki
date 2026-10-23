@@ -8,7 +8,9 @@
 #include "kintsuki.h"
 #include "adbg.hpp"
 #include "project.hpp"
+#include "perfetto.hpp"
 
+#include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -29,6 +31,14 @@ namespace ares::SuperFamicom {
   extern KintsukiDmaHook kintsukiDmaHook;
   typedef void (*KintsukiHdmaHook)(uint8_t, uint16_t, uint8_t);
   extern KintsukiHdmaHook kintsukiHdmaHook;
+  typedef void (*KintsukiPpuDropHook)(uint8_t);
+  extern KintsukiPpuDropHook kintsukiPpuDropHook;
+  typedef void (*KintsukiPpuLandHook)(uint8_t);
+  extern KintsukiPpuLandHook kintsukiPpuLandHook;
+  typedef void (*KintsukiVblankHook)(uint8_t);
+  extern KintsukiVblankHook kintsukiVblankHook;
+  typedef void (*KintsukiVramWriteHook)(uint16_t);
+  extern KintsukiVramWriteHook kintsukiVramWriteHook;
   typedef void (*KintsukiSdd1Hook)(uint8_t, uint8_t, uint32_t, uint32_t,
                                    uint16_t, uint32_t, uint8_t);
   extern KintsukiSdd1Hook kintsukiSdd1Hook;
@@ -116,7 +126,8 @@ std::unordered_map<uint32_t, ProfStat> g_profileStats;
 // delta straddling a reduce event. The counter is u32 and wraps roughly
 // every 2^32 ticks (~200s of emulated wall time at 21.477MHz). We widen
 // to u64 by detecting any backward step as a wrap and adding 2^32 to a
-// running base; profile_start resets both.
+// running base. Program::frameHook samples it every frame so a long
+// run_frames can't skip a wrap.
 uint32_t                      g_lastMasterCounter = 0;
 uint64_t                      g_masterCounterBase = 0;
 
@@ -161,6 +172,8 @@ void profileOnReturn() {
   }
 }
 
+void traceCloseSlices();
+
 // ---- Shadow-stack switching (tasks, fibers, coroutines) ----------------
 // One shadow stack per hardware stack. A TCS/TXS that moves S off the live
 // stack parks its frames (shadow callstack + profiler frames) and resumes the
@@ -199,6 +212,7 @@ void switchShadowStack(uint16_t new_s) {
     }
   }
   if(g_callstack.empty() && best < 0) return;  // nothing to park or resume
+  traceCloseSlices();
   uint64_t now = profileMasterCycles();
   ParkedStack resumed;
   if(best >= 0) {
@@ -223,6 +237,7 @@ void switchShadowStack(uint16_t new_s) {
 // Every live and parked frame: the call chain they describe is gone (reset,
 // state load, CPU rearm).
 void clearShadowStacks() {
+  traceCloseSlices();
   g_callstack.clear();
   g_callstackS.clear();
   g_parkedStacks.clear();
@@ -233,6 +248,179 @@ void clearShadowStacks() {
 void clearProfileFrames() {
   g_profileStack.clear();
   for(auto& p : g_parkedStacks) p.prof.clear();
+}
+
+// ---- Perfetto trace -----------------------------------------------------
+// kintsuki_timeline_start streams one slice per call (JSR/JSL, NMI/IRQ) on the
+// "65816" track, one per DMA channel run, and frame / mark instants.
+kintsuki::PerfettoTrace g_trace;
+uint64_t g_traceCpu = 0;
+uint64_t g_traceFrames = 0;
+uint64_t g_traceOverruns = 0;
+uint8_t g_traceDropped = 0;  // ports already marked this frame (bit 0 VRAM, 1 OAM, 2 CGRAM)
+uint64_t g_traceVblank = 0;  // "Vblank margin" counter track
+bool g_traceInVblank = false;  // the trace saw the current vblank begin
+double g_traceMargin = 0;  // lines the current vblank has left after its last screen-on VRAM/OAM write
+uint64_t g_traceMarks = 0;
+uint64_t g_traceDma[8] = {};
+uint64_t g_traceHdma[8] = {};
+// A channel's run of consecutive HDMA lines, open as one slice.
+struct HdmaRun {
+  bool     open = false;
+  uint16_t last = 0;
+  uint64_t lastMaster = 0;
+};
+HdmaRun g_traceHdmaRun[8];
+constexpr uint64_t kLineMaster = 1364;
+uint32_t g_traceDepth = 0;
+uint32_t g_traceScreenshotEvery = 0;  // frames; 0: no screenshots
+constexpr int kTraceJpegQuality = 80;
+std::unordered_map<uint32_t, std::string> g_traceNames;
+
+uint64_t traceNs(uint64_t master) {
+  double hz = ares::SuperFamicom::system.cpuFrequency();
+  return (uint64_t)((long double)master * 1e9L / hz);
+}
+
+uint64_t traceNow() { return traceNs(profileMasterCycles()); }
+
+uint64_t traceLine() { return ares::SuperFamicom::cpu.vcounter(); }
+
+const std::string& traceName(uint32_t pc) {
+  auto it = g_traceNames.find(pc);
+  if(it != g_traceNames.end()) return it->second;
+  std::string name;
+  if(auto* label = g_project ? g_project->get_label(pc) : nullptr) name = label->name;
+  // "__" names are the assembler's own (anonymous allocs): the address reads better.
+  const char* adbg = g_labels.lookup(pc);
+  if(name.empty() && adbg && std::strncmp(adbg, "__", 2) != 0) name = adbg;
+  if(name.empty()) {
+    char hex[16];
+    std::snprintf(hex, sizeof hex, "%02X:%04X", pc >> 16, pc & 0xFFFF);
+    name = hex;
+  }
+  return g_traceNames.emplace(pc, std::move(name)).first->second;
+}
+
+void traceCall(uint32_t callsite_pc, uint32_t target_pc, uint8_t kind) {
+  if(!g_trace.active()) return;
+  if(kind >= 2) {
+    std::string name = (kind == 2 ? "NMI " : "IRQ ") + traceName(target_pc);
+    g_trace.begin(g_traceCpu, traceNow(), name,
+                  {{"line", traceLine()}, {"from", callsite_pc}});
+  } else {
+    g_trace.begin(g_traceCpu, traceNow(), traceName(target_pc));
+  }
+  g_traceDepth++;
+}
+
+void traceReturn() {
+  if(!g_trace.active() || !g_traceDepth) return;
+  g_trace.end(g_traceCpu, traceNow());
+  g_traceDepth--;
+}
+
+// The call chain the open slices describe is gone (stack switch, reset).
+void traceCloseSlices() {
+  if(!g_trace.active()) return;
+  uint64_t now = traceNow();
+  for(; g_traceDepth; g_traceDepth--) g_trace.end(g_traceCpu, now);
+}
+
+// A DMA slice is named for where it writes: "VRAM $4800" (VMADD, a word address),
+// "CGRAM $10" (CGADD), "OAM $000" (OAMADD), else its B-bus register.
+void traceDma(uint8_t channel, uint32_t src, uint8_t dst, uint16_t size, uint32_t caller) {
+  if(!g_trace.active() || channel >= 8) return;
+  auto& ppu = ares::SuperFamicom::ppuPerformanceImpl;
+  uint64_t master = profileMasterCycles();
+  uint32_t bytes = size ? size : 0x10000;
+  std::vector<kintsuki::TraceArg> args{{"src", src}, {"bytes", bytes}, {"line", traceLine()}, {"caller", caller}};
+  char name[24];
+  if(dst == 0x18 || dst == 0x19 || dst == 0x39 || dst == 0x3A) {
+    uint32_t vmain = ppu.vram.mode << 7 | ppu.vram.mapping << 2
+                   | (ppu.vram.increment == 1 ? 0 : ppu.vram.increment == 32 ? 1 : 2);
+    std::snprintf(name, sizeof name, "VRAM $%04X", (unsigned)ppu.vram.address);
+    args.push_back({"vram", (uint64_t)ppu.vram.address});
+    args.push_back({"vmain", vmain});
+  } else if(dst == 0x22 || dst == 0x3B) {
+    std::snprintf(name, sizeof name, "CGRAM $%02X", (unsigned)ppu.io.cgramAddress);
+    args.push_back({"cg", (uint64_t)ppu.io.cgramAddress});
+  } else if(dst == 0x04 || dst == 0x38) {
+    std::snprintf(name, sizeof name, "OAM $%03X", (unsigned)ppu.io.oamAddress);
+    args.push_back({"oam", (uint64_t)ppu.io.oamAddress});
+  } else {
+    std::snprintf(name, sizeof name, "$21%02X", dst);
+  }
+  args.push_back({"reg", (uint64_t)(0x2100 | dst)});
+  g_trace.begin(g_traceDma[channel], traceNs(master), name, args);
+  g_trace.end(g_traceDma[channel], traceNs(master + 8 + 8ull * bytes));  // 8 master cycles a byte
+}
+
+void traceHdmaClose(uint8_t channel) {
+  auto& run = g_traceHdmaRun[channel];
+  if(!run.open) return;
+  g_trace.end(g_traceHdma[channel], traceNs(run.lastMaster + kLineMaster));
+  run.open = false;
+}
+
+void traceHdma(uint8_t channel, uint16_t line, uint8_t dst) {
+  if(!g_trace.active() || channel >= 8) return;
+  auto& run = g_traceHdmaRun[channel];
+  uint64_t master = profileMasterCycles();
+  if(!(run.open && line == run.last + 1)) {
+    traceHdmaClose(channel);
+    char name[16];
+    std::snprintf(name, sizeof name, "$21%02X", dst);
+    g_trace.begin(g_traceHdma[channel], traceNs(master), name, {{"line", line}});
+    run.open = true;
+  }
+  run.last = line;
+  run.lastMaster = master;
+}
+
+// The first write a port drops in a frame: the frame overran vblank.
+void tracePpuDrop(uint8_t port) {
+  if(!g_trace.active()) return;
+  uint8_t bit = port == 0x18 ? 1 : port == 0x04 ? 2 : 4;
+  if(g_traceDropped & bit) return;
+  g_traceDropped |= bit;
+  const char* name = bit == 1 ? "VRAM overrun" : bit == 2 ? "OAM overrun" : "CGRAM overrun";
+  g_trace.instant(g_traceOverruns, traceNow(), name,
+                  {{"line", ares::SuperFamicom::cpu.vcounter()}, {"pc", ares::SuperFamicom::cpu.r.pc.d}});
+}
+
+// A VRAM/OAM write landed with the screen on, so in vblank: the lines left after it, from
+// the beam the CPU sees (the PPU thread's own clock runs ahead of it).
+void tracePpuLand(uint8_t) {
+  if(!g_trace.active()) return;
+  using namespace ares::SuperFamicom;
+  uint32_t lines = Region::NTSC() ? 262 : 312;
+  g_traceMargin = double((lines - cpu.vcounter()) * kLineMaster - cpu.hcounter()) / kLineMaster;
+}
+
+// At vblank's end, the lines it had left after its last screen-on VRAM/OAM write (all of
+// them when none landed): how close the frame came to dropping writes.
+void traceVblank(uint8_t begin) {
+  if(!g_trace.active()) return;
+  using namespace ares::SuperFamicom;
+  if(begin) {
+    g_traceInVblank = true;
+    g_traceMargin = (Region::NTSC() ? 262 : 312) - ppu.vdisp();
+    return;
+  }
+  if(!g_traceInVblank) return;
+  g_trace.counter(g_traceVblank, traceNow(), g_traceMargin);
+  g_traceInVblank = false;
+}
+
+void traceFrame() {
+  g_traceDropped = 0;
+  if(!g_trace.active()) return;
+  uint64_t frame = kintsukiProgram ? kintsukiProgram->framesRendered : 0;
+  uint64_t now = traceNow();
+  g_trace.instant(g_traceFrames, now, "frame", {{"frame", frame}});
+  if(g_traceScreenshotEvery && kintsukiProgram && frame % g_traceScreenshotEvery == 0)
+    g_trace.screenshot(g_traceFrames, now, kintsukiProgram->encodeJPEG(kTraceJpegQuality));
 }
 
 void cOnCall(uint32_t callsite_pc, uint32_t target_pc, uint8_t kind) {
@@ -247,10 +435,12 @@ void cOnCall(uint32_t callsite_pc, uint32_t target_pc, uint8_t kind) {
   g_callstack.push_back(f);
   g_callstackS.push_back(ares::SuperFamicom::cpu.r.s.w);
   profileOnCall(target_pc);
+  traceCall(callsite_pc, target_pc, kind);
   // Auto-seed entry flags at every JSR/JSL target so cold-cache disasm at
   // any reached function knows the caller's M/X/E. First writer wins —
-  // manual edits are not clobbered.
-  if(g_project) {
+  // manual edits are not clobbered. An interrupt keeps the interrupted
+  // code's flags: nothing to seed.
+  if(g_project && kind < 2) {
     auto& r = ares::SuperFamicom::cpu.r;
     g_project->record_entry_flags(target_pc,
                                   (int8_t)r.p.m, (int8_t)r.p.x, (int8_t)r.e,
@@ -266,6 +456,7 @@ void cOnReturn(uint8_t kind) {
   g_callstack.pop_back();
   g_callstackS.pop_back();
   profileOnReturn();
+  traceReturn();
   if(g_project) {
     // exit_pc = the RTS/RTL opcode address. cOnExec stashes the last
     // PC it saw; ares' returnHook fires after PC has moved to the
@@ -291,6 +482,11 @@ kintsuki_t* kintsuki_create(void) {
   if(g_handle) return g_handle;
   auto* h = new kintsuki_t();
   h->program = std::make_unique<Program>();
+  // Sampled every frame so the widened master clock never skips a wrap.
+  h->program->frameHook = [] {
+    profileMasterCycles();
+    traceFrame();
+  };
   kintsukiProgram = h->program.get();
   g_handle = h;
   // Wire the call/return hooks now and leave them on for the handle's
@@ -420,8 +616,9 @@ void kintsuki_run_frames(kintsuki_t* h, uint32_t n) {
 uint64_t kintsuki_frame_count(kintsuki_t* h) { return h ? h->program->framesRendered : 0; }
 
 uint64_t kintsuki_master_clock(kintsuki_t* h) {
-  if(!h) return 0;
-  return ares::SuperFamicom::cpu.clock();
+  // Not cpu.clock(): the scheduler's reduce pass rewrites thread clocks, so
+  // deltas across it jump (even negative).
+  return h ? profileMasterCycles() : 0;
 }
 
 void kintsuki_live_counters(kintsuki_t* h, kintsuki_live_counters_t* out) {
@@ -437,11 +634,9 @@ int64_t kintsuki_clock_skew(kintsuki_t* h) {
 
 uint64_t kintsuki_cpu_cycles(kintsuki_t* h) {
   if(!h) return 0;
-  // SNES CPU runs at master/6. Thread clock is in ares-scaled units; the
-  // scalar collapses the ratio to nominal cycles for the lowest-frequency
-  // thread we care about. Dividing the master count by 6 keeps the unit
-  // intuitive for asm developers reading per-instruction timings.
-  return (uint64_t)ares::SuperFamicom::cpu.clock() / 6;
+  // Nominal 65816 cycles: master / 6. FastROM and slow accesses are already
+  // in the master count, so this is a time unit, not an exact cycle count.
+  return profileMasterCycles() / 6;
 }
 
 uint8_t kintsuki_read_u8(kintsuki_t* h, uint32_t addr) { return h ? h->program->memRead(addr) : 0; }
@@ -551,6 +746,113 @@ void kintsuki_set_state(kintsuki_t* h, const kintsuki_cpu_state_t* in) {
 }
 
 // PPU/DMA state snapshot — types declared in kintsuki.h.
+
+// Savestate readback of the PPU's write-only registers, as the MiSTer core's
+// PPU.vhd answers it on $C1:21xx (SS_A). $40-$41 are COLDATA green/red and
+// $4D-$61 the high bytes of the two-write registers at $0D-$21.
+uint8_t kintsuki_ppu_ss_read(kintsuki_t* h, uint8_t reg) {
+  if(!h) return 0;
+  auto& p = ares::SuperFamicom::ppuPerformanceImpl;
+  using Source = ares::SuperFamicom::PPUPerformance::Source;
+  auto b = [](bool v, int bit) -> uint8_t { return v ? (uint8_t)(1u << bit) : 0; };
+  auto sc = [](auto& bg) -> uint8_t {
+    return (uint8_t)((bg.io.screenAddress >> 10) << 2 | bg.io.screenSize);
+  };
+  auto wsel = [&](auto& w1, auto& w2) -> uint8_t {
+    return b(w1.oneInvert, 0) | b(w1.oneEnable, 1) | b(w1.twoInvert, 2) | b(w1.twoEnable, 3)
+         | b(w2.oneInvert, 4) | b(w2.oneEnable, 5) | b(w2.twoInvert, 6) | b(w2.twoEnable, 7);
+  };
+  bool m7 = p.io.bgMode == 7;
+  uint16_t oamadd = (uint16_t)(p.io.oamBaseAddress >> 1);
+  switch(reg) {
+  case 0x00: return b(p.io.displayDisable, 7) | (uint8_t)p.io.displayBrightness;
+  case 0x01: return (uint8_t)(p.obj.io.baseSize << 5 | p.obj.io.nameselect << 3
+                             | p.obj.io.tiledataAddress >> 13);
+  case 0x02: return (uint8_t)oamadd;
+  case 0x03: return b(p.io.oamPriority, 7) | (uint8_t)(oamadd >> 8 & 1);
+  case 0x05: return b(p.bg4.io.tileSize, 7) | b(p.bg3.io.tileSize, 6) | b(p.bg2.io.tileSize, 5)
+                  | b(p.bg1.io.tileSize, 4) | b(p.io.bgPriority, 3) | (uint8_t)p.io.bgMode;
+  case 0x06: return (uint8_t)((p.mosaic.size - 1) << 4)
+                  | b(p.bg4.io.mosaicEnable, 3) | b(p.bg3.io.mosaicEnable, 2)
+                  | b(p.bg2.io.mosaicEnable, 1) | b(p.bg1.io.mosaicEnable, 0);
+  case 0x07: return sc(p.bg1);
+  case 0x08: return sc(p.bg2);
+  case 0x09: return sc(p.bg3);
+  case 0x0a: return sc(p.bg4);
+  case 0x0b: return (uint8_t)(p.bg2.io.tiledataAddress >> 12 << 4 | p.bg1.io.tiledataAddress >> 12);
+  case 0x0c: return (uint8_t)(p.bg4.io.tiledataAddress >> 12 << 4 | p.bg3.io.tiledataAddress >> 12);
+  case 0x0d: return (uint8_t)(m7 ? p.mode7.hoffset : p.bg1.io.hoffset);
+  case 0x0e: return (uint8_t)(m7 ? p.mode7.voffset : p.bg1.io.voffset);
+  case 0x0f: return (uint8_t)p.bg2.io.hoffset;
+  case 0x10: return (uint8_t)p.bg2.io.voffset;
+  case 0x11: return (uint8_t)p.bg3.io.hoffset;
+  case 0x12: return (uint8_t)p.bg3.io.voffset;
+  case 0x13: return (uint8_t)p.bg4.io.hoffset;
+  case 0x14: return (uint8_t)p.bg4.io.voffset;
+  case 0x15: {
+    uint8_t inc = p.vram.increment == 1 ? 0 : p.vram.increment == 32 ? 1 : 2;
+    return b(p.vram.mode, 7) | (uint8_t)(p.vram.mapping << 2) | inc;
+  }
+  case 0x16: return (uint8_t)p.vram.address;
+  case 0x17: return (uint8_t)(p.vram.address >> 8);
+  case 0x1a: return (uint8_t)(p.mode7.repeat << 6) | b(p.mode7.vflip, 1) | b(p.mode7.hflip, 0);
+  case 0x1b: return (uint8_t)p.mode7.a;
+  case 0x1c: return (uint8_t)p.mode7.b;
+  case 0x1d: return (uint8_t)p.mode7.c;
+  case 0x1e: return (uint8_t)p.mode7.d;
+  case 0x1f: return (uint8_t)p.mode7.hcenter;
+  case 0x20: return (uint8_t)p.mode7.vcenter;
+  case 0x21: return (uint8_t)p.io.cgramAddress;
+  case 0x22: return (uint8_t)p.latch.cgram;
+  case 0x23: return wsel(p.bg1.window, p.bg2.window);
+  case 0x24: return wsel(p.bg3.window, p.bg4.window);
+  case 0x25: return wsel(p.obj.window, p.dac.window);
+  case 0x26: return (uint8_t)p.window.io.oneLeft;
+  case 0x27: return (uint8_t)p.window.io.oneRight;
+  case 0x28: return (uint8_t)p.window.io.twoLeft;
+  case 0x29: return (uint8_t)p.window.io.twoRight;
+  case 0x2a: return (uint8_t)(p.bg4.window.mask << 6 | p.bg3.window.mask << 4
+                             | p.bg2.window.mask << 2 | p.bg1.window.mask);
+  case 0x2b: return (uint8_t)(p.dac.window.mask << 2 | p.obj.window.mask);
+  case 0x2c: return b(p.obj.io.aboveEnable, 4) | b(p.bg4.io.aboveEnable, 3) | b(p.bg3.io.aboveEnable, 2)
+                  | b(p.bg2.io.aboveEnable, 1) | b(p.bg1.io.aboveEnable, 0);
+  case 0x2d: return b(p.obj.io.belowEnable, 4) | b(p.bg4.io.belowEnable, 3) | b(p.bg3.io.belowEnable, 2)
+                  | b(p.bg2.io.belowEnable, 1) | b(p.bg1.io.belowEnable, 0);
+  case 0x2e: return b(p.obj.window.aboveEnable, 4) | b(p.bg4.window.aboveEnable, 3)
+                  | b(p.bg3.window.aboveEnable, 2) | b(p.bg2.window.aboveEnable, 1)
+                  | b(p.bg1.window.aboveEnable, 0);
+  case 0x2f: return b(p.obj.window.belowEnable, 4) | b(p.bg4.window.belowEnable, 3)
+                  | b(p.bg3.window.belowEnable, 2) | b(p.bg2.window.belowEnable, 1)
+                  | b(p.bg1.window.belowEnable, 0);
+  case 0x30: return (uint8_t)(p.dac.window.aboveMask << 6 | p.dac.window.belowMask << 4)
+                  | b(p.dac.io.blendMode, 1) | b(p.dac.io.directColor, 0);
+  case 0x31: return b(p.dac.io.colorMode, 7) | b(p.dac.io.colorHalve, 6)
+                  | b(p.dac.io.colorEnable[Source::COL], 5) | b(p.dac.io.colorEnable[Source::OBJ2], 4)
+                  | b(p.dac.io.colorEnable[Source::BG4], 3) | b(p.dac.io.colorEnable[Source::BG3], 2)
+                  | b(p.dac.io.colorEnable[Source::BG2], 1) | b(p.dac.io.colorEnable[Source::BG1], 0);
+  case 0x32: return 0x80 | (uint8_t)p.dac.io.colorBlue;
+  case 0x33: return b(p.io.extbg, 6) | b(p.io.pseudoHires, 3) | b(p.io.overscan, 2)
+                  | b(p.obj.io.interlace, 1) | b(p.io.interlace, 0);
+  case 0x40: return 0x40 | (uint8_t)p.dac.io.colorGreen;
+  case 0x41: return 0x20 | (uint8_t)p.dac.io.colorRed;
+  case 0x4d: return (uint8_t)(m7 ? p.mode7.hoffset >> 8 & 0x1f : p.bg1.io.hoffset >> 8 & 3);
+  case 0x4e: return (uint8_t)(m7 ? p.mode7.voffset >> 8 & 0x1f : p.bg1.io.voffset >> 8 & 3);
+  case 0x4f: return (uint8_t)(p.bg2.io.hoffset >> 8 & 3);
+  case 0x50: return (uint8_t)(p.bg2.io.voffset >> 8 & 3);
+  case 0x51: return (uint8_t)(p.bg3.io.hoffset >> 8 & 3);
+  case 0x52: return (uint8_t)(p.bg3.io.voffset >> 8 & 3);
+  case 0x53: return (uint8_t)(p.bg4.io.hoffset >> 8 & 3);
+  case 0x54: return (uint8_t)(p.bg4.io.voffset >> 8 & 3);
+  case 0x5b: return (uint8_t)(p.mode7.a >> 8);
+  case 0x5c: return (uint8_t)(p.mode7.b >> 8);
+  case 0x5d: return (uint8_t)(p.mode7.c >> 8);
+  case 0x5e: return (uint8_t)(p.mode7.d >> 8);
+  case 0x5f: return (uint8_t)(p.mode7.hcenter >> 8 & 0x1f);
+  case 0x60: return (uint8_t)(p.mode7.vcenter >> 8 & 0x1f);
+  case 0x61: return (uint8_t)p.io.cgramAddressLatch;
+  default:   return 0;
+  }
+}
 
 void kintsuki_get_ppu_state(kintsuki_t* h, kintsuki_ppu_state_t* out) {
   if(!h || !out) return;
@@ -683,6 +985,7 @@ void kintsuki_get_ppu_state(kintsuki_t* h, kintsuki_ppu_state_t* out) {
   }
   out->mdmaen = mdmaen;
   out->hdmaen = hdmaen;
+  out->obsel = (uint8_t)(p.obj.io.baseSize << 5 | p.obj.io.nameselect << 3 | p.obj.io.tiledataAddress >> 13);
 }
 
 uint32_t kintsuki_save_state(kintsuki_t* h, void* buf, uint32_t cap) {
@@ -815,6 +1118,11 @@ uint32_t kintsuki_dsp_registers(kintsuki_t* h, uint8_t* out, uint32_t len) {
   return h->program->dspRegisters(out, len);
 }
 
+void kintsuki_dsp_write_register(kintsuki_t* h, uint8_t addr, uint8_t value) {
+  if(!h) return;
+  ares::SuperFamicom::dsp.write(addr & 0x7f, value);
+}
+
 // 1 when the PPU is in BGMODE 5/6 or pseudo-hires (each emitted column
 // is a real pixel), 0 in normal mode (every other column is a dupe).
 // Lets Python `framebuffer()` collapse the doubled output the same way
@@ -838,8 +1146,18 @@ void kintsuki_press(kintsuki_t* h, int port, int button, int pressed) {
 // Callbacks (function-pointer style for ctypes/swift interop)
 // =============================================================================
 typedef void (*kintsuki_cb_t)(uint32_t addr, uint8_t value, void* userdata);
+typedef int (*kintsuki_read_override_t)(uint32_t addr, uint8_t open_bus, void* userdata);
 
 namespace {
+
+struct ReadOverride {
+  uint32_t lo, hi;
+  kintsuki_read_override_t fn;
+  void* userdata;
+  bool active;
+};
+std::vector<ReadOverride> g_cOverride;
+uint8_t g_cOverridePages[65536] = {};
 
 struct CCallback {
   uint32_t lo, hi;
@@ -902,6 +1220,8 @@ static void resetAllCallbacks() {
   g_cExec.clear();
   g_cRead.clear();
   g_cWrite.clear();
+  g_cOverride.clear();
+  std::memset(g_cOverridePages, 0, sizeof(g_cOverridePages));
   std::memset(g_cExecPages,  0, sizeof(g_cExecPages));
   std::memset(g_cReadPages,  0, sizeof(g_cReadPages));
   std::memset(g_cWritePages, 0, sizeof(g_cWritePages));
@@ -1033,6 +1353,20 @@ void cOnWrite(uint32_t addr, uint8_t value) {
   }
   if(g_cWritePages[(addr & 0xffffff) >> 8] == 0) return;
   cFire(g_cWrite, addr, value);
+}
+
+bool cOnReadOverride(uint32_t addr, uint8_t openBus, uint8_t* out) {
+  if(g_cOverridePages[(addr & 0xffffff) >> 8] == 0) return false;
+  // By index, on a copy: an override may register another one.
+  for(size_t i = 0; i < g_cOverride.size(); i++) {
+    ReadOverride o = g_cOverride[i];
+    if(!o.active || addr < o.lo || addr > o.hi) continue;
+    int v = o.fn(addr, openBus, o.userdata);
+    if(v < 0 || v > 0xff) continue;
+    *out = (uint8_t)v;
+    return true;
+  }
+  return false;
 }
 
 auto pickList(int kind) -> std::vector<CCallback>* {
@@ -1175,6 +1509,27 @@ void kintsuki_remove_callback(kintsuki_t* h, int kind, int id) {
     if(kind == CB_READ  && !g_project) ares::SuperFamicom::memReadHook = nullptr;
     if(kind == CB_WRITE)               ares::SuperFamicom::memWriteHook = nullptr;
   }
+}
+
+int kintsuki_add_read_override(kintsuki_t* h, uint32_t lo, uint32_t hi,
+                               kintsuki_read_override_t fn, void* userdata) {
+  (void)h;
+  if(!fn) return 0;
+  g_cOverride.push_back({lo, hi, fn, userdata, true});
+  markCPages(g_cOverridePages, lo, hi, +1);
+  ares::SuperFamicom::memReadOverride = &cOnReadOverride;
+  return (int)g_cOverride.size();
+}
+
+void kintsuki_remove_read_override(kintsuki_t* h, int id) {
+  (void)h;
+  if(id < 1 || (size_t)id > g_cOverride.size()) return;
+  auto& o = g_cOverride[id - 1];
+  if(!o.active) return;
+  markCPages(g_cOverridePages, o.lo, o.hi, -1);
+  o.active = false;
+  for(auto& other : g_cOverride) if(other.active) return;
+  ares::SuperFamicom::memReadOverride = nullptr;
 }
 
 // ---- SPC700 execution debug: breakpoints / step / run-until / disasm ----
@@ -1617,17 +1972,49 @@ void kintsuki_callstack_clear(kintsuki_t* h) {
   clearShadowStacks();
 }
 
+int kintsuki_timeline_start(kintsuki_t* h, const char* path, uint32_t screenshot_every) {
+  if(!h || !path) return 0;
+  g_traceScreenshotEvery = screenshot_every;
+  traceCloseSlices();
+  if(!g_trace.open(path)) return 0;
+  g_traceNames.clear();
+  g_traceDepth = 0;
+  g_traceCpu = g_trace.track("65816");
+  g_traceFrames = g_trace.track("Frames");
+  g_traceOverruns = g_trace.track("Overruns");
+  g_traceVblank = g_trace.counterTrack("Vblank margin");
+  g_traceInVblank = false;
+  g_traceMarks = g_trace.track("Marks");
+  uint64_t dma = g_trace.track("DMA");
+  for(int i = 0; i < 8; i++) g_traceDma[i] = g_trace.track("DMA " + std::to_string(i), dma);
+  uint64_t hdma = g_trace.track("HDMA");
+  for(int i = 0; i < 8; i++) {
+    g_traceHdma[i] = g_trace.track("HDMA " + std::to_string(i), hdma);
+    g_traceHdmaRun[i] = {};
+  }
+  return 1;
+}
+
+void kintsuki_timeline_mark(kintsuki_t* h, const char* name) {
+  if(!h || !name) return;
+  g_trace.instant(g_traceMarks, traceNow(), name, {{"line", traceLine()}});
+}
+
+uint64_t kintsuki_timeline_stop(kintsuki_t* h) {
+  if(!h || !g_trace.active()) return 0;
+  traceCloseSlices();
+  for(uint8_t i = 0; i < 8; i++) traceHdmaClose(i);
+  uint64_t bytes = g_trace.bytes();
+  g_trace.close();
+  return bytes;
+}
+
 void kintsuki_profile_start(kintsuki_t* h, uint32_t lo, uint32_t hi) {
   if(!h) return;
   g_profileStats.clear();
   clearProfileFrames();
   g_profileLo = lo & 0xFFFFFF;
   g_profileHi = hi & 0xFFFFFF;
-  // Re-baseline the master-cycle widener. We don't reset the ares core
-  // counter (private, lives in the cpu Counter struct); instead we
-  // snapshot its current value as the new origin.
-  g_lastMasterCounter = ares::SuperFamicom::cpu.masterCycleCounter();
-  g_masterCounterBase = 0;
   g_profileActive = true;
   // Stack switches (TCS/TXS) are seen by the exec hook: keep it armed for
   // the profile window.
@@ -1783,14 +2170,19 @@ constexpr size_t kDmaLogCap = 64;
 DmaLogEntry g_dmaLog[kDmaLogCap] = {};
 size_t g_dmaLogSize = 0;
 
-void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
-               uint32_t src, uint8_t dst, uint16_t size) {
-  // Caller PC: top of the shadow callstack (the most recently entered
-  // routine), falling back to live cpu.r.pc.d if no JSR/JSL is on the
-  // stack yet (cold boot, IRQ context). 24-bit.
-  uint32_t callerPc = g_callstack.empty()
+// Caller PC: top of the shadow callstack (the most recently entered
+// routine), falling back to live cpu.r.pc.d if no JSR/JSL is on the
+// stack yet (cold boot, IRQ context). 24-bit.
+uint32_t currentRoutine() {
+  return g_callstack.empty()
     ? ((uint32_t)ares::SuperFamicom::cpu.r.pc.d & 0xFFFFFF)
     : (g_callstack.back().target_pc & 0xFFFFFF);
+}
+
+void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
+               uint32_t src, uint8_t dst, uint16_t size) {
+  uint32_t callerPc = currentRoutine();
+  traceDma(channel, src, dst, size, callerPc);
   // Project-file auto-classification: tag the ROM source range by the
   // destination PPU register class (graphics/palette/...) — no-op when
   // no project is open.
@@ -1853,7 +2245,8 @@ uint8_t g_hdmaCurrent[kHdmaScanlines] = {};
 uint8_t g_hdmaLatched[kHdmaScanlines] = {};
 uint64_t g_hdmaCurrentFrame = 0;
 
-void hdmaHookFn(uint8_t channel, uint16_t scanline, uint8_t /*dst*/) {
+void hdmaHookFn(uint8_t channel, uint16_t scanline, uint8_t dst) {
+  traceHdma(channel, scanline, dst);
   uint64_t frame = g_handle ? g_handle->program->framesRendered : 0;
   if(frame != g_hdmaCurrentFrame) {
     // Frame just rolled over — latch what we accumulated and clear.
@@ -1867,7 +2260,12 @@ void hdmaHookFn(uint8_t channel, uint16_t scanline, uint8_t /*dst*/) {
 }
 
 struct HdmaHookInstaller {
-  HdmaHookInstaller() { ares::SuperFamicom::kintsukiHdmaHook = &hdmaHookFn; }
+  HdmaHookInstaller() {
+    ares::SuperFamicom::kintsukiHdmaHook = &hdmaHookFn;
+    ares::SuperFamicom::kintsukiPpuDropHook = &tracePpuDrop;
+    ares::SuperFamicom::kintsukiPpuLandHook = &tracePpuLand;
+    ares::SuperFamicom::kintsukiVblankHook = &traceVblank;
+  }
 } g_hdmaHookInstaller;
 }
 
@@ -2038,6 +2436,52 @@ uint32_t kintsuki_sdd1_decompress(kintsuki_t* h, uint32_t bus_addr,
   for(uint32_t i = 0; i < size; i++) out[i] = (uint8_t)d->read();
   if(out_compressed_size) *out_compressed_size = d->im.position() - (bus_addr & 0xFFFFFF);
   return size;
+}
+
+// ---- VRAM map --------------------------------------------------------------
+// Per VRAM word: the layers the PPU fetched it for (ares ORs the bits into
+// g_vramReads), how many writes landed in it and the routine of the last one.
+namespace {
+constexpr size_t kVramWords = 0x10000;  // 128K with the VA15 mod; 64K uses the low half
+std::vector<uint16_t> g_vramReads;
+std::vector<uint32_t> g_vramWrites;
+std::vector<uint32_t> g_vramWriter;
+
+void vramWriteHookFn(uint16_t address) {
+  g_vramWrites[address]++;
+  g_vramWriter[address] = currentRoutine();
+}
+}
+
+void kintsuki_vram_map_clear(kintsuki_t* h) {
+  if(!h) return;
+  g_vramReads.assign(kVramWords, 0);
+  g_vramWrites.assign(kVramWords, 0);
+  g_vramWriter.assign(kVramWords, 0);
+}
+
+void kintsuki_vram_map_start(kintsuki_t* h) {
+  if(!h) return;
+  kintsuki_vram_map_clear(h);
+  ares::SuperFamicom::kintsukiVramReads = g_vramReads.data();
+  ares::SuperFamicom::kintsukiVramWriteHook = &vramWriteHookFn;
+}
+
+void kintsuki_vram_map_stop(kintsuki_t* h) {
+  if(!h) return;
+  ares::SuperFamicom::kintsukiVramReads = nullptr;
+  ares::SuperFamicom::kintsukiVramWriteHook = nullptr;
+}
+
+uint32_t kintsuki_vram_map_snapshot(kintsuki_t* h, uint16_t* reads, uint32_t* writes,
+                                    uint32_t* writers, uint32_t cap) {
+  if(!h || g_vramReads.empty()) return 0;
+  uint32_t words = (uint32_t)ares::SuperFamicom::ppuPerformanceImpl.vram.mask + 1;
+  uint32_t n = words < cap ? words : cap;
+  if(reads) std::copy_n(g_vramReads.begin(), n, reads);
+  if(writes) std::copy_n(g_vramWrites.begin(), n, writes);
+  if(writers) std::copy_n(g_vramWriter.begin(), n, writers);
+  return n;
 }
 
 // ---- PPU register write log --------------------------------------------

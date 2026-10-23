@@ -95,6 +95,10 @@ HANDLE = c_void_p
 # Callback signature: void (*)(uint32_t addr, uint8_t value, void* userdata)
 CALLBACK = CFUNCTYPE(None, c_uint32, c_uint8, c_void_p)
 
+# Read override: int (*)(uint32_t addr, uint8_t open_bus, void* userdata),
+# returning 0-255 to replace the read or -1 to pass through.
+READ_OVERRIDE = CFUNCTYPE(c_int, c_uint32, c_uint8, c_void_p)
+
 
 # Callback kind constants (must match libkintsuki.cpp).
 CB_EXEC = 0
@@ -190,6 +194,9 @@ class FnStatRaw(Structure):
     ]
 
 
+_bind("kintsuki_timeline_start",         c_int,    [HANDLE, c_char_p, c_uint32])
+_bind("kintsuki_timeline_mark",          None,     [HANDLE, c_char_p])
+_bind("kintsuki_timeline_stop",          c_uint64, [HANDLE])
 _bind("kintsuki_profile_start",       None,     [HANDLE, c_uint32, c_uint32])
 _bind("kintsuki_profile_stop",        None,     [HANDLE])
 _bind("kintsuki_profile_reset",       None,     [HANDLE])
@@ -262,6 +269,12 @@ _bind("kintsuki_ppu_writes_start",    None,     [HANDLE])
 _bind("kintsuki_ppu_writes_stop",     None,     [HANDLE])
 _bind("kintsuki_ppu_writes_count",    c_uint32, [HANDLE])
 _bind("kintsuki_ppu_writes_snapshot", c_uint32, [HANDLE, POINTER(PpuWriteRaw), c_uint32])
+
+_bind("kintsuki_vram_map_start",    None,     [HANDLE])
+_bind("kintsuki_vram_map_stop",     None,     [HANDLE])
+_bind("kintsuki_vram_map_clear",    None,     [HANDLE])
+_bind("kintsuki_vram_map_snapshot", c_uint32,
+      [HANDLE, POINTER(c_uint16), POINTER(c_uint32), POINTER(c_uint32), c_uint32])
 
 # .adbg label table.
 _bind("kintsuki_load_adbg",     c_int,    [HANDLE, c_char_p])
@@ -342,10 +355,12 @@ class PpuStateRaw(Structure):
         ("dma", DmaChannelRaw * 8),
         ("mdmaen", c_uint8),
         ("hdmaen", c_uint8),
+        ("obsel", c_uint8),
     ]
 
 
 _bind("kintsuki_get_ppu_state", None, [HANDLE, POINTER(PpuStateRaw)])
+_bind("kintsuki_ppu_ss_read", c_uint8, [HANDLE, c_uint8])
 
 # Tracer
 TRACE_RING = 0
@@ -422,6 +437,7 @@ _bind("kintsuki_spc_run_samples", c_uint32, [HANDLE, c_uint32])
 _bind("kintsuki_spc_get_state", None, [HANDLE, POINTER(SpcStateRaw)])
 _bind("kintsuki_spc_set_state", None, [HANDLE, POINTER(SpcStateRaw)])
 _bind("kintsuki_dsp_registers", c_uint32, [HANDLE, POINTER(c_uint8), c_uint32])
+_bind("kintsuki_dsp_write_register", None, [HANDLE, c_uint8, c_uint8])
 
 
 class SpcDisasmLine(Structure):
@@ -465,6 +481,8 @@ _bind("kintsuki_press", None, [HANDLE, c_int, c_int, c_int])
 # Callbacks
 _bind("kintsuki_add_callback", c_int, [HANDLE, c_int, c_uint32, c_uint32, CALLBACK, c_void_p])
 _bind("kintsuki_remove_callback", None, [HANDLE, c_int, c_int])
+_bind("kintsuki_add_read_override", c_int, [HANDLE, c_uint32, c_uint32, READ_OVERRIDE, c_void_p])
+_bind("kintsuki_remove_read_override", None, [HANDLE, c_int])
 
 
 # Project file (slice 1: map.bin classification).

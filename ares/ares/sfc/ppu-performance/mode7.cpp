@@ -44,7 +44,9 @@ auto PPU::Background::renderMode7() -> void {
     n16 tileAddress = tileY << 7 | tileX;
     n16 paletteAddress = (n3)pixelY << 3 | (n3)pixelX;
 
+    if(!(self.mode7.repeat == 3 && outOfBounds)) self.kintsukiRead(tileAddress, 1 << id);
     n8 tile = self.mode7.repeat == 3 && outOfBounds ? 0 : self.vram[tileAddress] >> 0;
+    if(!(self.mode7.repeat == 2 && outOfBounds)) self.kintsukiRead(tile << 6 | paletteAddress, 0x10 << id);
     n8 palette = self.mode7.repeat == 2 && outOfBounds ? 0 : self.vram[tile << 6 | paletteAddress] >> 8;
 
     n8 priority;

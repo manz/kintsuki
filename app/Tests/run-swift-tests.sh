@@ -26,3 +26,9 @@ swiftc -parse-as-library -o "$OUT/tile_sheet_test" \
     Tests/TileSheetTest.swift
 
 "$OUT/tile_sheet_test"
+
+swiftc -parse-as-library -o "$OUT/vram_map_test" \
+    Sources/Kintsuki/VRAMMap.swift \
+    Tests/VRAMMapTest.swift
+
+"$OUT/vram_map_test"

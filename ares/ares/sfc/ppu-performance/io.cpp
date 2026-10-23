@@ -16,6 +16,21 @@ alwaysinline auto PPU::addressVRAM() const -> n16 {
   unreachable;
 }
 
+// kintsuki: ring the host when a data-port write is dropped mid-display,
+// and when one lands in vblank with the screen on (the vblank margin).
+typedef void (*KintsukiPpuDropHook)(uint8_t port);
+extern KintsukiPpuDropHook kintsukiPpuDropHook;
+static inline auto kintsukiPpuDrop(uint8_t port) -> void {
+  if(kintsukiPpuDropHook) kintsukiPpuDropHook(port);
+}
+typedef void (*KintsukiVramWriteHook)(uint16_t address);
+extern KintsukiVramWriteHook kintsukiVramWriteHook;
+typedef void (*KintsukiPpuLandHook)(uint8_t port);
+extern KintsukiPpuLandHook kintsukiPpuLandHook;
+static inline auto kintsukiPpuLand(uint8_t port) -> void {
+  if(kintsukiPpuLandHook) kintsukiPpuLandHook(port);
+}
+
 alwaysinline auto PPU::readVRAM() -> n16 {
   if(!io.displayDisable && cpu.vcounter() < vdisp()) return 0x0000;
   auto address = addressVRAM();
@@ -23,8 +38,10 @@ alwaysinline auto PPU::readVRAM() -> n16 {
 }
 
 alwaysinline auto PPU::writeVRAM(n1 byte, n8 data) -> void {
-  if(!io.displayDisable && cpu.vcounter() < vdisp()) return;
+  if(!io.displayDisable && cpu.vcounter() < vdisp()) return kintsukiPpuDrop(0x18);
+  if(!io.displayDisable) kintsukiPpuLand(0x18);
   auto address = addressVRAM();
+  if(kintsukiVramWriteHook) kintsukiVramWriteHook(address & vram.mask);
   vram[address].byte(byte) = data;
 }
 
@@ -34,7 +51,8 @@ alwaysinline auto PPU::readOAM(n10 address) -> n8 {
 }
 
 alwaysinline auto PPU::writeOAM(n10 address, n8 data) -> void {
-  if(!io.displayDisable && cpu.vcounter() < vdisp()) address = 0x0218;
+  if(!io.displayDisable && cpu.vcounter() < vdisp()) address = 0x0218, kintsukiPpuDrop(0x04);
+  else if(!io.displayDisable) kintsukiPpuLand(0x04);
   return obj.oam.write(address, data);
 }
 
@@ -50,7 +68,7 @@ alwaysinline auto PPU::writeCGRAM(n8 address, n15 data) -> void {
   if(!io.displayDisable
   && cpu.vcounter() > 0 && cpu.vcounter() < vdisp()
   && cpu.hcounter() >= 88 && cpu.hcounter() < 1096
-  ) address = latch.cgramAddress;
+  ) address = latch.cgramAddress, kintsukiPpuDrop(0x22);
   dac.cgram[address] = data;
 }
 
