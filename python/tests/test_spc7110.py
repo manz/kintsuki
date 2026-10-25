@@ -7,15 +7,18 @@ into $7E:2000, then through the $D0 window into $7E:2004, then STPs.
 
 from __future__ import annotations
 
+import shutil
 import subprocess
 import sys
 import textwrap
+from pathlib import Path
 
 import pytest
 
 from kintsuki import Emu
 
 MARKER = bytes([0xD5, 0x7A, 0x11, 0xC0])
+SRAM_SIZE = 8 * 1024
 PORT_COPY = 0x7E2000
 WINDOW_COPY = 0x7E2004
 CART_TYPE_OFFSET = 0xFFD6
@@ -49,6 +52,27 @@ def test_spc7110_data_port_reads_data_rom(spc7110_emu):
 def test_spc7110_d0_window_reads_data_rom(spc7110_emu):
     assert _run_until_stp(spc7110_emu)
     assert bytes(spc7110_emu.read_range(WINDOW_COPY, 4)) == MARKER
+
+
+# The save RAM lives in the SPC7110, not cartridge.ram.
+
+def test_spc7110_read_sram_sees_the_mcu_ram(spc7110_emu):
+    assert len(spc7110_emu.read_sram()) == SRAM_SIZE
+
+
+def test_spc7110_inject_sram_reaches_the_mcu_ram(spc7110_emu):
+    save = bytes(range(256)) * (SRAM_SIZE // 256)
+    spc7110_emu.inject_sram(save)
+    assert spc7110_emu.read_sram() == save
+
+
+def test_spc7110_sav_sidecar_seeds_the_mcu_ram(assemble_rom, tmp_path: Path):
+    rom = tmp_path / "spc7110.sfc"
+    shutil.copy(assemble_rom("test_spc7110.s"), rom)
+    (tmp_path / "spc7110.sav").write_bytes(b"\x5A" * SRAM_SIZE)
+    with Emu(load_srm_sidecar=True) as emu:
+        emu.load_rom(str(rom))
+        assert emu.read_sram() == b"\x5A" * SRAM_SIZE
 
 
 def test_swapping_carts_with_and_without_rtc_keeps_running(assemble_rom, tmp_path):

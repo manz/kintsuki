@@ -103,9 +103,9 @@ struct KintsukiApp: App {
                 }
                 .disabled(emulator.recentROMs.isEmpty)
                 Divider()
-                Button("Load Save File (.srm)…") { loadSRMViaPanel() }
+                Button("Load Save File (.srm, .sav)…") { loadSRMViaPanel() }
                     .disabled(emulator.loadedROM == nil)
-                Button("Export Save File (.srm)…") { exportSRMViaPanel() }
+                Button("Export Save File (.srm, .sav)…") { exportSRMViaPanel() }
                     .disabled(emulator.loadedROM == nil)
                 Divider()
                 Button("Open Crash Dump…") { openCrashDumpViaPanel() }
@@ -313,7 +313,7 @@ struct KintsukiApp: App {
         panel.allowsMultipleSelection = false
         panel.canChooseDirectories = false
         panel.canChooseFiles = true
-        panel.message = "Select a cart save (.srm)"
+        panel.message = "Select a cart save (.srm, .sav)"
         panel.prompt = "Inject"
         if panel.runModal() == .OK, let url = panel.url {
             let ok = emulator.loadSRM(url: url)
