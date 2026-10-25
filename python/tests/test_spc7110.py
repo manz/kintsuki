@@ -7,6 +7,10 @@ into $7E:2000, then through the $D0 window into $7E:2004, then STPs.
 
 from __future__ import annotations
 
+import subprocess
+import sys
+import textwrap
+
 import pytest
 
 from kintsuki import Emu
@@ -14,6 +18,7 @@ from kintsuki import Emu
 MARKER = bytes([0xD5, 0x7A, 0x11, 0xC0])
 PORT_COPY = 0x7E2000
 WINDOW_COPY = 0x7E2004
+CART_TYPE_OFFSET = 0xFFD6
 
 
 def _run_until_stp(emu: Emu, max_frames: int = 30) -> bool:
@@ -44,3 +49,30 @@ def test_spc7110_data_port_reads_data_rom(spc7110_emu):
 def test_spc7110_d0_window_reads_data_rom(spc7110_emu):
     assert _run_until_stp(spc7110_emu)
     assert bytes(spc7110_emu.read_range(WINDOW_COPY, 4)) == MARKER
+
+
+def test_swapping_carts_with_and_without_rtc_keeps_running(assemble_rom, tmp_path):
+    """Every load powers the system twice (power, then reset), and each
+    Thread::create queued an entry point that only the first entry consumed.
+    The leftover named a coroutine handle libco later reused for another
+    chip, so a fresh EpsonRTC or SPC7110 thread ran the wrong main and the
+    CPU spun forever waiting for its clock. Runs in a child process: a
+    regression hangs instead of failing."""
+    image = bytearray(assemble_rom("test_spc7110.s").read_bytes())
+    roms = []
+    for cart_type in (0xF5, 0xF9):  # SPC7110, SPC7110 + Epson RTC
+        image[CART_TYPE_OFFSET] = cart_type
+        path = tmp_path / f"spc7110-{cart_type:x}.sfc"
+        path.write_bytes(image)
+        roms.append(str(path))
+    child = textwrap.dedent(
+        f"""
+        from kintsuki import Emu
+        for _ in range(20):
+            for rom in {roms!r}:
+                with Emu(load_srm_sidecar=False) as emu:
+                    emu.load_rom(rom)
+                    emu.run_frames(3)
+        """
+    )
+    subprocess.run([sys.executable, "-c", child], check=True, timeout=60)

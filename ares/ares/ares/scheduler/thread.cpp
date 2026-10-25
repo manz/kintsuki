@@ -51,6 +51,10 @@ inline auto Thread::create(double frequency, std::function<void ()> entryPoint) 
   } else {
     co_derive(_handle, Thread::Size, &Thread::Enter);
   }
+  //kintsuki: a power then reset creates the thread twice and Enter consumes
+  //one entry; drop the stale one, or a later thread handed the same handle
+  //by libco would run this thread's entry point.
+  std::erase_if(EntryPoints(), [&](auto& entry) { return entry.handle == _handle; });
   EntryPoints().push_back({_handle, entryPoint});
   setFrequency(frequency);
   setClock(0);
@@ -65,6 +69,8 @@ inline auto Thread::restart(std::function<void()> entryPoint) -> void {
 
 inline auto Thread::destroy() -> void {
   scheduler.remove(*this);
+  //kintsuki: an entry point the coroutine never entered outlives it otherwise.
+  std::erase_if(EntryPoints(), [&](auto& entry) { return entry.handle == _handle; });
   if(_handle) co_delete(_handle);
   _handle = nullptr;
 }
