@@ -301,7 +301,7 @@ auto Program::loadRom(const char* path) -> bool {
   cartPak->setAttribute("board",  string{info.board.c_str()});
   attachFile(cartPak, "manifest.bml", std::vector<uint8_t>(m.begin(), m.end()));
 
-  // Seed save.ram from a `.srm` sidecar if one exists next to the ROM,
+  // Seed save.ram from a `.srm` or `.sav` sidecar next to the ROM if any,
   // otherwise zero-fill. ares' loadMap binds a reader function pointing
   // into cart.ram.data(); if ram was never allocated (no save.ram in
   // pak), the first SRAM access dereferences null and crashes - happens
@@ -335,9 +335,11 @@ auto Program::loadRom(const char* path) -> bool {
                      srmPath.c_str(), srm.size());
         return true;
       };
-      if(!trySrm(p + ".srm")) {
-        auto dot = p.find_last_of('.');
-        if(dot != std::string::npos) trySrm(p.substr(0, dot) + ".srm");
+      // `.sav` is the Analogue Pocket (openfpga) name for the same raw dump.
+      auto dot = p.find_last_of('.');
+      for(auto ext : {".srm", ".sav"}) {
+        if(trySrm(p + ext)) break;
+        if(dot != std::string::npos && trySrm(p.substr(0, dot) + ext)) break;
       }
     }
     attachFile(cartPak, "save.ram", std::move(ram));
@@ -539,10 +541,24 @@ auto Program::fitSram(const u8* data, u32 len, u32 cap, std::vector<u8>& out,
   return false;
 }
 
+// The battery-backed RAM the cart's save file holds. Plain boards keep it in
+// cartridge.ram; coprocessor boards (SPC7110, SA-1, ...) load the same
+// save.ram into the chip's own buffer and leave cartridge.ram empty.
+static auto cartSaveRam() -> SuperFamicom::WritableMemory& {
+  using namespace SuperFamicom;
+  if(cartridge.ram.size()) return cartridge.ram;
+  if(cartridge.has.SA1) return sa1.bwram;
+  if(cartridge.has.SuperFX) return superfx.ram;
+  if(cartridge.has.HitachiDSP) return hitachidsp.ram;
+  if(cartridge.has.SPC7110) return spc7110.ram;
+  if(cartridge.has.OBC1) return obc1.ram;
+  return cartridge.ram;
+}
+
 auto Program::injectSram(const u8* data, u32 len) -> u32 {
   lastError.clear();
   if(!loaded || !data) return 0;
-  auto& ram = SuperFamicom::cartridge.ram;
+  auto& ram = cartSaveRam();
   u32 cap = (u32)ram.size();
   if(cap == 0) { lastError = "inject_sram: the cart has no SRAM"; return 0; }
   std::vector<u8> fitted;
@@ -553,7 +569,7 @@ auto Program::injectSram(const u8* data, u32 len) -> u32 {
 
 auto Program::readSram(u8* out, u32 cap) -> u32 {
   if(!loaded) return 0;
-  auto& ram = SuperFamicom::cartridge.ram;
+  auto& ram = cartSaveRam();
   u32 size = (u32)ram.size();
   if(out) std::memcpy(out, ram.data(), size < cap ? size : cap);
   return size;

@@ -154,6 +154,25 @@ def test_a_mismatched_sidecar_loads_under_fit(rom8: Path, tmp_path: Path) -> Non
         assert _sram_of(emu) == b"\x66" * (2 * KB) + bytes(6 * KB)
 
 
+def test_a_sav_sidecar_seeds_sram(rom8: Path, tmp_path: Path) -> None:
+    rom = tmp_path / "sram8.sfc"
+    shutil.copy(rom8, rom)
+    (tmp_path / "sram8.sav").write_bytes(b"\x77" * (8 * KB))
+    with Emu(load_srm_sidecar=True) as emu:
+        emu.load_rom(str(rom))
+        assert _sram_of(emu) == b"\x77" * (8 * KB)
+
+
+def test_an_srm_sidecar_wins_over_a_sav(rom8: Path, tmp_path: Path) -> None:
+    rom = tmp_path / "sram8.sfc"
+    shutil.copy(rom8, rom)
+    (tmp_path / "sram8.srm").write_bytes(b"\x66" * (8 * KB))
+    (tmp_path / "sram8.sav").write_bytes(b"\x77" * (8 * KB))
+    with Emu(load_srm_sidecar=True) as emu:
+        emu.load_rom(str(rom))
+        assert _sram_of(emu) == b"\x66" * (8 * KB)
+
+
 # --- read_sram -----------------------------------------------------------------
 
 def test_read_sram_returns_what_was_injected(rom8: Path) -> None:
