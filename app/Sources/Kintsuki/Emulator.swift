@@ -37,11 +37,29 @@ final class Emulator {
             UserDefaults.standard.set(ppuAccurate, forKey: ppuAccurateKey)
             guard let h = handle else { return }
             kintsuki_set_ppu_accurate(h, ppuAccurate ? 1 : 0)
+            if suppressPpuAccurateReload { return }
             // Apply mid-session by re-entering bootRom. Skip when no ROM
             // is loaded yet, since the setting takes effect on the first load.
             if loadedROM != nil {
                 hotReloadKeepingState()
             }
+        }
+    }
+    /// When true, didSet on ppuAccurate updates persistence + native but
+    /// skips the hot-reload. Used after kintsuki_load_state cross-mode
+    /// swaps, where the native impl is already in sync.
+    private var suppressPpuAccurateReload: Bool = false
+
+    /// Pull the native PPU-accurate flag into the Swift binding without
+    /// triggering a hot-reload. Called after loadState in case the state
+    /// was recorded under a different mode and native auto-swapped.
+    func syncPpuAccurateFromNative() {
+        guard let h = handle else { return }
+        let nativeAccurate = kintsuki_ppu_accurate(h) != 0
+        if nativeAccurate != ppuAccurate {
+            suppressPpuAccurateReload = true
+            ppuAccurate = nativeAccurate
+            suppressPpuAccurateReload = false
         }
     }
     private let recentsLimit = 10
@@ -2101,6 +2119,7 @@ final class Emulator {
             kintsuki_load_state(h, raw.baseAddress, UInt32(entry.blob.count))
         }
         guard ok != 0 else { return }
+        syncPpuAccurateFromNative()
         // ares serializes r.stp/r.wai + register file but not the libco
         // coroutine RIP. Without rearming, the next scheduler tick wakes
         // the coroutine inside whatever wait loop it happened to suspend
@@ -2303,6 +2322,7 @@ final class Emulator {
         if loaded == 0 {
             NSLog("kintsuki: hot-reload load_state rejected blob — booting cold")
         } else {
+            syncPpuAccurateFromNative()
             kintsuki_rearm_cpu(h)
         }
         snapshotFramebuffer()
@@ -2346,6 +2366,7 @@ final class Emulator {
             NSLog("kintsuki: importState rejected blob from \(url.path)")
             return false
         }
+        syncPpuAccurateFromNative()
         kintsuki_rearm_cpu(h)
         kintsuki_run_frames(h, 1)
         snapshotFramebuffer()
@@ -2885,7 +2906,7 @@ final class Emulator {
             let ok = lastBlob.withUnsafeBytes { raw -> Int32 in
                 kintsuki_load_state(h, raw.baseAddress, UInt32(lastBlob.count))
             }
-            if ok != 0 { kintsuki_rearm_cpu(h); kintsuki_run_frames(h, 1) }
+            if ok != 0 { syncPpuAccurateFromNative(); kintsuki_rearm_cpu(h); kintsuki_run_frames(h, 1) }
         }
         recoveryMode = true
         running = false

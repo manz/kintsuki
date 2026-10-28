@@ -857,20 +857,50 @@ auto unserializeState(Program& program, serializer& s) -> bool {
   return true;
 }
 
+// Peek the ppuAccurate flag the blob was saved under. Mirrors the ares
+// System::unserialize prefix (signature, synchronize, version, description,
+// ppuAcc). Returns false if the blob is too short or looks malformed.
+auto peekSavedPpuAccurate(const uint8_t* data, u32 size, bool& out) -> bool {
+  if(!data || size < 4 + 1 + 16 + 512 + 1) return false;
+  serializer s(data, size);
+  u32  sig = 0;
+  bool sync = true;
+  char ver[16] = {};
+  char desc[512] = {};
+  bool ppuAcc = false;
+  s(sig);
+  s(sync);
+  s(ver);
+  s(desc);
+  s(ppuAcc);
+  if(sig != ares::SerializerSignature) return false;
+  out = ppuAcc;
+  return true;
+}
+
 }  // anonymous namespace
 
 auto Program::cpuClockSkew() const -> s64 {
   // Both threads count master cycles in the same scaled units; the counters
   // place each one in the frame. Lines are taken as 1364 cycles (240 can be
-  // 4 short, hence SkewTolerance).
+  // 4 short, hence SkewTolerance). Pick whichever impl is currently driving
+  // the scheduler; the other impl's clock is frozen at the last mode swap.
   auto& cpu = SuperFamicom::cpu;
-  auto& ppu = SuperFamicom::ppuPerformanceImpl;
   s64 scalar = (s64)cpu.scalar();
-  s64 clocks = ((s64)(cpu.clock() - ppu.clock())) / scalar;
+  s64 ppuClock = SuperFamicom::ppu.accurate
+    ? (s64)SuperFamicom::ppuImpl.clock()
+    : (s64)SuperFamicom::ppuPerformanceImpl.clock();
+  s64 ppuV = SuperFamicom::ppu.accurate
+    ? (s64)SuperFamicom::ppuImpl.vcounter()
+    : (s64)SuperFamicom::ppuPerformanceImpl.vcounter();
+  s64 ppuH = SuperFamicom::ppu.accurate
+    ? (s64)SuperFamicom::ppuImpl.hcounter()
+    : (s64)SuperFamicom::ppuPerformanceImpl.hcounter();
+  s64 clocks = ((s64)cpu.clock() - ppuClock) / scalar;
   s64 line = 1364;
   s64 frame = line * (SuperFamicom::Region::PAL() ? 312 : 262);
-  s64 position = ((s64)cpu.vcounter() - (s64)ppu.vcounter()) * line
-               + (s64)cpu.hcounter() - (s64)ppu.hcounter();
+  s64 position = ((s64)cpu.vcounter() - ppuV) * line
+               + (s64)cpu.hcounter() - ppuH;
   if(position > frame / 2) position -= frame;
   if(position < -frame / 2) position += frame;
   return clocks - position;
@@ -926,6 +956,21 @@ auto Program::loadStateBlob(const uint8_t* data, u32 size) -> bool {
   // why) or fit the region under sramPolicy. A blob without a footer can't be
   // checked; it loads as before.
   lastError.clear();
+  // Cross-mode compat: ares' System::unserialize refuses when the saved
+  // ppuAcc differs from the live impl (different struct layouts past that
+  // point). Peek the saved flag and swap PPU impl + rebuild the system
+  // before deserializing, so a state saved in one mode loads in the other
+  // without the user having to toggle manually.
+  if(loaded) {
+    bool savedAcc = false;
+    if(peekSavedPpuAccurate(data, size, savedAcc) && savedAcc != ppuAccurate) {
+      ppuAccurate = savedAcc;
+      if(!bootRom()) {
+        lastError = "load_state: failed to swap PPU mode to match the state";
+        return false;
+      }
+    }
+  }
   auto footer = parseKssfFooter(data, size);
   u32 cartSram = (u32)SuperFamicom::cartridge.ram.size();
   if(footer.valid && footer.cartSram.present && footer.cartSram.length != cartSram) {
@@ -998,6 +1043,14 @@ auto Program::loadStateBlobEx(const uint8_t* data, u32 size,
 
   // Non-inject path: drive ares unserialize. STRICT and REMAP need
   // producer/cart sram comparison.
+  // Cross-mode compat: swap PPU impl before unserialize when the blob was
+  // saved in the other mode. Same reason as loadStateBlob; bootRom
+  // re-powers the system, then unserialize restores every CPU/PPU field.
+  bool savedAcc = false;
+  if(peekSavedPpuAccurate(data, size, savedAcc) && savedAcc != ppuAccurate) {
+    ppuAccurate = savedAcc;
+    if(!bootRom()) return 0;
+  }
   bool sizeMismatch = (producerSram != 0 && producerSram != cartSram);
 
   if(flags & FLAG_STRICT) {
