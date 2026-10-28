@@ -30,6 +30,8 @@ extern KintsukiPpuLandHook kintsukiPpuLandHook;
 static inline auto kintsukiPpuLand(uint8_t port) -> void {
   if(kintsukiPpuLandHook) kintsukiPpuLandHook(port);
 }
+// Shadow mirror: kintsuki's host-side IO shadow for impl-agnostic readout.
+extern "C" void kintsuki_ppu_shadow_write(uint32_t address, uint8_t data);
 
 alwaysinline auto PPU::readVRAM() -> n16 {
   if(!io.displayDisable && cpu.vcounter() < vdisp()) return 0x0000;
@@ -198,6 +200,7 @@ auto PPU::readIO(n24 address, n8 data) -> n8 {
 
 auto PPU::writeIO(n24 address, n8 data) -> void {
   cpu.synchronize(ppu);
+  kintsuki_ppu_shadow_write(address, (uint8_t)data);
 
   switch((n16)address) {
 

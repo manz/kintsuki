@@ -6,6 +6,9 @@ extern "C" typedef void (*KintsukiVramWriteHook)(uint32_t wordAddr);
 extern KintsukiPpuDropHook kintsukiPpuDropHook;
 extern KintsukiPpuLandHook kintsukiPpuLandHook;
 extern KintsukiVramWriteHook kintsukiVramWriteHook;
+// Shadow mirror: kintsuki's host-side IO shadow for impl-agnostic readout.
+// Fires on every $21xx write, before the real impl mutates anything.
+extern "C" void kintsuki_ppu_shadow_write(uint32_t address, uint8_t data);
 static inline auto kintsukiPpuDrop(uint8_t port) -> void {
   if(kintsukiPpuDropHook) kintsukiPpuDropHook(port);
 }
@@ -206,6 +209,7 @@ auto PPU::readIO(n24 address, n8 data) -> n8 {
 
 auto PPU::writeIO(n24 address, n8 data) -> void {
   cpu.synchronize(ppu);
+  kintsuki_ppu_shadow_write(address, (uint8_t)data);
 
   switch((n16)address) {
 
