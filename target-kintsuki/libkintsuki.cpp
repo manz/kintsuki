@@ -575,6 +575,17 @@ uint32_t kintsuki_vram_size(kintsuki_t* h) {
   return h->program->vramSizeBytes;
 }
 
+int kintsuki_set_ppu_accurate(kintsuki_t* h, int enable) {
+  if(!h) return 0;
+  h->program->ppuAccurate = (enable != 0);
+  return 1;
+}
+
+int kintsuki_ppu_accurate(kintsuki_t* h) {
+  if(!h) return 0;
+  return h->program->ppuAccurate ? 1 : 0;
+}
+
 int kintsuki_set_sram_policy(kintsuki_t* h, uint32_t policy) {
   if(!h || policy > KINTSUKI_SRAM_CLEAR) return 0;
   h->program->sramPolicy = policy;

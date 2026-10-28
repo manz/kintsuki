@@ -367,9 +367,22 @@ auto Program::loadRom(const char* path) -> bool {
 }
 
 auto Program::bootRom() -> bool {
+  // Tear down any previously loaded system BEFORE flipping the PPU
+  // implementation. SuperFamicom::load auto-unloads a prior session, but
+  // through whatever ppu.implementation points at *now*; swapping that
+  // out first would make unload() target the wrong impl and leak the
+  // previous one's Thread + screen Node (the old impl stays attached to
+  // the scheduler and crashes on the next tick).
+  if(loaded) {
+    SuperFamicom::system.unload();
+    loaded = false;
+  }
   // Performance PPU works fine — the earlier "no pixels" symptom was the
   // missing port.allocate/connect call (see below), not a PPU choice.
-  SuperFamicom::ppu.setAccurate(false);
+  // When ppuAccurate is on, route rendering through the cycle-accurate
+  // implementation; kintsuki's debug surfaces still read performance
+  // impl state and will go stale (documented at the field).
+  SuperFamicom::ppu.setAccurate(ppuAccurate);
 
   Node::System root;
   string profile = "[Nintendo] Super Famicom (NTSC)";
@@ -395,8 +408,13 @@ auto Program::bootRom() -> bool {
   }
 
   // PPU::power() latches vram.mask from this setting, so it has to be set
-  // between load() (which creates the node) and the first power().
-  SuperFamicom::ppuPerformanceImpl.vramSize->setValue(vramSizeBytes);
+  // between load() (which creates the node) and the first power(). Both
+  // impls expose the VRAM setting node; set on whichever one is active.
+  if(ppuAccurate) {
+    SuperFamicom::ppuImpl.vramSize->setValue(vramSizeBytes);
+  } else {
+    SuperFamicom::ppuPerformanceImpl.vramSize->setValue(vramSizeBytes);
+  }
 
   SuperFamicom::system.power(false);
   loaded = true;

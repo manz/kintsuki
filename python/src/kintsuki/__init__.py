@@ -413,7 +413,8 @@ class Emu:
     def __init__(self, *, load_srm_sidecar: bool | None = None,
                  load_bps_sidecar: bool = False,
                  vram_size: int = VRAM_BYTES,
-                 sram_policy: str = "error") -> None:
+                 sram_policy: str = "error",
+                 ppu_accurate: bool = False) -> None:
         # kintsuki runs one emulator per process (a single native handle). An
         # Emu still open would share it, then destroy it from its finaliser at
         # some later point - possibly under this one, at a reused address.
@@ -439,6 +440,7 @@ class Emu:
         _native.lib.kintsuki_set_bps_sidecar(self._handle, 1 if load_bps_sidecar else 0)
         self.set_vram_size(vram_size)
         self.sram_policy = sram_policy
+        self.ppu_accurate = ppu_accurate
 
     @property
     def sram_policy(self) -> str:
@@ -473,6 +475,22 @@ class Emu:
             raise ValueError(
                 f"vram_size must be {VRAM_BYTES} or {VRAM_BYTES_VA15}, got {size}"
             )
+
+    @property
+    def ppu_accurate(self) -> bool:
+        """Which ares PPU implementation renders frames. ``False`` (default)
+        uses ppu-performance, ares' fast scanline renderer; ``True`` routes
+        rendering through the cycle-accurate PPU on the next :meth:`load_rom`.
+        kintsuki's debug tooling (VRAM/CGRAM/OAM state, span tracer, hires
+        probe) stays anchored to the performance impl and reads stale state
+        while accurate mode is on; this toggle changes the rendered picture,
+        not the debug surfaces. Save states tag the active PPU and the ares
+        serializer refuses cross-mode restores."""
+        return bool(_native.lib.kintsuki_ppu_accurate(self._handle))
+
+    @ppu_accurate.setter
+    def ppu_accurate(self, enable: bool) -> None:
+        _native.lib.kintsuki_set_ppu_accurate(self._handle, 1 if enable else 0)
 
     @property
     def vram_size(self) -> int:

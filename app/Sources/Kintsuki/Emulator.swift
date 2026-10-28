@@ -21,6 +21,29 @@ final class Emulator {
             audioOutput?.setMuted(muted)
         }
     }
+    private let ppuAccurateKey = "kintsuki.ppuAccurate"
+    /// Which ares PPU implementation renders frames. False (default) uses
+    /// ppu-performance; true routes rendering through the cycle-accurate
+    /// PPU. Latched at bootRom() time; flipping while a ROM is loaded
+    /// triggers an automatic hot-reload-keeping-state so the new impl
+    /// kicks in without the user doing anything. The pre-flip save state
+    /// is tagged with the old mode, so ares' serializer will refuse to
+    /// restore it onto the new impl; the ROM boots cold in that case
+    /// (logged, see hotReloadKeepingState). Debug surfaces stay anchored
+    /// to ppu-performance regardless of this setting.
+    var ppuAccurate: Bool = UserDefaults.standard.bool(forKey: "kintsuki.ppuAccurate") {
+        didSet {
+            guard ppuAccurate != oldValue else { return }
+            UserDefaults.standard.set(ppuAccurate, forKey: ppuAccurateKey)
+            guard let h = handle else { return }
+            kintsuki_set_ppu_accurate(h, ppuAccurate ? 1 : 0)
+            // Apply mid-session by re-entering bootRom. Skip when no ROM
+            // is loaded yet, since the setting takes effect on the first load.
+            if loadedROM != nil {
+                hotReloadKeepingState()
+            }
+        }
+    }
     private let recentsLimit = 10
     private(set) var lastFrameID: UInt64 = 0
     private(set) var fps: Double = 0
@@ -579,6 +602,10 @@ final class Emulator {
             // The app applies a `<rom>.bps` sidecar; the library default
             // (and Python) leaves it off unless asked.
             kintsuki_set_bps_sidecar(h, 1)
+            // Seed the ppu-accurate choice from the persisted preference
+            // before the first auto-load, so bootRom() latches the right
+            // impl without needing a reload.
+            kintsuki_set_ppu_accurate(h, ppuAccurate ? 1 : 0)
             let out = AudioOutput(handle: h)
             out.setMuted(muted)
             audioOutput = out
