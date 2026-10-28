@@ -43,12 +43,24 @@ struct PPUBase {
 
 extern PPUBase ppu;
 
+// kintsuki: the host's VRAM read map, mirrored into the accurate PPU so
+// a tile-use bitmap can be filled when the user runs with this impl. The
+// global itself is declared by ppu-performance (same binary); using the
+// extern here keeps a single owner, same storage, both impls OR into it.
+extern uint16_t* kintsukiVramReads;
+
 struct PPU : PPUBase::Implementation, PPUcounter {
   Node::Object node;
   Node::Setting::Natural versionPPU1;
   Node::Setting::Natural versionPPU2;
   Node::Setting::Natural vramSize;
   Node::Setting::Boolean deepBlackBoost;
+
+  // kintsuki: same hook as the perf impl, tags a word in the host's
+  // VRAM-read bitmap when any part of the PPU reads from `address`.
+  alwaysinline auto kintsukiRead(u32 address, u16 bit) -> void {
+    if(kintsukiVramReads) kintsukiVramReads[address & vram.mask] |= bit;
+  }
 
   struct Debugger {
     PPU& self;

@@ -89,6 +89,7 @@ auto PPU::Background::fetchNameTable() -> void {
   if(vtile & 0x20) offset += vscreen;
 
   n16 address = io.screenAddress + offset;
+  self.kintsukiRead(address, 1 << id);
   n16 attributes = vram[address];
 
   auto& tile = tiles[nameTableIndex];
@@ -153,6 +154,7 @@ auto PPU::Background::fetchCharacter(u32 index, bool half) -> void {
   u32 characterIndex = (self.hcounter() >> 5 << hires()) + half;
 
   auto& tile = tiles[characterIndex];
+  self.kintsukiRead(tile.address + (index << 3), 0x10 << id);
   n16 data = vram[tile.address + (index << 3)];
 
   //reverse bits so that the lowest bit is the left-most pixel
