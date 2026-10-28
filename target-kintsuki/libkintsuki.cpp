@@ -9,6 +9,7 @@
 #include "adbg.hpp"
 #include "project.hpp"
 #include "perfetto.hpp"
+#include "ppu_facade.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -331,23 +332,24 @@ void traceCloseSlices() {
 // "CGRAM $10" (CGADD), "OAM $000" (OAMADD), else its B-bus register.
 void traceDma(uint8_t channel, uint32_t src, uint8_t dst, uint16_t size, uint32_t caller) {
   if(!g_trace.active() || channel >= 8) return;
-  auto& ppu = ares::SuperFamicom::ppuPerformanceImpl;
   uint64_t master = profileMasterCycles();
   uint32_t bytes = size ? size : 0x10000;
   std::vector<kintsuki::TraceArg> args{{"src", src}, {"bytes", bytes}, {"line", traceLine()}, {"caller", caller}};
   char name[24];
   if(dst == 0x18 || dst == 0x19 || dst == 0x39 || dst == 0x3A) {
-    uint32_t vmain = ppu.vram.mode << 7 | ppu.vram.mapping << 2
-                   | (ppu.vram.increment == 1 ? 0 : ppu.vram.increment == 32 ? 1 : 2);
-    std::snprintf(name, sizeof name, "VRAM $%04X", (unsigned)ppu.vram.address);
-    args.push_back({"vram", (uint64_t)ppu.vram.address});
+    uint32_t vmain = kintsuki::ppu::vmainByte();
+    uint16_t addr = kintsuki::ppu::vramAddress();
+    std::snprintf(name, sizeof name, "VRAM $%04X", (unsigned)addr);
+    args.push_back({"vram", (uint64_t)addr});
     args.push_back({"vmain", vmain});
   } else if(dst == 0x22 || dst == 0x3B) {
-    std::snprintf(name, sizeof name, "CGRAM $%02X", (unsigned)ppu.io.cgramAddress);
-    args.push_back({"cg", (uint64_t)ppu.io.cgramAddress});
+    uint8_t cg = kintsuki::ppu::cgramAddress();
+    std::snprintf(name, sizeof name, "CGRAM $%02X", (unsigned)cg);
+    args.push_back({"cg", (uint64_t)cg});
   } else if(dst == 0x04 || dst == 0x38) {
-    std::snprintf(name, sizeof name, "OAM $%03X", (unsigned)ppu.io.oamAddress);
-    args.push_back({"oam", (uint64_t)ppu.io.oamAddress});
+    uint16_t oam = kintsuki::ppu::oamAddress();
+    std::snprintf(name, sizeof name, "OAM $%03X", (unsigned)oam);
+    args.push_back({"oam", (uint64_t)oam});
   } else {
     std::snprintf(name, sizeof name, "$21%02X", dst);
   }
@@ -761,6 +763,12 @@ void kintsuki_set_state(kintsuki_t* h, const kintsuki_cpu_state_t* in) {
 // Savestate readback of the PPU's write-only registers, as the MiSTer core's
 // PPU.vhd answers it on $C1:21xx (SS_A). $40-$41 are COLDATA green/red and
 // $4D-$61 the high bytes of the two-write registers at $0D-$21.
+//
+// Still reads from the performance impl directly: the field set here spans
+// bg/obj/mode7/window/dac/mosaic latches whose shapes differ between impls,
+// and the facade covers only the register state both impls expose at
+// matching semantics. Returns stale perf-impl state when accurate mode is
+// on; see kintsuki::ppu for the shared surface.
 uint8_t kintsuki_ppu_ss_read(kintsuki_t* h, uint8_t reg) {
   if(!h) return 0;
   auto& p = ares::SuperFamicom::ppuPerformanceImpl;
@@ -865,6 +873,10 @@ uint8_t kintsuki_ppu_ss_read(kintsuki_t* h, uint8_t reg) {
   }
 }
 
+// Deep PPU-state snapshot. Same perf-only caveat as kintsuki_ppu_ss_read:
+// reaches into bg/obj/mode7/dac/mosaic latches that aren't exposed by the
+// facade. Returns stale perf-impl state when accurate mode is active. Use
+// kintsuki::ppu for state covered by the shared facade.
 void kintsuki_get_ppu_state(kintsuki_t* h, kintsuki_ppu_state_t* out) {
   if(!h || !out) return;
   std::memset(out, 0, sizeof(*out));
@@ -1140,7 +1152,7 @@ void kintsuki_dsp_write_register(kintsuki_t* h, uint8_t addr, uint8_t value) {
 // `kintsuki_screenshot` does so canonical bytes match the canonical PNG.
 int kintsuki_ppu_hires(kintsuki_t* h) {
   if(!h) return 0;
-  return ares::SuperFamicom::ppuPerformanceImpl.hires() ? 1 : 0;
+  return kintsuki::ppu::hires() ? 1 : 0;
 }
 
 void kintsuki_set_input(kintsuki_t* h, int port, uint16_t mask) {
@@ -2204,11 +2216,11 @@ void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
     g_project->note_dma(src, size, dst);
     g_project->note_dma_provenance(src, size, dst, callerPc, frame);
   }
-  // Capture VMADDR (word) at the moment the DMA fires — gives the
+  // Capture VMADDR (word) at the moment the DMA fires. Gives the
   // user the actual VRAM destination, not just "we wrote something
-  // through VMDATA". Read from the live performance PPU; the
-  // CGRAM/OAM equivalents could be added later if needed.
-  uint16_t vramAddr = (uint16_t)ares::SuperFamicom::ppuPerformanceImpl.vram.address;
+  // through VMDATA". The facade reads from whichever PPU impl is
+  // active; CGRAM/OAM equivalents could be added later if needed.
+  uint16_t vramAddr = kintsuki::ppu::vramAddress();
   // Dedupe key now includes vram_addr + caller_pc so two transfers from
   // different callers (or to different VRAM regions) don't collapse.
   for(size_t i = 0; i < g_dmaLogSize; i++) {
@@ -2352,7 +2364,7 @@ void sdd1HookFn(uint8_t event, uint8_t channel, uint32_t busAddr,
     st.info.size       = size;
     st.info.channel    = channel;
     st.info.dst_reg    = (uint8_t)ch.targetAddress;
-    st.info.vram_addr  = (uint16_t)ares::SuperFamicom::ppuPerformanceImpl.vram.address;
+    st.info.vram_addr  = kintsuki::ppu::vramAddress();
     st.info.wram_addr  = 0x7E0000 | ares::SuperFamicom::cpu.wramAddress();
     st.info.caller_pc  = g_callstack.empty()
       ? ((uint32_t)ares::SuperFamicom::cpu.r.pc.d & 0xFFFFFF)
@@ -2487,7 +2499,7 @@ void kintsuki_vram_map_stop(kintsuki_t* h) {
 uint32_t kintsuki_vram_map_snapshot(kintsuki_t* h, uint16_t* reads, uint32_t* writes,
                                     uint32_t* writers, uint32_t cap) {
   if(!h || g_vramReads.empty()) return 0;
-  uint32_t words = (uint32_t)ares::SuperFamicom::ppuPerformanceImpl.vram.mask + 1;
+  uint32_t words = kintsuki::ppu::vramWordCount();
   uint32_t n = words < cap ? words : cap;
   if(reads) std::copy_n(g_vramReads.begin(), n, reads);
   if(writes) std::copy_n(g_vramWrites.begin(), n, writes);
