@@ -729,6 +729,19 @@ final class Emulator {
             NSLog("kintsuki: loadROM called with nil handle")
             return
         }
+        // Tear down every async driver that touches ares state before
+        // swapping the ROM. Without this, a rewindTimer or runTimer tick
+        // fires kintsuki_run_frames mid kintsuki_load_rom and the app
+        // locks (core pinned at 100%). Previously only reloadROMFromDisk
+        // did this; the swap path (Open menu, drag-drop, recents) hit
+        // the same race.
+        rewindHolding = false
+        rewindHoldResumeWork?.cancel()
+        rewindHoldResumeWork = nil
+        stopRewindTimer()
+        stopRunLoop()
+        running = false
+        pendingBreakpointHaltId = nil
         timelineStop()  // a recording belongs to the ROM it started on
         vramMapStop()
         let path = url.path
@@ -2127,24 +2140,10 @@ final class Emulator {
     /// useful when the patched ROM on disk has been rebuilt.
     func reloadROMFromDisk() {
         guard let url = loadedROM else { return }
-        // Tear down every async driver that touches ares state before
-        // we yank the ROM out from under it. Without this, a
-        // rewindTimer fires kintsuki_run_frames mid kintsuki_load_rom
-        // and the app locks — Cmd+Shift+R landing on a rewind-held
-        // emulator was the reproducible case. The runTimer is gated
-        // on `running`, so flipping that to false before loadROM
-        // (which sets it back to true) prevents any queued
-        // tick-Task from re-entering ares mid-reload.
-        rewindHolding = false
-        rewindHoldResumeWork?.cancel()
-        rewindHoldResumeWork = nil
-        stopRewindTimer()
-        stopRunLoop()
-        running = false
-        pendingBreakpointHaltId = nil
         // Reload-from-disk is the "fresh boot" affordance: skip the
         // autosave restore so users testing an iterative build land at
-        // the reset vector instead of mid-game.
+        // the reset vector instead of mid-game. Teardown of async
+        // drivers happens inside loadROM().
         loadROM(url, restoreAutosave: false)
     }
 
