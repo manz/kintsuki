@@ -2315,7 +2315,15 @@ final class Emulator {
             NSLog("kintsuki: hot-reload load_rom failed at \(path)")
             return
         }
-        clearRewindBuffer()
+        // Preserve rewind history across the flip. The save blob stream
+        // changes shape when the PPU impl swaps (different save sizes),
+        // so force a fresh keyframe on the next push: deltas captured
+        // after the flip XOR against a same-mode keyframe, deltas from
+        // before the flip keep targeting their original keyframe which
+        // stays alive in the ring. Scrubbing back across the boundary
+        // trips peekSavedPpuAccurate at the first cross-mode load,
+        // bootRom swaps once, remaining in-mode steps are plain loads.
+        rewindBuffer.forceKeyframeOnNextPush()
         let loaded = blob.withUnsafeBytes { raw -> Int32 in
             kintsuki_load_state(h, raw.baseAddress, UInt32(blob.count))
         }

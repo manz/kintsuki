@@ -196,6 +196,13 @@ final class RewindBuffer {
     /// formula would mark every push as a keyframe (30 MB/s of leak).
     private var pushedSoFar: Int = 0
 
+    /// One-shot override: next push unconditionally becomes a keyframe,
+    /// even if the modulo schedule would make it a delta. Set when the
+    /// stream becomes incompatible with prior deltas (e.g. the PPU
+    /// impl flipped mid-session; same-mode-contiguous keyframes keep
+    /// the XOR delta chain size-coherent without clearing history).
+    private var forceKeyframeNext: Bool = false
+
     /// Logical index of `frames[0]`. Increments by 1 every time a frame
     /// is evicted from the front so deltas can reference their keyframe
     /// by a stable monotonic id instead of an array index that shifts
@@ -262,7 +269,8 @@ final class RewindBuffer {
     func push(count requestedCount: Int,
               producer: (UnsafeMutableRawBufferPointer) -> Int) {
         ensureWorkspaceCapacity(forBytes: requestedCount)
-        let isKeyframe = (pushedSoFar % keyframeInterval) == 0
+        let isKeyframe = forceKeyframeNext || (pushedSoFar % keyframeInterval) == 0
+        forceKeyframeNext = false
         pushedSoFar += 1
         // Make room before writing — eviction happens before the new
         // entry overwrites a slot so the byte accounting / pool release
@@ -445,6 +453,14 @@ final class RewindBuffer {
         return lastPopped
     }
 
+    /// Promote the next push to a keyframe, bypassing the modulo
+    /// schedule. Useful when the save-state stream is about to change
+    /// shape (size, layout) and existing deltas would XOR against a
+    /// stale-shape keyframe. The flag auto-clears on the next push.
+    func forceKeyframeOnNextPush() {
+        forceKeyframeNext = true
+    }
+
     func clear() {
         // Release any keyframe pool slots still held, then zero the
         // ring without touching the underlying allocation.
@@ -459,6 +475,7 @@ final class RewindBuffer {
         bytes = 0
         pushedSoFar = 0
         firstLogicalIdx = 0
+        forceKeyframeNext = false
     }
 
     // MARK: Internals
