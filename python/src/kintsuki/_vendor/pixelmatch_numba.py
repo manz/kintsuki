@@ -1,6 +1,6 @@
 """Numba-jitted port of mapbox/pixelmatch for kintsuki framebuffer
-pixel-diff oracles. Keeps the runtime dep on numpy/numba/Pillow inside
-the dev group; production kintsuki users don't pull these in.
+pixel-diff oracles. Keeps the runtime dep on numpy/numba inside the
+dev group; production kintsuki users don't pull these in.
 
 Algorithm reference: https://github.com/mapbox/pixelmatch
 """
@@ -9,7 +9,6 @@ import math
 
 import numpy as np
 from numpy.typing import NDArray
-from PIL import Image
 
 # Attempt to import Numba, required for performance
 try:
@@ -253,8 +252,8 @@ def _process_pixels_numba(
 
 
 def pixelmatch(
-    img1_pil: Image.Image,
-    img2_pil: Image.Image,
+    img1: NDArray[np.uint8],
+    img2: NDArray[np.uint8],
     *,
     threshold: float = 0.1,
     include_aa: bool = False,
@@ -263,47 +262,45 @@ def pixelmatch(
     diff_color: ColorTuple = (255, 0, 0),
     diff_color_alt: OptionalColorTuple = None,
     diff_mask: bool = False,
-) -> tuple[int, Image.Image]:
-    """
-    Compares two PIL Images pixel by pixel using Numba-optimized routines.
-    Returns a tuple: (number_of_mismatched_pixels, diff_image_as_PIL_Image).
+) -> tuple[int, NDArray[np.uint8]]:
+    """Compare two ``(height, width, 4)`` uint8 RGBA arrays.
+
+    Returns ``(mismatch_count, diff_rgba)`` where ``diff_rgba`` is a
+    freshly-allocated ``(height, width, 4)`` uint8 array laid out the
+    same way as the inputs. Non-RGBA inputs are coerced by appending an
+    opaque alpha channel (RGB) or raising (anything else).
     """
 
-    if img1_pil.mode != "RGBA":
-        img1_pil = img1_pil.convert("RGBA")
-    if img2_pil.mode != "RGBA":
-        img2_pil = img2_pil.convert("RGBA")
+    img1 = _as_rgba_array(img1)
+    img2 = _as_rgba_array(img2)
 
-    if img1_pil.size != img2_pil.size:
+    if img1.shape != img2.shape:
         raise ValueError("Image sizes do not match.")
 
-    width: int = img1_pil.width
-    height: int = img1_pil.height
+    height, width = img1.shape[0], img1.shape[1]
 
     if width == 0 or height == 0:
-        return 0, Image.new("RGBA", (0, 0))
+        return 0, np.zeros((0, 0, 4), dtype=np.uint8)
 
-    img1_data: NDArray[np.uint8] = np.array(img1_pil, dtype=np.uint8).ravel()
-    img2_data: NDArray[np.uint8] = np.array(img2_pil, dtype=np.uint8).ravel()
+    img1_data: NDArray[np.uint8] = np.ascontiguousarray(img1).ravel()
+    img2_data: NDArray[np.uint8] = np.ascontiguousarray(img2).ravel()
 
     output_data: NDArray[np.uint8] = np.zeros(width * height * 4, dtype=np.uint8)
 
     if diff_color_alt is None:
         effective_diff_color_alt: ColorTuple = diff_color
     else:
-        effective_diff_color_alt: ColorTuple = diff_color_alt
+        effective_diff_color_alt = diff_color_alt
 
     num_pixels: int = width * height
 
     img1_u32: NDArray[np.uint32] = img1_data.view(np.uint32)
     img2_u32: NDArray[np.uint32] = img2_data.view(np.uint32)
 
-    if np.array_equal(img1_u32, img2_u32):  # This NumPy check is fast
+    if np.array_equal(img1_u32, img2_u32):
         if not diff_mask:
-            # Use Numba JITted function for filling gray pixels
             _fill_gray_pixels_numba(img1_data, alpha, output_data, num_pixels)
-        diff_img_pil = Image.fromarray(output_data.reshape((height, width, 4)), "RGBA")
-        return 0, diff_img_pil
+        return 0, output_data.reshape((height, width, 4))
 
     max_sq_delta: float = 35215.0 * threshold * threshold
 
@@ -325,5 +322,25 @@ def pixelmatch(
         max_sq_delta,
     )
 
-    diff_img_pil = Image.fromarray(output_data.reshape((height, width, 4)), "RGBA")
-    return mismatch_count, diff_img_pil
+    return mismatch_count, output_data.reshape((height, width, 4))
+
+
+def _as_rgba_array(arr: NDArray[np.uint8]) -> NDArray[np.uint8]:
+    """Normalize a ``(h, w, 3)`` or ``(h, w, 4)`` uint8 array to RGBA.
+
+    RGB inputs get an opaque alpha appended. Anything else is a usage
+    error; callers are expected to decode PNGs via ``kintsuki._png``,
+    which already produces RGBA.
+    """
+    if arr.dtype != np.uint8:
+        arr = arr.astype(np.uint8, copy=False)
+    if arr.ndim != 3:
+        raise ValueError(f"expected (h, w, c) array, got shape {arr.shape}")
+    if arr.shape[2] == 4:
+        return arr
+    if arr.shape[2] == 3:
+        out = np.empty((arr.shape[0], arr.shape[1], 4), dtype=np.uint8)
+        out[..., :3] = arr
+        out[..., 3] = 255
+        return out
+    raise ValueError(f"unsupported channel count: {arr.shape[2]}")
