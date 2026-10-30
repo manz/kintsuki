@@ -22,7 +22,7 @@ classifiers = [
 ]
 
  [project.optional-dependencies]
-  visual = ["numpy>=1.26", "numba>=0.59", "Pillow>=10"]
+  visual = ["numpy>=1.26", "numba>=0.59"]
 
 [build-system]
 requires = ["hatchling"]
@@ -59,5 +59,4 @@ dev = [
     # kintsuki.visual pixel-diff oracle (vendored mapbox/pixelmatch port).
     "numpy>=1.26",
     "numba>=0.59",
-    "Pillow>=10",
 ]

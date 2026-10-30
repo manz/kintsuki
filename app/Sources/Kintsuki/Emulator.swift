@@ -21,6 +21,47 @@ final class Emulator {
             audioOutput?.setMuted(muted)
         }
     }
+    private let ppuAccurateKey = "kintsuki.ppuAccurate"
+    /// Which ares PPU implementation renders frames. False (default) uses
+    /// ppu-performance; true routes rendering through the cycle-accurate
+    /// PPU. Latched at bootRom() time; flipping while a ROM is loaded
+    /// triggers an automatic hot-reload-keeping-state so the new impl
+    /// kicks in without the user doing anything. The pre-flip save state
+    /// is tagged with the old mode, so ares' serializer will refuse to
+    /// restore it onto the new impl; the ROM boots cold in that case
+    /// (logged, see hotReloadKeepingState). Debug surfaces stay anchored
+    /// to ppu-performance regardless of this setting.
+    var ppuAccurate: Bool = UserDefaults.standard.bool(forKey: "kintsuki.ppuAccurate") {
+        didSet {
+            guard ppuAccurate != oldValue else { return }
+            UserDefaults.standard.set(ppuAccurate, forKey: ppuAccurateKey)
+            guard let h = handle else { return }
+            kintsuki_set_ppu_accurate(h, ppuAccurate ? 1 : 0)
+            if suppressPpuAccurateReload { return }
+            // Apply mid-session by re-entering bootRom. Skip when no ROM
+            // is loaded yet, since the setting takes effect on the first load.
+            if loadedROM != nil {
+                hotReloadKeepingState()
+            }
+        }
+    }
+    /// When true, didSet on ppuAccurate updates persistence + native but
+    /// skips the hot-reload. Used after kintsuki_load_state cross-mode
+    /// swaps, where the native impl is already in sync.
+    private var suppressPpuAccurateReload: Bool = false
+
+    /// Pull the native PPU-accurate flag into the Swift binding without
+    /// triggering a hot-reload. Called after loadState in case the state
+    /// was recorded under a different mode and native auto-swapped.
+    func syncPpuAccurateFromNative() {
+        guard let h = handle else { return }
+        let nativeAccurate = kintsuki_ppu_accurate(h) != 0
+        if nativeAccurate != ppuAccurate {
+            suppressPpuAccurateReload = true
+            ppuAccurate = nativeAccurate
+            suppressPpuAccurateReload = false
+        }
+    }
     private let recentsLimit = 10
     private(set) var lastFrameID: UInt64 = 0
     private(set) var fps: Double = 0
@@ -579,6 +620,10 @@ final class Emulator {
             // The app applies a `<rom>.bps` sidecar; the library default
             // (and Python) leaves it off unless asked.
             kintsuki_set_bps_sidecar(h, 1)
+            // Seed the ppu-accurate choice from the persisted preference
+            // before the first auto-load, so bootRom() latches the right
+            // impl without needing a reload.
+            kintsuki_set_ppu_accurate(h, ppuAccurate ? 1 : 0)
             let out = AudioOutput(handle: h)
             out.setMuted(muted)
             audioOutput = out
@@ -729,6 +774,19 @@ final class Emulator {
             NSLog("kintsuki: loadROM called with nil handle")
             return
         }
+        // Tear down every async driver that touches ares state before
+        // swapping the ROM. Without this, a rewindTimer or runTimer tick
+        // fires kintsuki_run_frames mid kintsuki_load_rom and the app
+        // locks (core pinned at 100%). Previously only reloadROMFromDisk
+        // did this; the swap path (Open menu, drag-drop, recents) hit
+        // the same race.
+        rewindHolding = false
+        rewindHoldResumeWork?.cancel()
+        rewindHoldResumeWork = nil
+        stopRewindTimer()
+        stopRunLoop()
+        running = false
+        pendingBreakpointHaltId = nil
         timelineStop()  // a recording belongs to the ROM it started on
         vramMapStop()
         let path = url.path
@@ -2061,6 +2119,7 @@ final class Emulator {
             kintsuki_load_state(h, raw.baseAddress, UInt32(entry.blob.count))
         }
         guard ok != 0 else { return }
+        syncPpuAccurateFromNative()
         // ares serializes r.stp/r.wai + register file but not the libco
         // coroutine RIP. Without rearming, the next scheduler tick wakes
         // the coroutine inside whatever wait loop it happened to suspend
@@ -2127,24 +2186,10 @@ final class Emulator {
     /// useful when the patched ROM on disk has been rebuilt.
     func reloadROMFromDisk() {
         guard let url = loadedROM else { return }
-        // Tear down every async driver that touches ares state before
-        // we yank the ROM out from under it. Without this, a
-        // rewindTimer fires kintsuki_run_frames mid kintsuki_load_rom
-        // and the app locks — Cmd+Shift+R landing on a rewind-held
-        // emulator was the reproducible case. The runTimer is gated
-        // on `running`, so flipping that to false before loadROM
-        // (which sets it back to true) prevents any queued
-        // tick-Task from re-entering ares mid-reload.
-        rewindHolding = false
-        rewindHoldResumeWork?.cancel()
-        rewindHoldResumeWork = nil
-        stopRewindTimer()
-        stopRunLoop()
-        running = false
-        pendingBreakpointHaltId = nil
         // Reload-from-disk is the "fresh boot" affordance: skip the
         // autosave restore so users testing an iterative build land at
-        // the reset vector instead of mid-game.
+        // the reset vector instead of mid-game. Teardown of async
+        // drivers happens inside loadROM().
         loadROM(url, restoreAutosave: false)
     }
 
@@ -2270,13 +2315,22 @@ final class Emulator {
             NSLog("kintsuki: hot-reload load_rom failed at \(path)")
             return
         }
-        clearRewindBuffer()
+        // Preserve rewind history across the flip. The save blob stream
+        // changes shape when the PPU impl swaps (different save sizes),
+        // so force a fresh keyframe on the next push: deltas captured
+        // after the flip XOR against a same-mode keyframe, deltas from
+        // before the flip keep targeting their original keyframe which
+        // stays alive in the ring. Scrubbing back across the boundary
+        // trips peekSavedPpuAccurate at the first cross-mode load,
+        // bootRom swaps once, remaining in-mode steps are plain loads.
+        rewindBuffer.forceKeyframeOnNextPush()
         let loaded = blob.withUnsafeBytes { raw -> Int32 in
             kintsuki_load_state(h, raw.baseAddress, UInt32(blob.count))
         }
         if loaded == 0 {
             NSLog("kintsuki: hot-reload load_state rejected blob — booting cold")
         } else {
+            syncPpuAccurateFromNative()
             kintsuki_rearm_cpu(h)
         }
         snapshotFramebuffer()
@@ -2320,6 +2374,7 @@ final class Emulator {
             NSLog("kintsuki: importState rejected blob from \(url.path)")
             return false
         }
+        syncPpuAccurateFromNative()
         kintsuki_rearm_cpu(h)
         kintsuki_run_frames(h, 1)
         snapshotFramebuffer()
@@ -2859,7 +2914,7 @@ final class Emulator {
             let ok = lastBlob.withUnsafeBytes { raw -> Int32 in
                 kintsuki_load_state(h, raw.baseAddress, UInt32(lastBlob.count))
             }
-            if ok != 0 { kintsuki_rearm_cpu(h); kintsuki_run_frames(h, 1) }
+            if ok != 0 { syncPpuAccurateFromNative(); kintsuki_rearm_cpu(h); kintsuki_run_frames(h, 1) }
         }
         recoveryMode = true
         running = false

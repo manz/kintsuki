@@ -1,3 +1,21 @@
+// kintsuki: host hooks for data-port drop/land/write detection. Same
+// pointers used by ppu-performance; both impls fire the same callbacks.
+extern "C" typedef void (*KintsukiPpuDropHook)(uint8_t port);
+extern "C" typedef void (*KintsukiPpuLandHook)(uint8_t port);
+extern "C" typedef void (*KintsukiVramWriteHook)(uint32_t wordAddr);
+extern KintsukiPpuDropHook kintsukiPpuDropHook;
+extern KintsukiPpuLandHook kintsukiPpuLandHook;
+extern KintsukiVramWriteHook kintsukiVramWriteHook;
+// Shadow mirror: kintsuki's host-side IO shadow for impl-agnostic readout.
+// Fires on every $21xx write, before the real impl mutates anything.
+extern "C" void kintsuki_ppu_shadow_write(uint32_t address, uint8_t data);
+static inline auto kintsukiPpuDrop(uint8_t port) -> void {
+  if(kintsukiPpuDropHook) kintsukiPpuDropHook(port);
+}
+static inline auto kintsukiPpuLand(uint8_t port) -> void {
+  if(kintsukiPpuLandHook) kintsukiPpuLandHook(port);
+}
+
 auto PPU::latchCounters() -> void {
   cpu.synchronize(ppu);
   io.hcounter = hdot();
@@ -23,9 +41,11 @@ inline auto PPU::readVRAM() -> n16 {
 }
 
 inline auto PPU::writeVRAM(n1 byte, n8 data) -> void {
-  if(!io.displayDisable && vcounter() < vdisp()) return;
+  if(!io.displayDisable && vcounter() < vdisp()) return kintsukiPpuDrop(0x18);
+  if(!io.displayDisable) kintsukiPpuLand(0x18);
   auto address = addressVRAM();
   vram[address].byte(byte) = data;
+  if(kintsukiVramWriteHook) kintsukiVramWriteHook(address & vram.mask);
 }
 
 inline auto PPU::readOAM(n10 address) -> n8 {
@@ -38,8 +58,11 @@ inline auto PPU::readOAM(n10 address) -> n8 {
 
 inline auto PPU::writeOAM(n10 address, n8 data) -> void {
   if(!io.displayDisable && vcounter() < vdisp()) {
+    kintsukiPpuDrop(0x04);
     if(address.bit(9) == 0) return oam.write(0x000 | latch.oamAddress << 2 | address & 1, data);
     if(address.bit(9) == 1) return oam.write(0x200 | latch.oamAddress >> 2, data);
+  } else if(!io.displayDisable) {
+    kintsukiPpuLand(0x04);
   }
   return oam.write(address, data);
 }
@@ -56,7 +79,7 @@ inline auto PPU::writeCGRAM(n8 address, n15 data) -> void {
   if(!io.displayDisable
   && vcounter() > 0 && vcounter() < vdisp()
   && hcounter() >= 88 && hcounter() < 1096
-  ) address = latch.cgramAddress;
+  ) address = latch.cgramAddress, kintsukiPpuDrop(0x22);
   dac.cgram[address] = data;
 }
 
@@ -186,6 +209,7 @@ auto PPU::readIO(n24 address, n8 data) -> n8 {
 
 auto PPU::writeIO(n24 address, n8 data) -> void {
   cpu.synchronize(ppu);
+  kintsuki_ppu_shadow_write(address, (uint8_t)data);
 
   switch((n16)address) {
 

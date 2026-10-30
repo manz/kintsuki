@@ -1,4 +1,10 @@
+// kintsuki: vblank edges for the host's vblank margin. The hook pointer is
+// owned by ppu-performance; both impls fire the same callback.
+extern "C" typedef void (*KintsukiVblankHook)(uint8_t begin);
+extern KintsukiVblankHook kintsukiVblankHook;
+
 auto PPU::main() -> void {
+  if(kintsukiVblankHook && (vcounter() == 0 || vcounter() == vdisp())) kintsukiVblankHook(vcounter() != 0);
   if(vcounter() == 0) {
     state.interlace = io.interlace;
     state.overscan = io.overscan;

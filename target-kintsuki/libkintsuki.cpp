@@ -9,6 +9,8 @@
 #include "adbg.hpp"
 #include "project.hpp"
 #include "perfetto.hpp"
+#include "ppu_facade.hpp"
+#include "ppu_shadow.hpp"
 
 #include <algorithm>
 #include <cstdint>
@@ -42,6 +44,15 @@ namespace ares::SuperFamicom {
   typedef void (*KintsukiSdd1Hook)(uint8_t, uint8_t, uint32_t, uint32_t,
                                    uint16_t, uint32_t, uint8_t);
   extern KintsukiSdd1Hook kintsukiSdd1Hook;
+}
+
+// IO shadow storage. Both ares PPU impls call kintsuki_ppu_shadow_write at
+// the top of writeIO; readers (ss_read, get_ppu_state) pull from this
+// struct instead of either impl's internal fields.
+namespace kintsuki { namespace ppu { Shadow shadow; } }
+
+extern "C" void kintsuki_ppu_shadow_write(uint32_t address, uint8_t data) {
+  kintsuki::ppu::applyWriteIO(address, data);
 }
 
 // ---- Shadow callstack + .adbg label table -------------------------------
@@ -331,23 +342,24 @@ void traceCloseSlices() {
 // "CGRAM $10" (CGADD), "OAM $000" (OAMADD), else its B-bus register.
 void traceDma(uint8_t channel, uint32_t src, uint8_t dst, uint16_t size, uint32_t caller) {
   if(!g_trace.active() || channel >= 8) return;
-  auto& ppu = ares::SuperFamicom::ppuPerformanceImpl;
   uint64_t master = profileMasterCycles();
   uint32_t bytes = size ? size : 0x10000;
   std::vector<kintsuki::TraceArg> args{{"src", src}, {"bytes", bytes}, {"line", traceLine()}, {"caller", caller}};
   char name[24];
   if(dst == 0x18 || dst == 0x19 || dst == 0x39 || dst == 0x3A) {
-    uint32_t vmain = ppu.vram.mode << 7 | ppu.vram.mapping << 2
-                   | (ppu.vram.increment == 1 ? 0 : ppu.vram.increment == 32 ? 1 : 2);
-    std::snprintf(name, sizeof name, "VRAM $%04X", (unsigned)ppu.vram.address);
-    args.push_back({"vram", (uint64_t)ppu.vram.address});
+    uint32_t vmain = kintsuki::ppu::vmainByte();
+    uint16_t addr = kintsuki::ppu::vramAddress();
+    std::snprintf(name, sizeof name, "VRAM $%04X", (unsigned)addr);
+    args.push_back({"vram", (uint64_t)addr});
     args.push_back({"vmain", vmain});
   } else if(dst == 0x22 || dst == 0x3B) {
-    std::snprintf(name, sizeof name, "CGRAM $%02X", (unsigned)ppu.io.cgramAddress);
-    args.push_back({"cg", (uint64_t)ppu.io.cgramAddress});
+    uint8_t cg = kintsuki::ppu::cgramAddress();
+    std::snprintf(name, sizeof name, "CGRAM $%02X", (unsigned)cg);
+    args.push_back({"cg", (uint64_t)cg});
   } else if(dst == 0x04 || dst == 0x38) {
-    std::snprintf(name, sizeof name, "OAM $%03X", (unsigned)ppu.io.oamAddress);
-    args.push_back({"oam", (uint64_t)ppu.io.oamAddress});
+    uint16_t oam = kintsuki::ppu::oamAddress();
+    std::snprintf(name, sizeof name, "OAM $%03X", (unsigned)oam);
+    args.push_back({"oam", (uint64_t)oam});
   } else {
     std::snprintf(name, sizeof name, "$21%02X", dst);
   }
@@ -575,6 +587,17 @@ uint32_t kintsuki_vram_size(kintsuki_t* h) {
   return h->program->vramSizeBytes;
 }
 
+int kintsuki_set_ppu_accurate(kintsuki_t* h, int enable) {
+  if(!h) return 0;
+  h->program->ppuAccurate = (enable != 0);
+  return 1;
+}
+
+int kintsuki_ppu_accurate(kintsuki_t* h) {
+  if(!h) return 0;
+  return h->program->ppuAccurate ? 1 : 0;
+}
+
 int kintsuki_set_sram_policy(kintsuki_t* h, uint32_t policy) {
   if(!h || policy > KINTSUKI_SRAM_CLEAR) return 0;
   h->program->sramPolicy = policy;
@@ -750,217 +773,220 @@ void kintsuki_set_state(kintsuki_t* h, const kintsuki_cpu_state_t* in) {
 // Savestate readback of the PPU's write-only registers, as the MiSTer core's
 // PPU.vhd answers it on $C1:21xx (SS_A). $40-$41 are COLDATA green/red and
 // $4D-$61 the high bytes of the two-write registers at $0D-$21.
+//
+// Still reads from the performance impl directly: the field set here spans
+// bg/obj/mode7/window/dac/mosaic latches whose shapes differ between impls,
+// and the facade covers only the register state both impls expose at
+// matching semantics. Returns stale perf-impl state when accurate mode is
+// on; see kintsuki::ppu for the shared surface.
 uint8_t kintsuki_ppu_ss_read(kintsuki_t* h, uint8_t reg) {
   if(!h) return 0;
-  auto& p = ares::SuperFamicom::ppuPerformanceImpl;
-  using Source = ares::SuperFamicom::PPUPerformance::Source;
-  auto b = [](bool v, int bit) -> uint8_t { return v ? (uint8_t)(1u << bit) : 0; };
-  auto sc = [](auto& bg) -> uint8_t {
-    return (uint8_t)((bg.io.screenAddress >> 10) << 2 | bg.io.screenSize);
+  auto& s = kintsuki::ppu::shadow;
+  auto b = [](uint8_t v, int bit) -> uint8_t { return v ? (uint8_t)(1u << bit) : 0; };
+  auto sc = [](const kintsuki::ppu::Shadow::Bg& bg) -> uint8_t {
+    return (uint8_t)(((bg.screenAddress >> 10) << 2) | bg.screenSize);
   };
-  auto wsel = [&](auto& w1, auto& w2) -> uint8_t {
+  auto wsel = [&](const kintsuki::ppu::Shadow::WLayer& w1,
+                  const kintsuki::ppu::Shadow::WLayer& w2) -> uint8_t {
     return b(w1.oneInvert, 0) | b(w1.oneEnable, 1) | b(w1.twoInvert, 2) | b(w1.twoEnable, 3)
          | b(w2.oneInvert, 4) | b(w2.oneEnable, 5) | b(w2.twoInvert, 6) | b(w2.twoEnable, 7);
   };
-  bool m7 = p.io.bgMode == 7;
-  uint16_t oamadd = (uint16_t)(p.io.oamBaseAddress >> 1);
+  bool m7 = s.bgMode == 7;
+  uint16_t oamadd = (uint16_t)(s.oamBaseAddress >> 1);
   switch(reg) {
-  case 0x00: return b(p.io.displayDisable, 7) | (uint8_t)p.io.displayBrightness;
-  case 0x01: return (uint8_t)(p.obj.io.baseSize << 5 | p.obj.io.nameselect << 3
-                             | p.obj.io.tiledataAddress >> 13);
+  case 0x00: return b(s.displayDisable, 7) | s.displayBrightness;
+  case 0x01: return (uint8_t)((s.objBaseSize << 5) | (s.objNameselect << 3)
+                             | (s.objTiledataAddress >> 13));
   case 0x02: return (uint8_t)oamadd;
-  case 0x03: return b(p.io.oamPriority, 7) | (uint8_t)(oamadd >> 8 & 1);
-  case 0x05: return b(p.bg4.io.tileSize, 7) | b(p.bg3.io.tileSize, 6) | b(p.bg2.io.tileSize, 5)
-                  | b(p.bg1.io.tileSize, 4) | b(p.io.bgPriority, 3) | (uint8_t)p.io.bgMode;
-  case 0x06: return (uint8_t)((p.mosaic.size - 1) << 4)
-                  | b(p.bg4.io.mosaicEnable, 3) | b(p.bg3.io.mosaicEnable, 2)
-                  | b(p.bg2.io.mosaicEnable, 1) | b(p.bg1.io.mosaicEnable, 0);
-  case 0x07: return sc(p.bg1);
-  case 0x08: return sc(p.bg2);
-  case 0x09: return sc(p.bg3);
-  case 0x0a: return sc(p.bg4);
-  case 0x0b: return (uint8_t)(p.bg2.io.tiledataAddress >> 12 << 4 | p.bg1.io.tiledataAddress >> 12);
-  case 0x0c: return (uint8_t)(p.bg4.io.tiledataAddress >> 12 << 4 | p.bg3.io.tiledataAddress >> 12);
-  case 0x0d: return (uint8_t)(m7 ? p.mode7.hoffset : p.bg1.io.hoffset);
-  case 0x0e: return (uint8_t)(m7 ? p.mode7.voffset : p.bg1.io.voffset);
-  case 0x0f: return (uint8_t)p.bg2.io.hoffset;
-  case 0x10: return (uint8_t)p.bg2.io.voffset;
-  case 0x11: return (uint8_t)p.bg3.io.hoffset;
-  case 0x12: return (uint8_t)p.bg3.io.voffset;
-  case 0x13: return (uint8_t)p.bg4.io.hoffset;
-  case 0x14: return (uint8_t)p.bg4.io.voffset;
+  case 0x03: return b(s.oamPriority, 7) | (uint8_t)((oamadd >> 8) & 1);
+  case 0x05: return b(s.bg4.tileSize, 7) | b(s.bg3.tileSize, 6) | b(s.bg2.tileSize, 5)
+                  | b(s.bg1.tileSize, 4) | b(s.bgPriority, 3) | s.bgMode;
+  case 0x06: return (uint8_t)(((s.mosaicSize - 1) << 4)
+                  | (s.bg4MosaicEnable ? 0x08 : 0) | (s.bg3MosaicEnable ? 0x04 : 0)
+                  | (s.bg2MosaicEnable ? 0x02 : 0) | (s.bg1MosaicEnable ? 0x01 : 0));
+  case 0x07: return sc(s.bg1);
+  case 0x08: return sc(s.bg2);
+  case 0x09: return sc(s.bg3);
+  case 0x0a: return sc(s.bg4);
+  case 0x0b: return (uint8_t)((s.bg2.tiledataAddress >> 12 << 4) | (s.bg1.tiledataAddress >> 12));
+  case 0x0c: return (uint8_t)((s.bg4.tiledataAddress >> 12 << 4) | (s.bg3.tiledataAddress >> 12));
+  case 0x0d: return (uint8_t)(m7 ? s.mode7Hoffset : s.bg1.hoffset);
+  case 0x0e: return (uint8_t)(m7 ? s.mode7Voffset : s.bg1.voffset);
+  case 0x0f: return (uint8_t)s.bg2.hoffset;
+  case 0x10: return (uint8_t)s.bg2.voffset;
+  case 0x11: return (uint8_t)s.bg3.hoffset;
+  case 0x12: return (uint8_t)s.bg3.voffset;
+  case 0x13: return (uint8_t)s.bg4.hoffset;
+  case 0x14: return (uint8_t)s.bg4.voffset;
   case 0x15: {
-    uint8_t inc = p.vram.increment == 1 ? 0 : p.vram.increment == 32 ? 1 : 2;
-    return b(p.vram.mode, 7) | (uint8_t)(p.vram.mapping << 2) | inc;
+    uint8_t inc = s.vramIncrementSize == 1 ? 0 : s.vramIncrementSize == 32 ? 1 : 2;
+    return b(s.vramMode, 7) | (uint8_t)(s.vramMapping << 2) | inc;
   }
-  case 0x16: return (uint8_t)p.vram.address;
-  case 0x17: return (uint8_t)(p.vram.address >> 8);
-  case 0x1a: return (uint8_t)(p.mode7.repeat << 6) | b(p.mode7.vflip, 1) | b(p.mode7.hflip, 0);
-  case 0x1b: return (uint8_t)p.mode7.a;
-  case 0x1c: return (uint8_t)p.mode7.b;
-  case 0x1d: return (uint8_t)p.mode7.c;
-  case 0x1e: return (uint8_t)p.mode7.d;
-  case 0x1f: return (uint8_t)p.mode7.hcenter;
-  case 0x20: return (uint8_t)p.mode7.vcenter;
-  case 0x21: return (uint8_t)p.io.cgramAddress;
-  case 0x22: return (uint8_t)p.latch.cgram;
-  case 0x23: return wsel(p.bg1.window, p.bg2.window);
-  case 0x24: return wsel(p.bg3.window, p.bg4.window);
-  case 0x25: return wsel(p.obj.window, p.dac.window);
-  case 0x26: return (uint8_t)p.window.io.oneLeft;
-  case 0x27: return (uint8_t)p.window.io.oneRight;
-  case 0x28: return (uint8_t)p.window.io.twoLeft;
-  case 0x29: return (uint8_t)p.window.io.twoRight;
-  case 0x2a: return (uint8_t)(p.bg4.window.mask << 6 | p.bg3.window.mask << 4
-                             | p.bg2.window.mask << 2 | p.bg1.window.mask);
-  case 0x2b: return (uint8_t)(p.dac.window.mask << 2 | p.obj.window.mask);
-  case 0x2c: return b(p.obj.io.aboveEnable, 4) | b(p.bg4.io.aboveEnable, 3) | b(p.bg3.io.aboveEnable, 2)
-                  | b(p.bg2.io.aboveEnable, 1) | b(p.bg1.io.aboveEnable, 0);
-  case 0x2d: return b(p.obj.io.belowEnable, 4) | b(p.bg4.io.belowEnable, 3) | b(p.bg3.io.belowEnable, 2)
-                  | b(p.bg2.io.belowEnable, 1) | b(p.bg1.io.belowEnable, 0);
-  case 0x2e: return b(p.obj.window.aboveEnable, 4) | b(p.bg4.window.aboveEnable, 3)
-                  | b(p.bg3.window.aboveEnable, 2) | b(p.bg2.window.aboveEnable, 1)
-                  | b(p.bg1.window.aboveEnable, 0);
-  case 0x2f: return b(p.obj.window.belowEnable, 4) | b(p.bg4.window.belowEnable, 3)
-                  | b(p.bg3.window.belowEnable, 2) | b(p.bg2.window.belowEnable, 1)
-                  | b(p.bg1.window.belowEnable, 0);
-  case 0x30: return (uint8_t)(p.dac.window.aboveMask << 6 | p.dac.window.belowMask << 4)
-                  | b(p.dac.io.blendMode, 1) | b(p.dac.io.directColor, 0);
-  case 0x31: return b(p.dac.io.colorMode, 7) | b(p.dac.io.colorHalve, 6)
-                  | b(p.dac.io.colorEnable[Source::COL], 5) | b(p.dac.io.colorEnable[Source::OBJ2], 4)
-                  | b(p.dac.io.colorEnable[Source::BG4], 3) | b(p.dac.io.colorEnable[Source::BG3], 2)
-                  | b(p.dac.io.colorEnable[Source::BG2], 1) | b(p.dac.io.colorEnable[Source::BG1], 0);
-  case 0x32: return 0x80 | (uint8_t)p.dac.io.colorBlue;
-  case 0x33: return b(p.io.extbg, 6) | b(p.io.pseudoHires, 3) | b(p.io.overscan, 2)
-                  | b(p.obj.io.interlace, 1) | b(p.io.interlace, 0);
-  case 0x40: return 0x40 | (uint8_t)p.dac.io.colorGreen;
-  case 0x41: return 0x20 | (uint8_t)p.dac.io.colorRed;
-  case 0x4d: return (uint8_t)(m7 ? p.mode7.hoffset >> 8 & 0x1f : p.bg1.io.hoffset >> 8 & 3);
-  case 0x4e: return (uint8_t)(m7 ? p.mode7.voffset >> 8 & 0x1f : p.bg1.io.voffset >> 8 & 3);
-  case 0x4f: return (uint8_t)(p.bg2.io.hoffset >> 8 & 3);
-  case 0x50: return (uint8_t)(p.bg2.io.voffset >> 8 & 3);
-  case 0x51: return (uint8_t)(p.bg3.io.hoffset >> 8 & 3);
-  case 0x52: return (uint8_t)(p.bg3.io.voffset >> 8 & 3);
-  case 0x53: return (uint8_t)(p.bg4.io.hoffset >> 8 & 3);
-  case 0x54: return (uint8_t)(p.bg4.io.voffset >> 8 & 3);
-  case 0x5b: return (uint8_t)(p.mode7.a >> 8);
-  case 0x5c: return (uint8_t)(p.mode7.b >> 8);
-  case 0x5d: return (uint8_t)(p.mode7.c >> 8);
-  case 0x5e: return (uint8_t)(p.mode7.d >> 8);
-  case 0x5f: return (uint8_t)(p.mode7.hcenter >> 8 & 0x1f);
-  case 0x60: return (uint8_t)(p.mode7.vcenter >> 8 & 0x1f);
-  case 0x61: return (uint8_t)p.io.cgramAddressLatch;
+  case 0x16: return (uint8_t)kintsuki::ppu::vramAddress();
+  case 0x17: return (uint8_t)(kintsuki::ppu::vramAddress() >> 8);
+  case 0x1a: return (uint8_t)(s.mode7Repeat << 6) | b(s.mode7Vflip, 1) | b(s.mode7Hflip, 0);
+  case 0x1b: return (uint8_t)s.mode7A;
+  case 0x1c: return (uint8_t)s.mode7B;
+  case 0x1d: return (uint8_t)s.mode7C;
+  case 0x1e: return (uint8_t)s.mode7D;
+  case 0x1f: return (uint8_t)s.mode7X;
+  case 0x20: return (uint8_t)s.mode7Y;
+  case 0x21: return s.cgramAddress;
+  case 0x22: return s.cgramLatch;
+  case 0x23: return wsel(s.wBg1, s.wBg2);
+  case 0x24: return wsel(s.wBg3, s.wBg4);
+  case 0x25: return wsel(s.wObj, s.wCol);
+  case 0x26: return s.wOneLeft;
+  case 0x27: return s.wOneRight;
+  case 0x28: return s.wTwoLeft;
+  case 0x29: return s.wTwoRight;
+  case 0x2a: return (uint8_t)((s.wBg4.mask << 6) | (s.wBg3.mask << 4)
+                             | (s.wBg2.mask << 2) | s.wBg1.mask);
+  case 0x2b: return (uint8_t)((s.wCol.mask << 2) | s.wObj.mask);
+  case 0x2c: return b(s.objAboveEnable, 4) | b(s.bg4.aboveEnable, 3) | b(s.bg3.aboveEnable, 2)
+                  | b(s.bg2.aboveEnable, 1) | b(s.bg1.aboveEnable, 0);
+  case 0x2d: return b(s.objBelowEnable, 4) | b(s.bg4.belowEnable, 3) | b(s.bg3.belowEnable, 2)
+                  | b(s.bg2.belowEnable, 1) | b(s.bg1.belowEnable, 0);
+  case 0x2e: return b(s.wObj.aboveEnable, 4) | b(s.wBg4.aboveEnable, 3)
+                  | b(s.wBg3.aboveEnable, 2) | b(s.wBg2.aboveEnable, 1)
+                  | b(s.wBg1.aboveEnable, 0);
+  case 0x2f: return b(s.wObj.belowEnable, 4) | b(s.wBg4.belowEnable, 3)
+                  | b(s.wBg3.belowEnable, 2) | b(s.wBg2.belowEnable, 1)
+                  | b(s.wBg1.belowEnable, 0);
+  case 0x30: return (uint8_t)((s.dacWinAboveMask << 6) | (s.dacWinBelowMask << 4))
+                  | b(s.dacBlendMode, 1) | b(s.dacDirectColor, 0);
+  case 0x31: return b(s.colorMode, 7) | b(s.colorHalve, 6)
+                  | b(s.colorEnableCOL, 5) | b(s.colorEnableOBJ, 4)
+                  | b(s.colorEnableBG4, 3) | b(s.colorEnableBG3, 2)
+                  | b(s.colorEnableBG2, 1) | b(s.colorEnableBG1, 0);
+  case 0x32: return 0x80 | s.colorBlue;
+  case 0x33: return b(s.extbg, 6) | b(s.pseudoHires, 3) | b(s.overscan, 2)
+                  | b(s.objInterlace, 1) | b(s.interlace, 0);
+  case 0x40: return 0x40 | s.colorGreen;
+  case 0x41: return 0x20 | s.colorRed;
+  case 0x4d: return (uint8_t)(m7 ? (s.mode7Hoffset >> 8) & 0x1f : (s.bg1.hoffset >> 8) & 3);
+  case 0x4e: return (uint8_t)(m7 ? (s.mode7Voffset >> 8) & 0x1f : (s.bg1.voffset >> 8) & 3);
+  case 0x4f: return (uint8_t)((s.bg2.hoffset >> 8) & 3);
+  case 0x50: return (uint8_t)((s.bg2.voffset >> 8) & 3);
+  case 0x51: return (uint8_t)((s.bg3.hoffset >> 8) & 3);
+  case 0x52: return (uint8_t)((s.bg3.voffset >> 8) & 3);
+  case 0x53: return (uint8_t)((s.bg4.hoffset >> 8) & 3);
+  case 0x54: return (uint8_t)((s.bg4.voffset >> 8) & 3);
+  case 0x5b: return (uint8_t)(s.mode7A >> 8);
+  case 0x5c: return (uint8_t)(s.mode7B >> 8);
+  case 0x5d: return (uint8_t)(s.mode7C >> 8);
+  case 0x5e: return (uint8_t)(s.mode7D >> 8);
+  case 0x5f: return (uint8_t)((s.mode7X >> 8) & 0x1f);
+  case 0x60: return (uint8_t)((s.mode7Y >> 8) & 0x1f);
+  case 0x61: return s.cgramAddressLatch;
   default:   return 0;
   }
 }
 
+// Deep PPU-state snapshot. Reads the impl-agnostic IO shadow for all
+// $21xx-derived state, so both ppu-performance and ppu produce the same
+// snapshot. hcounter/vcounter come straight from the live impl's counter
+// base (shared between impls).
 void kintsuki_get_ppu_state(kintsuki_t* h, kintsuki_ppu_state_t* out) {
   if(!h || !out) return;
   std::memset(out, 0, sizeof(*out));
 
-  auto& p = ares::SuperFamicom::ppuPerformanceImpl;
+  auto& s = kintsuki::ppu::shadow;
   auto& c = ares::SuperFamicom::cpu;
 
-  // INIDISP ($2100): brightness in low nybble, force-blank in bit 7.
-  out->inidisp = (uint8_t)((p.io.displayBrightness & 0x0F) | (p.io.displayDisable ? 0x80 : 0x00));
-  // BGMODE ($2105): mode | priority | per-BG tile-size bits.
-  out->bgmode  = (uint8_t)((p.io.bgMode & 0x07) | (p.io.bgPriority ? 0x08 : 0)
-                          | (p.bg1.io.tileSize ? 0x10 : 0)
-                          | (p.bg2.io.tileSize ? 0x20 : 0)
-                          | (p.bg3.io.tileSize ? 0x40 : 0)
-                          | (p.bg4.io.tileSize ? 0x80 : 0));
-  // BGxSC ($2107..$210A): tilemap base in bits 7..2, screenSize in bits 1..0.
-  // screenAddress is the tilemap word base (e.g. $7000 → byte $70).
+  out->inidisp = (uint8_t)((s.displayBrightness & 0x0F)
+                          | (s.displayDisable ? 0x80 : 0x00));
+  out->bgmode  = (uint8_t)((s.bgMode & 0x07) | (s.bgPriority ? 0x08 : 0)
+                          | (s.bg1.tileSize ? 0x10 : 0)
+                          | (s.bg2.tileSize ? 0x20 : 0)
+                          | (s.bg3.tileSize ? 0x40 : 0)
+                          | (s.bg4.tileSize ? 0x80 : 0));
   auto packBGSC = [](uint16_t scrAddr, uint8_t scrSize) -> uint8_t {
     return (uint8_t)((scrAddr >> 8) & 0xFC) | (uint8_t)(scrSize & 0x03);
   };
-  out->bg1sc = packBGSC(p.bg1.io.screenAddress, p.bg1.io.screenSize);
-  out->bg2sc = packBGSC(p.bg2.io.screenAddress, p.bg2.io.screenSize);
-  out->bg3sc = packBGSC(p.bg3.io.screenAddress, p.bg3.io.screenSize);
-  out->bg4sc = packBGSC(p.bg4.io.screenAddress, p.bg4.io.screenSize);
-  // BG12NBA ($210B): char-data addr / 0x1000 for BG2|BG1.
-  out->bg12nba = (uint8_t)(((p.bg1.io.tiledataAddress >> 12) & 0x0F)
-                          | (((p.bg2.io.tiledataAddress >> 12) & 0x0F) << 4));
-  out->bg34nba = (uint8_t)(((p.bg3.io.tiledataAddress >> 12) & 0x0F)
-                          | (((p.bg4.io.tiledataAddress >> 12) & 0x0F) << 4));
+  out->bg1sc = packBGSC(s.bg1.screenAddress, s.bg1.screenSize);
+  out->bg2sc = packBGSC(s.bg2.screenAddress, s.bg2.screenSize);
+  out->bg3sc = packBGSC(s.bg3.screenAddress, s.bg3.screenSize);
+  out->bg4sc = packBGSC(s.bg4.screenAddress, s.bg4.screenSize);
+  out->bg12nba = (uint8_t)(((s.bg1.tiledataAddress >> 12) & 0x0F)
+                          | (((s.bg2.tiledataAddress >> 12) & 0x0F) << 4));
+  out->bg34nba = (uint8_t)(((s.bg3.tiledataAddress >> 12) & 0x0F)
+                          | (((s.bg4.tiledataAddress >> 12) & 0x0F) << 4));
 
-  // BGxHOFS / BGxVOFS — full 16-bit shadow ares keeps after the double-write.
-  out->bg1hofs = (uint16_t)p.bg1.io.hoffset;
-  out->bg1vofs = (uint16_t)p.bg1.io.voffset;
-  out->bg2hofs = (uint16_t)p.bg2.io.hoffset;
-  out->bg2vofs = (uint16_t)p.bg2.io.voffset;
-  out->bg3hofs = (uint16_t)p.bg3.io.hoffset;
-  out->bg3vofs = (uint16_t)p.bg3.io.voffset;
-  out->bg4hofs = (uint16_t)p.bg4.io.hoffset;
-  out->bg4vofs = (uint16_t)p.bg4.io.voffset;
+  out->bg1hofs = s.bg1.hoffset;
+  out->bg1vofs = s.bg1.voffset;
+  out->bg2hofs = s.bg2.hoffset;
+  out->bg2vofs = s.bg2.voffset;
+  out->bg3hofs = s.bg3.hoffset;
+  out->bg3vofs = s.bg3.voffset;
+  out->bg4hofs = s.bg4.hoffset;
+  out->bg4vofs = s.bg4.voffset;
 
-  // M7SEL + M7A..D + M7X/Y — mode-7 transform regs, all in mode7 substate.
-  out->m7sel = (uint8_t)((p.mode7.hflip ? 0x01 : 0)
-                       | (p.mode7.vflip ? 0x02 : 0)
-                       | ((p.mode7.repeat & 0x03) << 6));
-  out->m7a = (uint16_t)p.mode7.a;
-  out->m7b = (uint16_t)p.mode7.b;
-  out->m7c = (uint16_t)p.mode7.c;
-  out->m7d = (uint16_t)p.mode7.d;
-  out->m7x = (uint16_t)p.mode7.hcenter;
-  out->m7y = (uint16_t)p.mode7.vcenter;
+  out->m7sel = (uint8_t)((s.mode7Hflip ? 0x01 : 0)
+                       | (s.mode7Vflip ? 0x02 : 0)
+                       | ((s.mode7Repeat & 0x03) << 6));
+  out->m7a = s.mode7A;
+  out->m7b = s.mode7B;
+  out->m7c = s.mode7C;
+  out->m7d = s.mode7D;
+  out->m7x = s.mode7X;
+  out->m7y = s.mode7Y;
 
-  // VMAIN/VMADDR — performance PPU stores increment as size (1/32/128/128),
-  // map back to the bit-pattern.
   uint8_t vmainBits = 0;
-  switch(p.vram.increment) {
+  switch(s.vramIncrementSize) {
     case 1:   vmainBits = 0; break;
     case 32:  vmainBits = 1; break;
-    case 128: vmainBits = 2; break;  // 0b10 and 0b11 both give 128
+    case 128: vmainBits = 2; break;
   }
   out->vmain  = (uint8_t)((vmainBits & 0x03)
-                       | ((p.vram.mapping & 0x03) << 2)
-                       | (p.vram.mode ? 0x80 : 0));
-  out->vmaddr = (uint16_t)p.vram.address;
+                       | ((s.vramMapping & 0x03) << 2)
+                       | (s.vramMode ? 0x80 : 0));
+  // vramAddress is maintained post-write by both impls; pull live via the
+  // facade so increments after VMDATA show up here.
+  out->vmaddr = kintsuki::ppu::vramAddress();
 
-  out->cgadd  = (uint8_t)p.io.cgramAddress;
+  out->cgadd  = s.cgramAddress;
 
-  // TM/TS/TMW/TSW reconstructed from per-layer enable bits inside ares.
   auto mkTm = [](bool b1, bool b2, bool b3, bool b4, bool ob) -> uint8_t {
     return (uint8_t)((b1 ? 0x01 : 0) | (b2 ? 0x02 : 0)
                    | (b3 ? 0x04 : 0) | (b4 ? 0x08 : 0)
                    | (ob ? 0x10 : 0));
   };
-  out->tm = mkTm(p.bg1.io.aboveEnable, p.bg2.io.aboveEnable,
-                 p.bg3.io.aboveEnable, p.bg4.io.aboveEnable,
-                 p.obj.io.aboveEnable);
-  out->ts = mkTm(p.bg1.io.belowEnable, p.bg2.io.belowEnable,
-                 p.bg3.io.belowEnable, p.bg4.io.belowEnable,
-                 p.obj.io.belowEnable);
-  out->tmw = mkTm(p.bg1.window.aboveEnable, p.bg2.window.aboveEnable,
-                  p.bg3.window.aboveEnable, p.bg4.window.aboveEnable,
-                  p.obj.window.aboveEnable);
-  out->tsw = mkTm(p.bg1.window.belowEnable, p.bg2.window.belowEnable,
-                  p.bg3.window.belowEnable, p.bg4.window.belowEnable,
-                  p.obj.window.belowEnable);
+  out->tm = mkTm(s.bg1.aboveEnable, s.bg2.aboveEnable,
+                 s.bg3.aboveEnable, s.bg4.aboveEnable, s.objAboveEnable);
+  out->ts = mkTm(s.bg1.belowEnable, s.bg2.belowEnable,
+                 s.bg3.belowEnable, s.bg4.belowEnable, s.objBelowEnable);
+  out->tmw = mkTm(s.wBg1.aboveEnable, s.wBg2.aboveEnable,
+                  s.wBg3.aboveEnable, s.wBg4.aboveEnable, s.wObj.aboveEnable);
+  out->tsw = mkTm(s.wBg1.belowEnable, s.wBg2.belowEnable,
+                  s.wBg3.belowEnable, s.wBg4.belowEnable, s.wObj.belowEnable);
 
-  out->cgwsel  = (uint8_t)((p.dac.io.directColor ? 0x01 : 0)
-                        | (p.dac.io.blendMode ? 0x02 : 0)
-                        | ((p.dac.window.belowMask & 0x03) << 4)
-                        | ((p.dac.window.aboveMask & 0x03) << 6));
-  // CGADDSUB ($2131): performance PPU stores colorEnable as a 7-element
-  // n1 array indexed by Source::{BG1,BG2,BG3,BG4,OBJ1,OBJ2,COL}.
-  using PerfPPU = ares::SuperFamicom::PPUPerformance;
-  out->cgadsub = (uint8_t)((p.dac.io.colorEnable[PerfPPU::Source::BG1]  ? 0x01 : 0)
-                        | (p.dac.io.colorEnable[PerfPPU::Source::BG2]  ? 0x02 : 0)
-                        | (p.dac.io.colorEnable[PerfPPU::Source::BG3]  ? 0x04 : 0)
-                        | (p.dac.io.colorEnable[PerfPPU::Source::BG4]  ? 0x08 : 0)
-                        | (p.dac.io.colorEnable[PerfPPU::Source::OBJ2] ? 0x10 : 0)
-                        | (p.dac.io.colorEnable[PerfPPU::Source::COL]  ? 0x20 : 0)
-                        | (p.dac.io.colorHalve ? 0x40 : 0)
-                        | (p.dac.io.colorMode ? 0x80 : 0));
-  out->setini = (uint8_t)((p.io.interlace ? 0x01 : 0)
-                       | (p.io.overscan ? 0x10 : 0)
-                       | (p.io.pseudoHires ? 0x40 : 0)
-                       | (p.io.extbg ? 0x80 : 0));
+  out->cgwsel  = (uint8_t)((s.dacDirectColor ? 0x01 : 0)
+                        | (s.dacBlendMode ? 0x02 : 0)
+                        | ((s.dacWinBelowMask & 0x03) << 4)
+                        | ((s.dacWinAboveMask & 0x03) << 6));
+  out->cgadsub = (uint8_t)((s.colorEnableBG1 ? 0x01 : 0)
+                        | (s.colorEnableBG2 ? 0x02 : 0)
+                        | (s.colorEnableBG3 ? 0x04 : 0)
+                        | (s.colorEnableBG4 ? 0x08 : 0)
+                        | (s.colorEnableOBJ ? 0x10 : 0)
+                        | (s.colorEnableCOL ? 0x20 : 0)
+                        | (s.colorHalve ? 0x40 : 0)
+                        | (s.colorMode ? 0x80 : 0));
+  out->setini = (uint8_t)((s.interlace ? 0x01 : 0)
+                       | (s.overscan ? 0x10 : 0)
+                       | (s.pseudoHires ? 0x40 : 0)
+                       | (s.extbg ? 0x80 : 0));
 
-  out->hcounter = (uint16_t)p.io.hcounter;
-  out->vcounter = (uint16_t)p.io.vcounter;
+  // Counters live on PPUcounter base, shared between impls. Pull from the
+  // active one.
+  if(ares::SuperFamicom::ppu.accurate) {
+    out->hcounter = (uint16_t)ares::SuperFamicom::ppuImpl.io.hcounter;
+    out->vcounter = (uint16_t)ares::SuperFamicom::ppuImpl.io.vcounter;
+  } else {
+    out->hcounter = (uint16_t)ares::SuperFamicom::ppuPerformanceImpl.io.hcounter;
+    out->vcounter = (uint16_t)ares::SuperFamicom::ppuPerformanceImpl.io.vcounter;
+  }
 
   // DMA / HDMA channels
   uint8_t mdmaen = 0, hdmaen = 0;
@@ -985,7 +1011,9 @@ void kintsuki_get_ppu_state(kintsuki_t* h, kintsuki_ppu_state_t* out) {
   }
   out->mdmaen = mdmaen;
   out->hdmaen = hdmaen;
-  out->obsel = (uint8_t)(p.obj.io.baseSize << 5 | p.obj.io.nameselect << 3 | p.obj.io.tiledataAddress >> 13);
+  out->obsel = (uint8_t)((s.objBaseSize << 5)
+                       | (s.objNameselect << 3)
+                       | (s.objTiledataAddress >> 13));
 }
 
 uint32_t kintsuki_save_state(kintsuki_t* h, void* buf, uint32_t cap) {
@@ -1129,7 +1157,7 @@ void kintsuki_dsp_write_register(kintsuki_t* h, uint8_t addr, uint8_t value) {
 // `kintsuki_screenshot` does so canonical bytes match the canonical PNG.
 int kintsuki_ppu_hires(kintsuki_t* h) {
   if(!h) return 0;
-  return ares::SuperFamicom::ppuPerformanceImpl.hires() ? 1 : 0;
+  return kintsuki::ppu::hires() ? 1 : 0;
 }
 
 void kintsuki_set_input(kintsuki_t* h, int port, uint16_t mask) {
@@ -2193,11 +2221,11 @@ void dmaHookFn(uint8_t channel, uint8_t direction, uint8_t mode,
     g_project->note_dma(src, size, dst);
     g_project->note_dma_provenance(src, size, dst, callerPc, frame);
   }
-  // Capture VMADDR (word) at the moment the DMA fires — gives the
+  // Capture VMADDR (word) at the moment the DMA fires. Gives the
   // user the actual VRAM destination, not just "we wrote something
-  // through VMDATA". Read from the live performance PPU; the
-  // CGRAM/OAM equivalents could be added later if needed.
-  uint16_t vramAddr = (uint16_t)ares::SuperFamicom::ppuPerformanceImpl.vram.address;
+  // through VMDATA". The facade reads from whichever PPU impl is
+  // active; CGRAM/OAM equivalents could be added later if needed.
+  uint16_t vramAddr = kintsuki::ppu::vramAddress();
   // Dedupe key now includes vram_addr + caller_pc so two transfers from
   // different callers (or to different VRAM regions) don't collapse.
   for(size_t i = 0; i < g_dmaLogSize; i++) {
@@ -2341,7 +2369,7 @@ void sdd1HookFn(uint8_t event, uint8_t channel, uint32_t busAddr,
     st.info.size       = size;
     st.info.channel    = channel;
     st.info.dst_reg    = (uint8_t)ch.targetAddress;
-    st.info.vram_addr  = (uint16_t)ares::SuperFamicom::ppuPerformanceImpl.vram.address;
+    st.info.vram_addr  = kintsuki::ppu::vramAddress();
     st.info.wram_addr  = 0x7E0000 | ares::SuperFamicom::cpu.wramAddress();
     st.info.caller_pc  = g_callstack.empty()
       ? ((uint32_t)ares::SuperFamicom::cpu.r.pc.d & 0xFFFFFF)
@@ -2476,7 +2504,7 @@ void kintsuki_vram_map_stop(kintsuki_t* h) {
 uint32_t kintsuki_vram_map_snapshot(kintsuki_t* h, uint16_t* reads, uint32_t* writes,
                                     uint32_t* writers, uint32_t cap) {
   if(!h || g_vramReads.empty()) return 0;
-  uint32_t words = (uint32_t)ares::SuperFamicom::ppuPerformanceImpl.vram.mask + 1;
+  uint32_t words = kintsuki::ppu::vramWordCount();
   uint32_t n = words < cap ? words : cap;
   if(reads) std::copy_n(g_vramReads.begin(), n, reads);
   if(writes) std::copy_n(g_vramWrites.begin(), n, writes);

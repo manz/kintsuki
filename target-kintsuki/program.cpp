@@ -8,6 +8,7 @@
 
 #include "program.hpp"
 #include "heuristics.hpp"
+#include "ppu_shadow.hpp"
 
 #include <nall/beat/single/apply.hpp>
 
@@ -367,9 +368,22 @@ auto Program::loadRom(const char* path) -> bool {
 }
 
 auto Program::bootRom() -> bool {
+  // Tear down any previously loaded system BEFORE flipping the PPU
+  // implementation. SuperFamicom::load auto-unloads a prior session, but
+  // through whatever ppu.implementation points at *now*; swapping that
+  // out first would make unload() target the wrong impl and leak the
+  // previous one's Thread + screen Node (the old impl stays attached to
+  // the scheduler and crashes on the next tick).
+  if(loaded) {
+    SuperFamicom::system.unload();
+    loaded = false;
+  }
   // Performance PPU works fine — the earlier "no pixels" symptom was the
   // missing port.allocate/connect call (see below), not a PPU choice.
-  SuperFamicom::ppu.setAccurate(false);
+  // When ppuAccurate is on, route rendering through the cycle-accurate
+  // implementation; kintsuki's debug surfaces still read performance
+  // impl state and will go stale (documented at the field).
+  SuperFamicom::ppu.setAccurate(ppuAccurate);
 
   Node::System root;
   string profile = "[Nintendo] Super Famicom (NTSC)";
@@ -395,10 +409,19 @@ auto Program::bootRom() -> bool {
   }
 
   // PPU::power() latches vram.mask from this setting, so it has to be set
-  // between load() (which creates the node) and the first power().
-  SuperFamicom::ppuPerformanceImpl.vramSize->setValue(vramSizeBytes);
+  // between load() (which creates the node) and the first power(). Both
+  // impls expose the VRAM setting node; set on whichever one is active.
+  if(ppuAccurate) {
+    SuperFamicom::ppuImpl.vramSize->setValue(vramSizeBytes);
+  } else {
+    SuperFamicom::ppuPerformanceImpl.vramSize->setValue(vramSizeBytes);
+  }
 
   SuperFamicom::system.power(false);
+  // Fresh system boot resets every $21xx bit; mirror that in the shadow
+  // so a readout right after bootRom (and before any writeIO replays)
+  // doesn't surface stale state from the previous session.
+  kintsuki::ppu::shadow.reset();
   loaded = true;
   return true;
 }
@@ -787,6 +810,11 @@ struct KssfFooter {
   uint16_t    verMinor = 0;
   uint32_t    aresBlobLen = 0;    // bytes before footer (or total len if absent)
   KssfRegion  cartSram;
+  // ppu.shadow TLV: pointer into the blob + length when present. Owned by
+  // caller's blob; loadStateBlob memcpys into kintsuki::ppu::shadow when
+  // the length matches sizeof(Shadow).
+  const uint8_t* ppuShadowData = nullptr;
+  uint32_t       ppuShadowLen  = 0;
 };
 
 auto parseKssfFooter(const uint8_t* data, uint32_t size) -> KssfFooter {
@@ -825,6 +853,9 @@ auto parseKssfFooter(const uint8_t* data, uint32_t size) -> KssfFooter {
       f.cartSram.offset  = readU32LE(tlvData + 0);
       f.cartSram.length  = readU32LE(tlvData + 4);
       f.cartSram.present = true;
+    } else if(name == "ppu.shadow") {
+      f.ppuShadowData = tlvData;
+      f.ppuShadowLen  = dataLen;
     }
     // unknown TLVs: skip silently (forward-compat)
   }
@@ -839,20 +870,60 @@ auto unserializeState(Program& program, serializer& s) -> bool {
   return true;
 }
 
+// Pull the IO shadow out of a KSSF footer, when present and sized right.
+// Older blobs (pre-shadow or different struct size) leave the live shadow
+// alone; it stays accurate up to the pre-load state only, which is still
+// better than wiping it.
+auto restoreShadowFromFooter(const KssfFooter& f) -> void {
+  if(!f.valid || !f.ppuShadowData) return;
+  if(f.ppuShadowLen != sizeof(kintsuki::ppu::Shadow)) return;
+  std::memcpy(&kintsuki::ppu::shadow, f.ppuShadowData, sizeof(kintsuki::ppu::Shadow));
+}
+
+// Peek the ppuAccurate flag the blob was saved under. Mirrors the ares
+// System::unserialize prefix (signature, synchronize, version, description,
+// ppuAcc). Returns false if the blob is too short or looks malformed.
+auto peekSavedPpuAccurate(const uint8_t* data, u32 size, bool& out) -> bool {
+  if(!data || size < 4 + 1 + 16 + 512 + 1) return false;
+  serializer s(data, size);
+  u32  sig = 0;
+  bool sync = true;
+  char ver[16] = {};
+  char desc[512] = {};
+  bool ppuAcc = false;
+  s(sig);
+  s(sync);
+  s(ver);
+  s(desc);
+  s(ppuAcc);
+  if(sig != ares::SerializerSignature) return false;
+  out = ppuAcc;
+  return true;
+}
+
 }  // anonymous namespace
 
 auto Program::cpuClockSkew() const -> s64 {
   // Both threads count master cycles in the same scaled units; the counters
   // place each one in the frame. Lines are taken as 1364 cycles (240 can be
-  // 4 short, hence SkewTolerance).
+  // 4 short, hence SkewTolerance). Pick whichever impl is currently driving
+  // the scheduler; the other impl's clock is frozen at the last mode swap.
   auto& cpu = SuperFamicom::cpu;
-  auto& ppu = SuperFamicom::ppuPerformanceImpl;
   s64 scalar = (s64)cpu.scalar();
-  s64 clocks = ((s64)(cpu.clock() - ppu.clock())) / scalar;
+  s64 ppuClock = SuperFamicom::ppu.accurate
+    ? (s64)SuperFamicom::ppuImpl.clock()
+    : (s64)SuperFamicom::ppuPerformanceImpl.clock();
+  s64 ppuV = SuperFamicom::ppu.accurate
+    ? (s64)SuperFamicom::ppuImpl.vcounter()
+    : (s64)SuperFamicom::ppuPerformanceImpl.vcounter();
+  s64 ppuH = SuperFamicom::ppu.accurate
+    ? (s64)SuperFamicom::ppuImpl.hcounter()
+    : (s64)SuperFamicom::ppuPerformanceImpl.hcounter();
+  s64 clocks = ((s64)cpu.clock() - ppuClock) / scalar;
   s64 line = 1364;
   s64 frame = line * (SuperFamicom::Region::PAL() ? 312 : 262);
-  s64 position = ((s64)cpu.vcounter() - (s64)ppu.vcounter()) * line
-               + (s64)cpu.hcounter() - (s64)ppu.hcounter();
+  s64 position = ((s64)cpu.vcounter() - ppuV) * line
+               + (s64)cpu.hcounter() - ppuH;
   if(position > frame / 2) position -= frame;
   if(position < -frame / 2) position += frame;
   return clocks - position;
@@ -894,6 +965,15 @@ auto Program::saveStateBlob() -> std::vector<uint8_t> {
   region[7] = (uint8_t)((sramSize >> 24) & 0xff);
   writeTLV(footer, "cart.sram", region, 8);
 
+  // ppu.shadow: raw bytes of the IO shadow struct. ares' unserialize
+  // restores each impl's internal state without replaying writeIO, so
+  // without this the shadow would be a reset after load. Layout is
+  // kintsuki's own, versioned via sizeof: a reader expecting a different
+  // size skips the TLV.
+  writeTLV(footer, "ppu.shadow",
+           reinterpret_cast<const uint8_t*>(&kintsuki::ppu::shadow),
+           (uint32_t)sizeof(kintsuki::ppu::Shadow));
+
   uint32_t footerLen = (uint32_t)footer.size();
   out.insert(out.end(), footer.begin(), footer.end());
   writeU32LE(out, footerLen);
@@ -908,6 +988,21 @@ auto Program::loadStateBlob(const uint8_t* data, u32 size) -> bool {
   // why) or fit the region under sramPolicy. A blob without a footer can't be
   // checked; it loads as before.
   lastError.clear();
+  // Cross-mode compat: ares' System::unserialize refuses when the saved
+  // ppuAcc differs from the live impl (different struct layouts past that
+  // point). Peek the saved flag and swap PPU impl + rebuild the system
+  // before deserializing, so a state saved in one mode loads in the other
+  // without the user having to toggle manually.
+  if(loaded) {
+    bool savedAcc = false;
+    if(peekSavedPpuAccurate(data, size, savedAcc) && savedAcc != ppuAccurate) {
+      ppuAccurate = savedAcc;
+      if(!bootRom()) {
+        lastError = "load_state: failed to swap PPU mode to match the state";
+        return false;
+      }
+    }
+  }
   auto footer = parseKssfFooter(data, size);
   u32 cartSram = (u32)SuperFamicom::cartridge.ram.size();
   if(footer.valid && footer.cartSram.present && footer.cartSram.length != cartSram) {
@@ -925,11 +1020,15 @@ auto Program::loadStateBlob(const uint8_t* data, u32 size) -> bool {
     patched.insert(patched.end(), sram.begin(), sram.end());
     patched.insert(patched.end(), data + srcOff + srcLen, data + footer.aresBlobLen);
     serializer s(patched.data(), (u32)patched.size());
-    return unserializeState(*this, s);
+    if(!unserializeState(*this, s)) return false;
+    restoreShadowFromFooter(footer);
+    return true;
   }
   u32 aresLen = footer.present ? footer.aresBlobLen : size;
   serializer s(data, aresLen);
-  return unserializeState(*this, s);
+  if(!unserializeState(*this, s)) return false;
+  restoreShadowFromFooter(footer);
+  return true;
 }
 
 auto Program::loadStateBlobEx(const uint8_t* data, u32 size,
@@ -980,6 +1079,14 @@ auto Program::loadStateBlobEx(const uint8_t* data, u32 size,
 
   // Non-inject path: drive ares unserialize. STRICT and REMAP need
   // producer/cart sram comparison.
+  // Cross-mode compat: swap PPU impl before unserialize when the blob was
+  // saved in the other mode. Same reason as loadStateBlob; bootRom
+  // re-powers the system, then unserialize restores every CPU/PPU field.
+  bool savedAcc = false;
+  if(peekSavedPpuAccurate(data, size, savedAcc) && savedAcc != ppuAccurate) {
+    ppuAccurate = savedAcc;
+    if(!bootRom()) return 0;
+  }
   bool sizeMismatch = (producerSram != 0 && producerSram != cartSram);
 
   if(flags & FLAG_STRICT) {
@@ -1007,7 +1114,9 @@ auto Program::loadStateBlobEx(const uint8_t* data, u32 size,
                    data + footer.aresBlobLen);
 
     serializer s(patched.data(), (u32)patched.size());
-    return unserializeState(*this, s) ? 1 : 0;
+    if(!unserializeState(*this, s)) return 0;
+    restoreShadowFromFooter(footer);
+    return 1;
   }
 
   if(sizeMismatch) return 0;  // no flag covers this case → reject
@@ -1015,7 +1124,9 @@ auto Program::loadStateBlobEx(const uint8_t* data, u32 size,
   // Default path: equivalent to loadStateBlob.
   u32 aresLen = footer.present ? footer.aresBlobLen : size;
   serializer s(data, aresLen);
-  return unserializeState(*this, s) ? 1 : 0;
+  if(!unserializeState(*this, s)) return 0;
+  restoreShadowFromFooter(footer);
+  return 1;
 }
 
 auto Program::saveStateFile(const char* path) -> bool {

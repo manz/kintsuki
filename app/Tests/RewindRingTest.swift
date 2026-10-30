@@ -132,6 +132,46 @@ struct RewindBufferTest {
                   + "want < \(limit)")
         }
 
+        // ---- forceKeyframeOnNextPush bridges a size discontinuity --------
+        do {
+            // Mode-flip scenario: frames before the flip are size A, after
+            // are size B. Without the force, the first post-flip push lands
+            // mid-schedule as a delta and XORs against a size-A keyframe,
+            // corrupting the materialize. With the force, each contiguous
+            // same-shape segment uses its own keyframes and round-trips.
+            let buf = RewindBuffer(capacity: 50, keyframeInterval: 10)
+            func sizeA(_ seed: UInt8) -> Data {
+                var d = Data(count: 1024)
+                d.withUnsafeMutableBytes { raw in
+                    let p = raw.bindMemory(to: UInt8.self)
+                    for i in 0..<p.count { p[i] = seed &+ UInt8(i & 0xFF) }
+                }
+                return d
+            }
+            func sizeB(_ seed: UInt8) -> Data {
+                var d = Data(count: 2048)
+                d.withUnsafeMutableBytes { raw in
+                    let p = raw.bindMemory(to: UInt8.self)
+                    for i in 0..<p.count { p[i] = seed ^ UInt8(i & 0xFF) }
+                }
+                return d
+            }
+            let pre = (0..<7).map { sizeA(UInt8($0)) }
+            let post = (0..<7).map { sizeB(UInt8($0 + 100)) }
+            for s in pre { buf.push(s) }
+            buf.forceKeyframeOnNextPush()
+            for s in post { buf.push(s) }
+            check(buf.count == 14, "both segments retained")
+            for (i, want) in pre.enumerated() {
+                check(buf.materialize(at: i) == want,
+                      "pre-flip frame \(i) survives segment boundary")
+            }
+            for (i, want) in post.enumerated() {
+                check(buf.materialize(at: 7 + i) == want,
+                      "post-flip frame \(i) round-trips against new keyframe")
+            }
+        }
+
         // ---- clear --------------------------------------------------------
         do {
             let buf = RewindBuffer(capacity: 5, keyframeInterval: 2)

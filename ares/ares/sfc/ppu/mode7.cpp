@@ -38,7 +38,9 @@ auto PPU::Background::runMode7() -> void {
 
   bool outOfBounds = (pixelX | pixelY) & ~1023;
 
+  if(!(self.io.repeatMode7 == 3 && outOfBounds)) self.kintsukiRead(tileAddress, 1 << id);
   n8 tile = self.io.repeatMode7 == 3 && outOfBounds ? 0 : vram[tileAddress] >> 0;
+  if(!(self.io.repeatMode7 == 2 && outOfBounds)) self.kintsukiRead(tile << 6 | paletteAddress, 0x10 << id);
   n8 palette = self.io.repeatMode7 == 2 && outOfBounds ? 0 : vram[tile << 6 | paletteAddress] >> 8;
 
   u32 priority;

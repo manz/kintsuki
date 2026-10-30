@@ -146,11 +146,11 @@ auto PPU::Object::fetch() -> void {
       u32 pos = tiledataAddress + ((chry + (chrx + mx & 15)) << 4);
       n16 address = (pos & 0xfff0) + (y & 7);
 
-      if(!self.io.displayDisable)
+      self.kintsukiRead(address + 0, 0x100);
       oamTile[n].data.bit( 0,15) = vram[address + 0];
       self.step(4);
 
-      if(!self.io.displayDisable)
+      self.kintsukiRead(address + 8, 0x100);
       oamTile[n].data.bit(16,31) = vram[address + 8];
       self.step(4);
     }

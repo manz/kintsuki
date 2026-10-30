@@ -18,37 +18,32 @@ doesn't exist yet, the current frame is saved (via the same screenshot
 path) and the test is `skip`-ed with a message asking the user to
 commit the golden. If it exists, behaves like `assert_pixel_match`.
 
-The dependency on Pillow/numba/numpy is dev-only (declared in the
+The dependency on numba/numpy is dev-only (declared in the
 ``[visual]`` extras / dev group). Production kintsuki users don't pay
-for it.
+for it. PNG I/O is stdlib-only (zlib + a tiny decoder in
+``kintsuki._png``, encoder shared with ``kintsuki.recorder``).
 """
 
 from __future__ import annotations
 
 import tempfile
-from io import BytesIO
 from pathlib import Path
 from typing import Protocol
 
 import numpy as np
+from numpy.typing import NDArray
 import pytest
-from PIL import Image
 
+from ._png import decode_rgba
 from ._vendor.pixelmatch_numba import pixelmatch
+from .recorder import _encode_png_rgba
 
 
 class _EmuLike(Protocol):
     def screenshot(self, path: str) -> bool: ...
 
 
-def _open_rgba(path: str | Path) -> Image.Image:
-    """Decode a PNG and force it into RGBA so pixelmatch sees uniform
-    channel layout regardless of how the writer stored it (writePNG
-    emits RGB; PIL adds alpha=255 on convert)."""
-    return Image.open(path).convert("RGBA")
-
-
-def _screenshot_to_image(emu: _EmuLike) -> Image.Image:
+def _screenshot_to_rgba(emu: _EmuLike) -> NDArray[np.uint8]:
     """Snapshot the current frame via the C `writePNG` path into a temp
     file and decode it as RGBA. Funneling through screenshot() is what
     keeps record + compare bit-identical."""
@@ -57,7 +52,7 @@ def _screenshot_to_image(emu: _EmuLike) -> Image.Image:
     try:
         if not emu.screenshot(tmp_path):
             raise AssertionError("emu.screenshot() failed")
-        return _open_rgba(tmp_path).copy()  # detach from disk
+        return decode_rgba(tmp_path)
     finally:
         try:
             Path(tmp_path).unlink()
@@ -65,33 +60,34 @@ def _screenshot_to_image(emu: _EmuLike) -> Image.Image:
             pass
 
 
+def _save_rgba_png(arr: NDArray[np.uint8], path: Path) -> None:
+    h, w, _ = arr.shape
+    path.write_bytes(_encode_png_rgba(np.ascontiguousarray(arr).tobytes(), w, h))
+
+
 def pixel_diff(a_rgba: bytes, b_rgba: bytes, w: int, h: int, *,
                threshold: float = 0.1) -> tuple[int, bytes]:
     """Compare two **canonical RGBA** byte buffers (R, G, B, A per
     pixel). Returns ``(mismatch_pixel_count, diff_png_bytes)``. Use
     :func:`pixel_diff_files` if your inputs are PNGs on disk — that
-    path goes through Pillow's decoder and avoids the BGRA-confusion
-    that bites callers who feed ``Emu.framebuffer()`` bytes here."""
-    a = Image.fromarray(np.frombuffer(a_rgba, dtype=np.uint8).reshape((h, w, 4)),
-                        "RGBA")
-    b = Image.fromarray(np.frombuffer(b_rgba, dtype=np.uint8).reshape((h, w, 4)),
-                        "RGBA")
+    path goes through the kintsuki PNG decoder and avoids the
+    BGRA-confusion that bites callers who feed ``Emu.framebuffer()``
+    bytes here."""
+    a = np.frombuffer(a_rgba, dtype=np.uint8).reshape((h, w, 4))
+    b = np.frombuffer(b_rgba, dtype=np.uint8).reshape((h, w, 4))
     n, diff = pixelmatch(a, b, threshold=threshold)
-    buf = BytesIO()
-    diff.save(buf, format="PNG")
-    return n, buf.getvalue()
+    return n, _encode_png_rgba(np.ascontiguousarray(diff).tobytes(), w, h)
 
 
 def pixel_diff_files(a_path: str | Path, b_path: str | Path, *,
                      threshold: float = 0.1) -> tuple[int, bytes]:
     """File-level companion to :func:`pixel_diff`. Decodes both PNGs as
     RGBA, runs pixelmatch, returns the same tuple."""
-    a = _open_rgba(a_path)
-    b = _open_rgba(b_path)
+    a = decode_rgba(a_path)
+    b = decode_rgba(b_path)
     n, diff = pixelmatch(a, b, threshold=threshold)
-    buf = BytesIO()
-    diff.save(buf, format="PNG")
-    return n, buf.getvalue()
+    h, w, _ = diff.shape
+    return n, _encode_png_rgba(np.ascontiguousarray(diff).tobytes(), w, h)
 
 
 def assert_pixel_match(emu: _EmuLike, golden_path: str | Path, *,
@@ -104,19 +100,21 @@ def assert_pixel_match(emu: _EmuLike, golden_path: str | Path, *,
     if not golden_path.exists():
         raise FileNotFoundError(f"golden PNG not found: {golden_path}")
 
-    actual_img = _screenshot_to_image(emu)
-    golden_img = _open_rgba(golden_path)
-    if golden_img.size != actual_img.size:
+    actual = _screenshot_to_rgba(emu)
+    gold = decode_rgba(golden_path)
+    if gold.shape != actual.shape:
+        gh, gw, _ = gold.shape
+        ah, aw, _ = actual.shape
         raise AssertionError(
-            f"size mismatch: golden is {golden_img.size}, "
-            f"actual frame is {actual_img.size}")
+            f"size mismatch: golden is ({gw}, {gh}), "
+            f"actual frame is ({aw}, {ah})")
 
-    n, diff = pixelmatch(golden_img, actual_img, threshold=threshold)
+    n, diff = pixelmatch(gold, actual, threshold=threshold)
     if n > max_diff_pixels:
         actual_path = golden_path.with_suffix(".actual.png")
         diff_path = golden_path.with_suffix(".diff.png")
-        actual_img.save(actual_path, format="PNG")
-        diff.save(diff_path, format="PNG")
+        _save_rgba_png(actual, actual_path)
+        _save_rgba_png(diff, diff_path)
         raise AssertionError(
             f"{n} diff pixels (threshold={threshold}, "
             f"max_diff_pixels={max_diff_pixels}); "

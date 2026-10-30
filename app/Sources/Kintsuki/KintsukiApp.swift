@@ -124,12 +124,16 @@ struct KintsukiApp: App {
                 Button("Hot-Reload ROM (Keep State)") { emulator.hotReloadKeepingState() }
                     .keyboardShortcut("r", modifiers: [.command, .option])
                     .disabled(emulator.loadedROM == nil)
+            }
+            CommandMenu("Playback") {
                 Button(emulator.running ? "Pause" : "Resume") {
                     emulator.togglePause()
                 }
                 .keyboardShortcut("p", modifiers: .command)
                 Toggle("Mute Audio", isOn: $emulator.muted)
                     .keyboardShortcut("m", modifiers: [.command, .option])
+                Toggle("Accurate PPU", isOn: $emulator.ppuAccurate)
+                Divider()
                 Button("Step Frame") { emulator.stepOneFrame() }
                     .keyboardShortcut(".", modifiers: .command)
                 Button("Rewind 1 Frame") { emulator.rewindOneFrame() }
@@ -139,31 +143,6 @@ struct KintsukiApp: App {
                     .keyboardShortcut(.leftArrow, modifiers: [.command, .shift])
                     .disabled(!emulator.canRewind)
                 Divider()
-                Button("Tilemap Viewer") { toggleToolWindow("tilemap") }
-                    .keyboardShortcut("t", modifiers: [.command, .shift])
-                Button("VRAM Viewer") { toggleToolWindow("vram") }
-                    .keyboardShortcut("v", modifiers: [.command, .shift])
-                Button("VRAM Map") { toggleToolWindow("vrammap") }
-                    .keyboardShortcut("k", modifiers: [.command, .shift])
-                Button("Memory Viewer") { toggleToolWindow("memory") }
-                    .keyboardShortcut("m", modifiers: [.command, .shift])
-                Button("HDMA Inspector") { toggleToolWindow("hdma") }
-                    .keyboardShortcut("h", modifiers: [.command, .shift])
-                Button("S-DD1 Viewer") { toggleToolWindow("sdd1") }
-                    .keyboardShortcut("u", modifiers: [.command, .shift])
-                    .disabled(emulator.loadedROM == nil || !emulator.sdd1Present)
-                Button("Debugger") { toggleToolWindow("debugger") }
-                    .keyboardShortcut("d", modifiers: [.command, .shift])
-                Button("Project Labels") { toggleToolWindow("labels") }
-                    .keyboardShortcut("l", modifiers: [.command, .shift])
-                Button("Project Bookmarks") { toggleToolWindow("bookmarks") }
-                    .keyboardShortcut("b", modifiers: [.command, .shift])
-                Button("Profiler") { toggleToolWindow("profiler") }
-                    .keyboardShortcut("f", modifiers: [.command, .shift])
-                Button("Patch Info") { toggleToolWindow("patch") }
-                    .keyboardShortcut("i", modifiers: [.command, .shift])
-                    .disabled(emulator.loadedROM == nil)
-                Divider()
                 Button("Save Screenshot") { saveScreenshotToPicturesFolder() }
                     .keyboardShortcut("p", modifiers: [.command, .shift])
                     .disabled(emulator.loadedROM == nil)
@@ -172,6 +151,34 @@ struct KintsukiApp: App {
                 }
                 .keyboardShortcut("p", modifiers: [.command, .option])
                 .disabled(emulator.loadedROM == nil)
+            }
+            CommandMenu("Debug") {
+                Button("Debugger") { toggleToolWindow("debugger") }
+                    .keyboardShortcut("d", modifiers: [.command, .shift])
+                Button("Memory Viewer") { toggleToolWindow("memory") }
+                    .keyboardShortcut("m", modifiers: [.command, .shift])
+                Button("Profiler") { toggleToolWindow("profiler") }
+                    .keyboardShortcut("f", modifiers: [.command, .shift])
+                Divider()
+                Button("Tilemap Viewer") { toggleToolWindow("tilemap") }
+                    .keyboardShortcut("t", modifiers: [.command, .shift])
+                Button("VRAM Viewer") { toggleToolWindow("vram") }
+                    .keyboardShortcut("v", modifiers: [.command, .shift])
+                Button("VRAM Map") { toggleToolWindow("vrammap") }
+                    .keyboardShortcut("k", modifiers: [.command, .shift])
+                Button("HDMA Inspector") { toggleToolWindow("hdma") }
+                    .keyboardShortcut("h", modifiers: [.command, .shift])
+                Button("S-DD1 Viewer") { toggleToolWindow("sdd1") }
+                    .keyboardShortcut("u", modifiers: [.command, .shift])
+                    .disabled(emulator.loadedROM == nil || !emulator.sdd1Present)
+                Divider()
+                Button("Project Labels") { toggleToolWindow("labels") }
+                    .keyboardShortcut("l", modifiers: [.command, .shift])
+                Button("Project Bookmarks") { toggleToolWindow("bookmarks") }
+                    .keyboardShortcut("b", modifiers: [.command, .shift])
+                Button("Patch Info") { toggleToolWindow("patch") }
+                    .keyboardShortcut("i", modifiers: [.command, .shift])
+                    .disabled(emulator.loadedROM == nil)
             }
             CommandMenu("Project") {
                 if emulator.projectIsOpen, let dir = emulator.projectDir {

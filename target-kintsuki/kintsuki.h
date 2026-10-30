@@ -95,6 +95,22 @@ int         kintsuki_set_vram_size(kintsuki_t*, uint32_t bytes);
 // Current PPU VRAM size in bytes (65536 or 131072). 0 on a NULL handle.
 uint32_t    kintsuki_vram_size(kintsuki_t*);
 
+// Select which ares SNES PPU implementation renders frames. Default 0:
+// ppu-performance (ares' fast scanline renderer). Pass 1 to route through
+// the cycle-accurate PPU on the next kintsuki_load_rom. kintsuki's debug
+// surfaces (VRAM/CGRAM/OAM state, span tracer, hires probe) remain anchored
+// to the performance impl, so they read stale state while accurate mode is
+// on; this toggle changes the rendered picture, not the debug tooling.
+// Latched at bootRom() time; flipping requires a fresh load_rom to take
+// effect. Save states are tagged with the active PPU accurate flag and
+// cross-mode restores will be refused by the ares serializer.
+// Returns 1 on success, 0 on a NULL handle.
+int         kintsuki_set_ppu_accurate(kintsuki_t*, int enable);
+
+// Current PPU accurate flag (0 = performance, 1 = accurate). 0 on a NULL
+// handle.
+int         kintsuki_ppu_accurate(kintsuki_t*);
+
 // Load `len` bytes from `data` into the cart's SRAM region (the
 // in-memory `save.ram` buffer ares allocated at boot). Use this to
 // inject a `.srm` blob without binding the file on disk: the emulator

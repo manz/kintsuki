@@ -220,6 +220,15 @@ struct Program : ares::Platform {
   // are accepted (see kintsuki_set_vram_size).
   uint32_t vramSizeBytes = 64 * 1024;
 
+  // When true, bootRom() routes rendering through ares' accurate PPU
+  // (ares::SuperFamicom::ppuImpl) instead of the default ppu-performance
+  // impl. kintsuki's debug surfaces (VRAM/CGRAM/OAM introspection, span
+  // tracer, hires probe) remain anchored to ppuPerformanceImpl, so they
+  // read stale state while accurate is active; accurate mode is a
+  // run-time behavior toggle only. Latched at bootRom() time; flipping
+  // between loads requires a fresh load_rom() to take effect.
+  bool ppuAccurate = false;
+
 private:
   // ROM image + cart pak built at load_rom().
   std::vector<uint8_t> romData;
