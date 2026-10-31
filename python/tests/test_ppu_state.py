@@ -48,6 +48,37 @@ def test_ppu_state_after_test_rom_setup(assemble_rom):
         assert ch5.enabled == 0, "ch5.enabled should mirror HDMAEN bit (off)"
 
 
+def test_ppu_state_survives_save_load_without_shadow_footer(assemble_rom):
+    """Regression for a22: loading a state blob that lacks the ppu.shadow
+    TLV (any pre-a22 .kss, or a blob from a ROM with no SRAM) left the
+    IO shadow at reset defaults, so `get_ppu_state()` reported zero for
+    every $21xx-derived field until the game re-wrote it. The test ROM
+    has no SRAM, so `save_state()` emits no KSSF footer at all, which is
+    a perfect stand-in for a pre-shadow blob. After reload, the hydrator pulls
+    values back from the live ares impl and the readout matches."""
+    rom = assemble_rom("test_ppu_state.s")
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        emu.run_frames(30)
+        before = emu.get_ppu_state()
+        blob = emu.save_state()
+        # Guard the premise: no footer, so no ppu.shadow TLV to restore
+        # from. The hydrator is the only thing populating the shadow.
+        assert blob[-4:] != b"KSSF"
+
+    with Emu() as emu:
+        emu.load_rom(str(rom))
+        emu.load_state(blob)
+        after = emu.get_ppu_state()
+        for name in ("bgmode", "bg1sc", "bg2sc", "bg3sc", "bg4sc",
+                     "bg12nba", "bg34nba", "tm", "ts",
+                     "bg3vofs", "obsel",
+                     "m7a", "m7b", "m7c", "m7d", "m7x", "m7y"):
+            assert getattr(after, name) == getattr(before, name), (
+                f"{name}: pre={getattr(before, name):#x} "
+                f"post={getattr(after, name):#x}")
+
+
 def test_ppu_state_field_ranges(assemble_rom):
     """All bytes are within u8/u16; no garbage from struct copy overrun."""
     rom = assemble_rom("test_ppu_state.s")

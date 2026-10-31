@@ -870,10 +870,181 @@ auto unserializeState(Program& program, serializer& s) -> bool {
   return true;
 }
 
+// Rebuild the IO shadow from the live ares PPU impl. ares' serializer
+// restores every impl-side register; copying them back into the shadow
+// is what keeps pre-a22 saves (and any blob missing the ppu.shadow TLV)
+// usable: without this hydrate step the shadow stays whatever bootRom
+// reset it to, and any $21xx readout that doesn't get re-written by the
+// post-load game code reads zero. Covers the fields each impl actually
+// owns in its IO struct; derived latches that no snapshot persists stay
+// at their reset values (they're only observable mid-write anyway).
+auto hydrateShadowFromLive() -> void {
+  auto& s = kintsuki::ppu::shadow;
+  auto hydrateBg = [](kintsuki::ppu::Shadow::Bg& dst, auto& src) {
+    dst.tileSize        = (uint8_t)src.io.tileSize;
+    dst.screenAddress   = (uint16_t)src.io.screenAddress;
+    dst.screenSize      = (uint8_t)src.io.screenSize;
+    dst.tiledataAddress = (uint16_t)src.io.tiledataAddress;
+    dst.hoffset         = (uint16_t)src.io.hoffset;
+    dst.voffset         = (uint16_t)src.io.voffset;
+    dst.aboveEnable     = (uint8_t)src.io.aboveEnable;
+    dst.belowEnable     = (uint8_t)src.io.belowEnable;
+  };
+  auto hydrateWinLayer = [](kintsuki::ppu::Shadow::WLayer& dst, auto& src) {
+    dst.oneInvert   = (uint8_t)src.oneInvert;
+    dst.oneEnable   = (uint8_t)src.oneEnable;
+    dst.twoInvert   = (uint8_t)src.twoInvert;
+    dst.twoEnable   = (uint8_t)src.twoEnable;
+    dst.mask        = (uint8_t)src.mask;
+    dst.aboveEnable = (uint8_t)src.aboveEnable;
+    dst.belowEnable = (uint8_t)src.belowEnable;
+  };
+
+  if(ares::SuperFamicom::ppu.accurate) {
+    auto& p = ares::SuperFamicom::ppuImpl;
+    s.displayBrightness = (uint8_t)p.io.displayBrightness;
+    s.displayDisable    = (uint8_t)p.io.displayDisable;
+    s.oamBaseAddress    = (uint16_t)p.io.oamBaseAddress;
+    s.oamPriority       = (uint8_t)p.io.oamPriority;
+    s.bgMode            = (uint8_t)p.io.bgMode;
+    s.bgPriority        = (uint8_t)p.io.bgPriority;
+    s.cgramAddress      = (uint8_t)p.io.cgramAddress;
+    s.cgramAddressLatch = (uint8_t)p.io.cgramAddressLatch;
+    s.interlace         = (uint8_t)p.io.interlace;
+    s.overscan          = (uint8_t)p.io.overscan;
+    s.pseudoHires       = (uint8_t)p.io.pseudoHires;
+    s.extbg             = (uint8_t)p.io.extbg;
+    s.vramIncrementSize = (uint8_t)p.io.vramIncrementSize;
+    s.vramMapping       = (uint8_t)p.io.vramMapping;
+    s.vramMode          = (uint8_t)p.io.vramIncrementMode;
+    s.vramAddress       = (uint16_t)p.io.vramAddress;
+    s.mode7Hflip  = (uint8_t)p.io.hflipMode7;
+    s.mode7Vflip  = (uint8_t)p.io.vflipMode7;
+    s.mode7Repeat = (uint8_t)p.io.repeatMode7;
+    s.mode7A = (uint16_t)p.io.m7a;
+    s.mode7B = (uint16_t)p.io.m7b;
+    s.mode7C = (uint16_t)p.io.m7c;
+    s.mode7D = (uint16_t)p.io.m7d;
+    s.mode7X = (uint16_t)p.io.m7x;
+    s.mode7Y = (uint16_t)p.io.m7y;
+    s.mode7Hoffset = (uint16_t)p.io.hoffsetMode7;
+    s.mode7Voffset = (uint16_t)p.io.voffsetMode7;
+    hydrateBg(s.bg1, p.bg1);
+    hydrateBg(s.bg2, p.bg2);
+    hydrateBg(s.bg3, p.bg3);
+    hydrateBg(s.bg4, p.bg4);
+    s.mosaicSize         = (uint8_t)p.mosaic.size;
+    s.objBaseSize        = (uint8_t)p.obj.io.baseSize;
+    s.objNameselect      = (uint8_t)p.obj.io.nameselect;
+    s.objTiledataAddress = (uint16_t)p.obj.io.tiledataAddress;
+    s.objAboveEnable     = (uint8_t)p.obj.io.aboveEnable;
+    s.objBelowEnable     = (uint8_t)p.obj.io.belowEnable;
+    s.objInterlace       = (uint8_t)p.obj.io.interlace;
+    hydrateWinLayer(s.wBg1, p.window.io.bg1);
+    hydrateWinLayer(s.wBg2, p.window.io.bg2);
+    hydrateWinLayer(s.wBg3, p.window.io.bg3);
+    hydrateWinLayer(s.wBg4, p.window.io.bg4);
+    hydrateWinLayer(s.wObj, p.window.io.obj);
+    s.wCol.oneInvert = (uint8_t)p.window.io.col.oneInvert;
+    s.wCol.oneEnable = (uint8_t)p.window.io.col.oneEnable;
+    s.wCol.twoInvert = (uint8_t)p.window.io.col.twoInvert;
+    s.wCol.twoEnable = (uint8_t)p.window.io.col.twoEnable;
+    s.wCol.mask      = (uint8_t)p.window.io.col.mask;
+    s.dacWinAboveMask = (uint8_t)p.window.io.col.aboveMask;
+    s.dacWinBelowMask = (uint8_t)p.window.io.col.belowMask;
+    s.wOneLeft  = (uint8_t)p.window.io.oneLeft;
+    s.wOneRight = (uint8_t)p.window.io.oneRight;
+    s.wTwoLeft  = (uint8_t)p.window.io.twoLeft;
+    s.wTwoRight = (uint8_t)p.window.io.twoRight;
+    s.dacDirectColor = (uint8_t)p.dac.io.directColor;
+    s.dacBlendMode   = (uint8_t)p.dac.io.blendMode;
+    s.colorHalve = (uint8_t)p.dac.io.colorHalve;
+    s.colorMode  = (uint8_t)p.dac.io.colorMode;
+    s.colorRed   = (uint8_t)p.dac.io.colorRed;
+    s.colorGreen = (uint8_t)p.dac.io.colorGreen;
+    s.colorBlue  = (uint8_t)p.dac.io.colorBlue;
+    s.colorEnableBG1 = (uint8_t)p.dac.io.bg1.colorEnable;
+    s.colorEnableBG2 = (uint8_t)p.dac.io.bg2.colorEnable;
+    s.colorEnableBG3 = (uint8_t)p.dac.io.bg3.colorEnable;
+    s.colorEnableBG4 = (uint8_t)p.dac.io.bg4.colorEnable;
+    s.colorEnableOBJ = (uint8_t)p.dac.io.obj.colorEnable;
+    s.colorEnableCOL = (uint8_t)p.dac.io.back.colorEnable;
+  } else {
+    auto& p = ares::SuperFamicom::ppuPerformanceImpl;
+    s.displayBrightness = (uint8_t)p.io.displayBrightness;
+    s.displayDisable    = (uint8_t)p.io.displayDisable;
+    s.oamBaseAddress    = (uint16_t)p.io.oamBaseAddress;
+    s.oamPriority       = (uint8_t)p.io.oamPriority;
+    s.bgMode            = (uint8_t)p.io.bgMode;
+    s.bgPriority        = (uint8_t)p.io.bgPriority;
+    s.cgramAddress      = (uint8_t)p.io.cgramAddress;
+    s.cgramAddressLatch = (uint8_t)p.io.cgramAddressLatch;
+    s.interlace         = (uint8_t)p.io.interlace;
+    s.overscan          = (uint8_t)p.io.overscan;
+    s.pseudoHires       = (uint8_t)p.io.pseudoHires;
+    s.extbg             = (uint8_t)p.io.extbg;
+    s.vramIncrementSize = (uint8_t)p.vram.increment;
+    s.vramMapping       = (uint8_t)p.vram.mapping;
+    s.vramMode          = (uint8_t)p.vram.mode;
+    s.vramAddress       = (uint16_t)p.vram.address;
+    s.mode7Hflip  = (uint8_t)p.mode7.hflip;
+    s.mode7Vflip  = (uint8_t)p.mode7.vflip;
+    s.mode7Repeat = (uint8_t)p.mode7.repeat;
+    s.mode7A = (uint16_t)p.mode7.a;
+    s.mode7B = (uint16_t)p.mode7.b;
+    s.mode7C = (uint16_t)p.mode7.c;
+    s.mode7D = (uint16_t)p.mode7.d;
+    s.mode7X = (uint16_t)p.mode7.hcenter;
+    s.mode7Y = (uint16_t)p.mode7.vcenter;
+    s.mode7Hoffset = (uint16_t)p.mode7.hoffset;
+    s.mode7Voffset = (uint16_t)p.mode7.voffset;
+    hydrateBg(s.bg1, p.bg1);
+    hydrateBg(s.bg2, p.bg2);
+    hydrateBg(s.bg3, p.bg3);
+    hydrateBg(s.bg4, p.bg4);
+    s.mosaicSize         = (uint8_t)p.mosaic.size;
+    s.objBaseSize        = (uint8_t)p.obj.io.baseSize;
+    s.objNameselect      = (uint8_t)p.obj.io.nameselect;
+    s.objTiledataAddress = (uint16_t)p.obj.io.tiledataAddress;
+    s.objAboveEnable     = (uint8_t)p.obj.io.aboveEnable;
+    s.objBelowEnable     = (uint8_t)p.obj.io.belowEnable;
+    s.objInterlace       = (uint8_t)p.obj.io.interlace;
+    hydrateWinLayer(s.wBg1, p.bg1.window);
+    hydrateWinLayer(s.wBg2, p.bg2.window);
+    hydrateWinLayer(s.wBg3, p.bg3.window);
+    hydrateWinLayer(s.wBg4, p.bg4.window);
+    hydrateWinLayer(s.wObj, p.obj.window);
+    s.wCol.oneInvert = (uint8_t)p.dac.window.oneInvert;
+    s.wCol.oneEnable = (uint8_t)p.dac.window.oneEnable;
+    s.wCol.twoInvert = (uint8_t)p.dac.window.twoInvert;
+    s.wCol.twoEnable = (uint8_t)p.dac.window.twoEnable;
+    s.wCol.mask      = (uint8_t)p.dac.window.mask;
+    s.dacWinAboveMask = (uint8_t)p.dac.window.aboveMask;
+    s.dacWinBelowMask = (uint8_t)p.dac.window.belowMask;
+    s.wOneLeft  = (uint8_t)p.window.io.oneLeft;
+    s.wOneRight = (uint8_t)p.window.io.oneRight;
+    s.wTwoLeft  = (uint8_t)p.window.io.twoLeft;
+    s.wTwoRight = (uint8_t)p.window.io.twoRight;
+    s.dacDirectColor = (uint8_t)p.dac.io.directColor;
+    s.dacBlendMode   = (uint8_t)p.dac.io.blendMode;
+    s.colorHalve = (uint8_t)p.dac.io.colorHalve;
+    s.colorMode  = (uint8_t)p.dac.io.colorMode;
+    s.colorRed   = (uint8_t)p.dac.io.colorRed;
+    s.colorGreen = (uint8_t)p.dac.io.colorGreen;
+    s.colorBlue  = (uint8_t)p.dac.io.colorBlue;
+    s.colorEnableBG1 = (uint8_t)p.dac.io.colorEnable[0];
+    s.colorEnableBG2 = (uint8_t)p.dac.io.colorEnable[1];
+    s.colorEnableBG3 = (uint8_t)p.dac.io.colorEnable[2];
+    s.colorEnableBG4 = (uint8_t)p.dac.io.colorEnable[3];
+    s.colorEnableOBJ = (uint8_t)p.dac.io.colorEnable[4];
+    s.colorEnableCOL = (uint8_t)p.dac.io.colorEnable[5];
+  }
+}
+
 // Pull the IO shadow out of a KSSF footer, when present and sized right.
-// Older blobs (pre-shadow or different struct size) leave the live shadow
-// alone; it stays accurate up to the pre-load state only, which is still
-// better than wiping it.
+// A KSSF with the ppu.shadow TLV overrides the live-hydrated values with
+// the exact per-write snapshot; a KSSF without it (pre-a22 blobs) leaves
+// the already-hydrated shadow in place.
 auto restoreShadowFromFooter(const KssfFooter& f) -> void {
   if(!f.valid || !f.ppuShadowData) return;
   if(f.ppuShadowLen != sizeof(kintsuki::ppu::Shadow)) return;
@@ -1021,12 +1192,14 @@ auto Program::loadStateBlob(const uint8_t* data, u32 size) -> bool {
     patched.insert(patched.end(), data + srcOff + srcLen, data + footer.aresBlobLen);
     serializer s(patched.data(), (u32)patched.size());
     if(!unserializeState(*this, s)) return false;
+    hydrateShadowFromLive();
     restoreShadowFromFooter(footer);
     return true;
   }
   u32 aresLen = footer.present ? footer.aresBlobLen : size;
   serializer s(data, aresLen);
   if(!unserializeState(*this, s)) return false;
+  hydrateShadowFromLive();
   restoreShadowFromFooter(footer);
   return true;
 }
@@ -1115,6 +1288,7 @@ auto Program::loadStateBlobEx(const uint8_t* data, u32 size,
 
     serializer s(patched.data(), (u32)patched.size());
     if(!unserializeState(*this, s)) return 0;
+    hydrateShadowFromLive();
     restoreShadowFromFooter(footer);
     return 1;
   }
@@ -1125,6 +1299,7 @@ auto Program::loadStateBlobEx(const uint8_t* data, u32 size,
   u32 aresLen = footer.present ? footer.aresBlobLen : size;
   serializer s(data, aresLen);
   if(!unserializeState(*this, s)) return 0;
+  hydrateShadowFromLive();
   restoreShadowFromFooter(footer);
   return 1;
 }
