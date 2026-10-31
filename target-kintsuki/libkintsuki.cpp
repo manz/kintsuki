@@ -945,7 +945,11 @@ void kintsuki_get_ppu_state(kintsuki_t* h, kintsuki_ppu_state_t* out) {
   // facade so increments after VMDATA show up here.
   out->vmaddr = kintsuki::ppu::vramAddress();
 
-  out->cgadd  = s.cgramAddress;
+  // CGRAM auto-increments inside the live impl on every $2122 write; the
+  // shadow only captures the $2121 base. Serve the live value via the
+  // facade so a readout mid-palette-upload matches ares, same approach
+  // as vmaddr above.
+  out->cgadd  = kintsuki::ppu::cgramAddress();
 
   auto mkTm = [](bool b1, bool b2, bool b3, bool b4, bool ob) -> uint8_t {
     return (uint8_t)((b1 ? 0x01 : 0) | (b2 ? 0x02 : 0)
