@@ -395,6 +395,8 @@ _bind("kintsuki_set_vram_size", c_int, [HANDLE, c_uint32])
 _bind("kintsuki_vram_size", c_uint32, [HANDLE])
 _bind("kintsuki_set_ppu_accurate", c_int, [HANDLE, c_int])
 _bind("kintsuki_ppu_accurate", c_int, [HANDLE])
+_bind("kintsuki_set_render", c_int, [HANDLE, c_int])
+_bind("kintsuki_render", c_int, [HANDLE])
 
 # Savestate
 _bind("kintsuki_save_state", c_uint32, [HANDLE, c_void_p, c_uint32])

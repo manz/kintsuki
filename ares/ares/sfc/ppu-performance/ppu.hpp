@@ -4,6 +4,10 @@
 // PPU fetches to draw (bit n: BGn+1's tilemap, bit 4+n: its tiles, bit 8: OBJ
 // tiles); null when off.
 extern uint16_t* kintsukiVramReads;
+// kintsuki: whether to draw frames, and what to ring per frame left undrawn
+// (see system.cpp).
+extern bool kintsukiRender;
+extern void (*kintsukiFrameSkippedHook)();
 
 struct PPU : PPUBase::Implementation, PPUcounter {
   Node::Object node;
@@ -315,6 +319,7 @@ struct PPU : PPUBase::Implementation, PPUcounter {
     auto addressReset() -> void;
     auto setFirstSprite() -> void;
     auto render() -> void;
+    auto evaluate() -> void;
     auto power() -> void;
 
     //serialization.cpp
@@ -340,6 +345,8 @@ struct PPU : PPUBase::Implementation, PPUcounter {
     } io;
 
     PPU::Window::Layer window;
+
+    auto scan(bool fetch) -> void;
 
   //unserialized:
     struct Item {

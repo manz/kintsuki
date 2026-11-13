@@ -72,15 +72,19 @@ auto PPU::main() -> void {
   if(vcounter() && vcounter() < vdisp() && !runAhead()) {
     step(renderingCycle);
     mosaic.scanline();
-    dac.prepare();
-    if(!io.displayDisable) {
-      bg1.render();
-      bg2.render();
-      bg3.render();
-      bg4.render();
-      obj.render();
+    if(kintsukiRender) {
+      dac.prepare();
+      if(!io.displayDisable) {
+        bg1.render();
+        bg2.render();
+        bg3.render();
+        bg4.render();
+        obj.render();
+      }
+      dac.render();
+    } else if(!io.displayDisable) {
+      obj.evaluate();  // range/time over still latch into $213E
     }
-    dac.render();
   }
 
   if(vcounter() == vdisp()) {
@@ -117,7 +121,8 @@ auto PPU::main() -> void {
       screen->setViewport(x, y, w, h * yScale);
     }
 
-    screen->frame();
+    if(kintsukiRender) screen->frame();
+    else if(kintsukiFrameSkippedHook) kintsukiFrameSkippedHook();
     scheduler.exit(Event::Frame);
   }
 

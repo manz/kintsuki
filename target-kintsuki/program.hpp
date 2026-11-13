@@ -182,8 +182,12 @@ struct Program : ares::Platform {
   u32 fbWidth = 0;
   u32 fbHeight = 0;
   u64 framesRendered = 0;
-  // Called after each rendered frame (libkintsuki samples its master clock).
+  // Called after each frame, drawn or not (libkintsuki samples its master
+  // clock).
   void (*frameHook)() = nullptr;
+  // Counts a frame and rings frameHook; video() calls it after the copy, and
+  // ppu-performance in place of the screen when it skips drawing.
+  auto frameDone() -> void;
 
   // Per-port input bitmask. 12 bits used.
   uint16_t inputState[2] = {0, 0};

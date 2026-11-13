@@ -131,6 +131,16 @@ typedef void (*KintsukiVblankHook)(uint8_t begin);
 __attribute__((visibility("default")))
 KintsukiVblankHook kintsukiVblankHook = nullptr;
 
+// kintsuki: false makes ppu-performance skip drawing (the BG/OBJ line
+// renderers, the DAC and the screen refresh); the PPU still runs its
+// timing, latches and sprite range/time over evaluation. Each frame it
+// does not draw rings kintsukiFrameSkippedHook instead of the screen.
+__attribute__((visibility("default")))
+bool kintsukiRender = true;
+typedef void (*KintsukiFrameSkippedHook)();
+__attribute__((visibility("default")))
+KintsukiFrameSkippedHook kintsukiFrameSkippedHook = nullptr;
+
 auto System::load(Node::System& root, string name) -> bool {
   if(node) unload();
 
