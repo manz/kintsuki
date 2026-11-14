@@ -493,6 +493,23 @@ class Emu:
         _native.lib.kintsuki_set_ppu_accurate(self._handle, 1 if enable else 0)
 
     @property
+    def render(self) -> bool:
+        """Draw frames (for :meth:`framebuffer`); on by default. Off, the
+        performance PPU skips the picture (line renderers, colour math,
+        screen refresh) so emulation runs faster; game logic, timing,
+        DMA/HDMA, NMI/IRQ, the counter latches, PPU register reads and the
+        sprite range/time over flags in $213E run exactly as with it on, and
+        frames still count. :meth:`framebuffer` keeps the last drawn frame;
+        the first frame run after turning it back on draws. The VRAM read map
+        misses the reads drawing would make, and the cycle-accurate PPU
+        (:attr:`ppu_accurate`) always draws."""
+        return bool(_native.lib.kintsuki_render(self._handle))
+
+    @render.setter
+    def render(self, enable: bool) -> None:
+        _native.lib.kintsuki_set_render(self._handle, 1 if enable else 0)
+
+    @property
     def vram_size(self) -> int:
         """PPU VRAM size in bytes (64 KB stock, 128 KB with the VA15 mod)."""
         return int(_native.lib.kintsuki_vram_size(self._handle))

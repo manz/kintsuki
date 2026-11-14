@@ -39,6 +39,8 @@ namespace ares::SuperFamicom {
   extern KintsukiPpuLandHook kintsukiPpuLandHook;
   typedef void (*KintsukiVblankHook)(uint8_t);
   extern KintsukiVblankHook kintsukiVblankHook;
+  extern bool kintsukiRender;
+  extern void (*kintsukiFrameSkippedHook)();
   typedef void (*KintsukiVramWriteHook)(uint16_t);
   extern KintsukiVramWriteHook kintsukiVramWriteHook;
   typedef void (*KintsukiSdd1Hook)(uint8_t, uint8_t, uint32_t, uint32_t,
@@ -501,6 +503,10 @@ kintsuki_t* kintsuki_create(void) {
   };
   kintsukiProgram = h->program.get();
   g_handle = h;
+  ares::SuperFamicom::kintsukiRender = true;
+  ares::SuperFamicom::kintsukiFrameSkippedHook = [] {
+    if(kintsukiProgram) kintsukiProgram->frameDone();
+  };
   // Wire the call/return hooks now and leave them on for the handle's
   // lifetime — non-debug builds that never inspect the callstack pay a
   // single null-check per JSR/RTS, identical to execHook's pattern.
@@ -522,6 +528,8 @@ void kintsuki_destroy(kintsuki_t* h) {
   ares::SuperFamicom::smpExecHook = nullptr;
   ares::SuperFamicom::smpReadHook = nullptr;
   ares::SuperFamicom::smpWriteHook = nullptr;
+  ares::SuperFamicom::kintsukiFrameSkippedHook = nullptr;
+  ares::SuperFamicom::kintsukiRender = true;
   ares::callHook = nullptr;
   ares::returnHook = nullptr;
   clearShadowStacks();
@@ -596,6 +604,17 @@ int kintsuki_set_ppu_accurate(kintsuki_t* h, int enable) {
 int kintsuki_ppu_accurate(kintsuki_t* h) {
   if(!h) return 0;
   return h->program->ppuAccurate ? 1 : 0;
+}
+
+int kintsuki_set_render(kintsuki_t* h, int enable) {
+  if(!h) return 0;
+  ares::SuperFamicom::kintsukiRender = (enable != 0);
+  return 1;
+}
+
+int kintsuki_render(kintsuki_t* h) {
+  if(!h) return 0;
+  return ares::SuperFamicom::kintsukiRender ? 1 : 0;
 }
 
 int kintsuki_set_sram_policy(kintsuki_t* h, uint32_t policy) {

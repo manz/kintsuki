@@ -111,6 +111,10 @@ auto Program::video(Node::Video::Screen, const u32* data, u32 pitch, u32 width, 
     uint32_t* dst = fb.data() + y * width;
     std::memcpy(dst, src, width * sizeof(u32));
   }
+  frameDone();
+}
+
+auto Program::frameDone() -> void {
   framesRendered++;
   if(frameHook) frameHook();
 }

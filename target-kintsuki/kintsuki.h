@@ -111,6 +111,20 @@ int         kintsuki_set_ppu_accurate(kintsuki_t*, int enable);
 // handle.
 int         kintsuki_ppu_accurate(kintsuki_t*);
 
+// Draw frames (default 1). 0 makes ppu-performance skip the picture: the
+// BG/OBJ line renderers, the colour math / pixel output and the screen
+// refresh. Emulation is unchanged: timing, DMA/HDMA, NMI/IRQ, the counter
+// latches, PPU register reads and the sprite range/time over flags all run
+// as with drawing on, and frames still count. kintsuki_framebuffer keeps the
+// last drawn frame; the first frame run after turning it back on draws.
+// The VRAM read map misses the reads drawing would make. The cycle-accurate
+// PPU (kintsuki_set_ppu_accurate) always draws. Takes effect immediately.
+// Returns 1 on success, 0 on a NULL handle.
+int         kintsuki_set_render(kintsuki_t*, int enable);
+
+// Current render flag (1 = draw). 0 on a NULL handle.
+int         kintsuki_render(kintsuki_t*);
+
 // Load `len` bytes from `data` into the cart's SRAM region (the
 // in-memory `save.ram` buffer ares allocated at boot). Use this to
 // inject a `.srm` blob without binding the file on disk: the emulator

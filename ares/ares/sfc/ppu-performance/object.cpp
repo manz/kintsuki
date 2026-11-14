@@ -8,14 +8,9 @@ inline auto PPU::Object::setFirstSprite() -> void {
   if(self.io.oamPriority) io.firstSprite = self.io.oamAddress >> 2;
 }
 
-auto PPU::Object::render() -> void {
-  if(!io.aboveEnable && !io.belowEnable) return;
-
-  bool windowAbove[448];
-  bool windowBelow[448];
-  self.window.render(window, window.aboveEnable, windowAbove);
-  self.window.render(window, window.belowEnable, windowBelow);
-
+// kintsuki: the line's sprite and tile evaluation, which latches range/time
+// over. `fetch` also builds the tiles (VRAM fetches) render() draws.
+auto PPU::Object::scan(bool fetch) -> void {
   u32 itemCount = 0;
   u32 tileCount = 0;
   for(u32 n : range(32)) items[n].valid = false;
@@ -75,6 +70,10 @@ auto PPU::Object::render() -> void {
     for(u32 tileX : range(tileWidth)) {
       u32 objectX = x + (tileX << 3) & 511;
       if(x != width && objectX >= width && objectX + 7 < 512 + x1) continue;
+      if(!fetch) {
+        if(tileCount++ >= 34) break;
+        continue;
+      }
 
       Tile tile{true};
       tile.x = objectX;
@@ -97,7 +96,25 @@ auto PPU::Object::render() -> void {
 
   io.rangeOver |= itemCount > 32;
   io.timeOver  |= tileCount > 34;
+}
 
+auto PPU::Object::evaluate() -> void {
+  if(!io.aboveEnable && !io.belowEnable) return;
+  scan(false);
+}
+
+auto PPU::Object::render() -> void {
+  if(!io.aboveEnable && !io.belowEnable) return;
+
+  bool windowAbove[448];
+  bool windowBelow[448];
+  self.window.render(window, window.aboveEnable, windowAbove);
+  self.window.render(window, window.belowEnable, windowBelow);
+
+  scan(true);
+
+  u32 width = 256;
+  s32 x1 = 0, x2 = 255;
   n8 palette[448];
   n8 priority[448];
 
